@@ -666,18 +666,18 @@ pub fn score_mesh(mesh: &DiscoveredMesh, _now_secs: u64, last_mesh_id: Option<&s
 /// Decision from smart auto-join.
 #[derive(Debug)]
 pub enum AutoDecision {
-    /// Join this mesh's invite token
-    Join { token: String, mesh: DiscoveredMesh },
+    /// Ranked list of meshes to try joining (best first)
+    Join { candidates: Vec<(String, DiscoveredMesh)> },
     /// No suitable mesh found — start a new one with these models
     StartNew { models: Vec<String> },
 }
 
-/// Pick the best mesh to join, or decide to start a new one.
+/// Pick meshes to join, ranked by score, or decide to start a new one.
 ///
 /// - Scores all discovered meshes (freshness, region, capacity)
 /// - Filters out stale/full meshes
-/// - If no good mesh found, recommends starting a new one with
-///   models appropriate for the node's VRAM
+/// - Returns all viable candidates ranked by score so the caller
+///   can probe each in order and fall back to the next on failure
 pub fn smart_auto(
     meshes: &[DiscoveredMesh],
     my_vram_gb: f64,
@@ -707,14 +707,14 @@ pub fn smart_auto(
         .collect();
     scored.sort_by(|a, b| b.1.cmp(&a.1));
 
-    // Best mesh must have a positive score (not stale, not full)
-    if let Some((best, score)) = scored.first() {
-        if *score > 0 {
-            return AutoDecision::Join {
-                token: best.listing.invite_token.clone(),
-                mesh: (*best).clone(),
-            };
-        }
+    // Collect all candidates with positive score (not stale, not full)
+    let viable: Vec<(String, DiscoveredMesh)> = scored.iter()
+        .filter(|(_, score)| *score > 0)
+        .map(|(m, _)| (m.listing.invite_token.clone(), (*m).clone()))
+        .collect();
+
+    if !viable.is_empty() {
+        return AutoDecision::Join { candidates: viable };
     }
 
     // No suitable mesh — recommend models for a new one based on VRAM

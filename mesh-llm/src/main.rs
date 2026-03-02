@@ -275,38 +275,54 @@ async fn main() -> Result<()> {
         }
 
         match nostr::smart_auto(&meshes, my_vram_gb, target_name) {
-            nostr::AutoDecision::Join { token, mesh } => {
-                // Carry mesh name from discovery for console display
-                if cli.mesh_name.is_none() {
-                    if let Some(ref name) = mesh.listing.name {
-                        cli.mesh_name = Some(name.clone());
-                    }
-                }
+            nostr::AutoDecision::Join { candidates } => {
                 if cli.client {
-                    // Skip health probe for clients — joining itself is the test
+                    // Clients skip health probe — joining itself is the test.
+                    // Use the best candidate.
+                    let (token, mesh) = &candidates[0];
+                    if cli.mesh_name.is_none() {
+                        if let Some(ref name) = mesh.listing.name {
+                            cli.mesh_name = Some(name.clone());
+                        }
+                    }
                     eprintln!("✅ Joining: {} ({} nodes, {} models{})",
                         mesh.listing.name.as_deref().unwrap_or("unnamed"),
                         mesh.listing.node_count,
                         mesh.listing.serving.len(),
                         mesh.listing.region.as_ref().map(|r| format!(", region: {r}")).unwrap_or_default());
-                    cli.join.push(token);
+                    cli.join.push(token.clone());
                 } else {
-                    // GPU nodes: probe before committing (avoids downloading model for dead mesh)
-                    eprintln!("  Probing mesh health...");
-                    match probe_mesh_health(&token, &cli.relay).await {
-                        Ok(()) => {
-                            eprintln!("✅ Joining: {} ({} nodes, {} models{})",
-                                mesh.listing.name.as_deref().unwrap_or("unnamed"),
-                                mesh.listing.node_count,
-                                mesh.listing.serving.len(),
-                                mesh.listing.region.as_ref().map(|r| format!(", region: {r}")).unwrap_or_default());
-                            cli.join.push(token);
+                    // GPU nodes: probe each candidate in order until one responds
+                    let mut joined = false;
+                    for (i, (token, mesh)) in candidates.iter().enumerate() {
+                        eprintln!("  Probing mesh {}{}...",
+                            mesh.listing.name.as_deref().unwrap_or("unnamed"),
+                            if candidates.len() > 1 { format!(" ({}/{})", i + 1, candidates.len()) } else { String::new() });
+                        match probe_mesh_health(token, &cli.relay).await {
+                            Ok(()) => {
+                                if cli.mesh_name.is_none() {
+                                    if let Some(ref name) = mesh.listing.name {
+                                        cli.mesh_name = Some(name.clone());
+                                    }
+                                }
+                                eprintln!("✅ Joining: {} ({} nodes, {} models{})",
+                                    mesh.listing.name.as_deref().unwrap_or("unnamed"),
+                                    mesh.listing.node_count,
+                                    mesh.listing.serving.len(),
+                                    mesh.listing.region.as_ref().map(|r| format!(", region: {r}")).unwrap_or_default());
+                                cli.join.push(token.clone());
+                                joined = true;
+                                break;
+                            }
+                            Err(e) => {
+                                eprintln!("⚠️  Mesh unreachable: {e}");
+                            }
                         }
-                        Err(e) => {
-                            eprintln!("⚠️  Best mesh unreachable: {e}");
-                            let models = nostr::default_models_for_vram(my_vram_gb);
-                            start_new_mesh(&mut cli, &models, my_vram_gb);
-                        }
+                    }
+                    if !joined {
+                        eprintln!("⚠️  All {} mesh(es) unreachable — starting new", candidates.len());
+                        let models = nostr::default_models_for_vram(my_vram_gb);
+                        start_new_mesh(&mut cli, &models, my_vram_gb);
                     }
                 }
             }
