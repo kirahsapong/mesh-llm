@@ -11,6 +11,10 @@ pub enum Category {
     Chat,
     ToolCall,
     Creative,
+    /// Factual lookup, summarization, knowledge retrieval
+    Info,
+    /// Image generation or analysis (future: multimodal models)
+    Image,
 }
 
 /// How complex/heavy the request appears to be.
@@ -111,7 +115,7 @@ pub static MODEL_PROFILES: &[ModelProfile] = &[
     },
     ModelProfile {
         name: "Qwen2.5-32B-Instruct-Q4_K_M",
-        strengths: &[Category::Chat, Category::Reasoning],
+        strengths: &[Category::Chat, Category::Reasoning, Category::Code, Category::ToolCall],
         tier: 3, tools: true,
     },
     ModelProfile {
@@ -326,6 +330,26 @@ pub fn classify(body: &Value) -> Classification {
         .filter(|s| lower.contains(*s))
         .count();
 
+    // Info/knowledge signals — factual lookup, summarization
+    let info_signals = [
+        "what is", "who is", "when did", "where is", "how does",
+        "define ", "explain ", "summarize", "summary", "overview",
+        "tell me about", "describe ", "what are the", "list the",
+        "difference between", "compare ", "history of",
+    ];
+    let info_score: usize = info_signals.iter()
+        .filter(|s| lower.contains(*s))
+        .count();
+
+    // Image signals — generation or analysis (future)
+    let image_signals = [
+        "image", "picture", "photo", "draw", "generate an image",
+        "visualize", "diagram", "screenshot", "describe this image",
+    ];
+    let image_score: usize = image_signals.iter()
+        .filter(|s| lower.contains(*s))
+        .count();
+
     // Deep-thinking signals (want the biggest brain)
     let deep_signals = [
         "architect", "design a system", "trade-off", "tradeoff",
@@ -359,9 +383,13 @@ pub fn classify(body: &Value) -> Classification {
         Category::Reasoning
     } else if creative_score >= 1 {
         Category::Creative
+    } else if image_score >= 1 {
+        Category::Image
     } else if needs_tools && code_score == 0 && reasoning_score == 0 && creative_score == 0 {
         // Only ToolCall if tools present AND no other signal dominates
         Category::ToolCall
+    } else if info_score >= 2 && code_score == 0 {
+        Category::Info
     } else {
         Category::Chat
     };
@@ -461,18 +489,30 @@ pub fn pick_model_classified<'a>(
                 })
                 .unwrap_or(0);
 
-            // Complexity adjusts tier preference:
-            //   Quick → prefer lower tier (faster) — invert tier bonus
-            //   Deep  → prefer higher tier (smarter) — amplify tier bonus
-            //   Moderate → neutral
-            let tier_bonus = match classification.complexity {
-                Complexity::Quick => (5 - tier) * 10,   // tier 1→40, tier 2→30, tier 3→20, tier 4→10
-                Complexity::Moderate => tier * 5,         // tier 1→5, tier 4→20 (mild preference for bigger)
-                Complexity::Deep => tier * 15,            // tier 1→15, tier 4→60 (strong preference for biggest)
+            // Agentic vs chat scoring:
+            // When tools are needed, strongly prefer the most capable model.
+            // For chat, prefer the fastest model that matches.
+            let tier_bonus = if classification.needs_tools {
+                // Agentic: always prefer strongest. Tier dominates.
+                // tier 1→20, tier 2→40, tier 3→60, tier 4→80
+                tier * 20
+            } else {
+                // Chat/no-tools: complexity adjusts preference
+                match classification.complexity {
+                    Complexity::Quick => (5 - tier) * 10,   // tier 1→40, tier 2→30, tier 3→20
+                    Complexity::Moderate => tier * 5,         // mild bigger preference
+                    Complexity::Deep => tier * 15,            // strong bigger preference
+                }
             };
 
-            // Speed bonus: normalize tok/s to 0-10 range (100+ tok/s = max bonus)
-            let speed_bonus = (tok_s / 10.0).min(10.0) as i32;
+            // Speed bonus: higher for chat (speed matters), lower for agentic (quality matters)
+            let speed_bonus = if classification.needs_tools {
+                // Agentic: speed is a tiebreaker only
+                (tok_s / 20.0).min(5.0) as i32
+            } else {
+                // Chat: speed matters more
+                (tok_s / 5.0).min(20.0) as i32
+            };
 
             let score = match_bonus + tier_bonus + position_bonus + speed_bonus;
             (*name, score)
@@ -757,4 +797,56 @@ mod tests {
         // With tools required but nothing capable: falls back to available
         let result = pick_model_with_tools(Category::Reasoning, &available, true);
         assert_eq!(result, Some("DeepSeek-R1-Distill-Qwen-32B-Q4_K_M"));
+    }
+
+    #[test]
+    fn test_agentic_prefers_strongest_model() {
+        // Agentic (needs_tools=true): 32B (tier 3) should beat 7B (tier 2) even though 7B is faster
+        let available = vec![
+            ("Hermes-2-Pro-Mistral-7B-Q4_K_M", 87.0),    // tier 2, tools: false
+            ("Qwen2.5-Coder-7B-Instruct-Q4_K_M", 85.0),  // tier 2, tools: true
+            ("Qwen2.5-32B-Instruct-Q4_K_M", 18.0),       // tier 3, tools: true
+        ];
+        let cl = Classification {
+            category: Category::Code,
+            complexity: Complexity::Moderate,
+            needs_tools: true,
+        };
+        let result = pick_model_classified(&cl, &available);
+        // 32B should win: tier 3×20=60 beats Coder tier 2×20=40, despite lower speed
+        assert_eq!(result, Some("Qwen2.5-32B-Instruct-Q4_K_M"));
+    }
+
+    #[test]
+    fn test_chat_prefers_fastest_model() {
+        // Chat (needs_tools=false, Quick): fast model should beat big slow one
+        let available = vec![
+            ("Hermes-2-Pro-Mistral-7B-Q4_K_M", 87.0),    // tier 2, fast
+            ("Qwen2.5-32B-Instruct-Q4_K_M", 18.0),       // tier 3, slow
+        ];
+        let cl = Classification {
+            category: Category::Chat,
+            complexity: Complexity::Quick,
+            needs_tools: false,
+        };
+        let result = pick_model_classified(&cl, &available);
+        // Hermes should win: speed 87/5=17.4 + tier(5-2)*10=30 + match 1000 = 1047
+        // vs 32B: speed 18/5=3.6 + tier(5-3)*10=20 + match 1000 = 1023
+        assert_eq!(result, Some("Hermes-2-Pro-Mistral-7B-Q4_K_M"));
+    }
+
+    #[test]
+    fn test_agentic_deep_strongly_prefers_biggest() {
+        // Deep agentic: tier 4 should massively beat tier 2
+        let available = vec![
+            ("Qwen2.5-Coder-7B-Instruct-Q4_K_M", 85.0),  // tier 2
+            ("MiniMax-M2.5-Q4_K_M", 21.0),                // tier 4
+        ];
+        let cl = Classification {
+            category: Category::Code,
+            complexity: Complexity::Deep,
+            needs_tools: true,
+        };
+        let result = pick_model_classified(&cl, &available);
+        assert_eq!(result, Some("MiniMax-M2.5-Q4_K_M"));
     }
