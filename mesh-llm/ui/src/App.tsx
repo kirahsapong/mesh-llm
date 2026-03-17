@@ -173,6 +173,10 @@ function sectionFromPathname(pathname: string): TopSection | null {
   return null;
 }
 
+function isMobileViewport(): boolean {
+  return typeof window !== 'undefined' && window.innerWidth < 768;
+}
+
 function readRouteFromLocation(): AppRoute {
   if (typeof window === 'undefined') return { section: 'dashboard', chatId: null };
   const pathname = window.location.pathname;
@@ -183,7 +187,8 @@ function readRouteFromLocation(): AppRoute {
     const chatId = raw ? decodeURIComponent(raw.split('/')[0]) : null;
     return { section: 'chat', chatId };
   }
-  return { section: 'dashboard', chatId: null };
+  // Default: chat on mobile, dashboard on desktop
+  return { section: isMobileViewport() ? 'chat' : 'dashboard', chatId: null };
 }
 
 function pathnameForRoute(route: AppRoute): string {
@@ -1180,12 +1185,12 @@ function AppHeader({
 
   return (
     <header className="shrink-0 border-b bg-card/95 backdrop-blur supports-[backdrop-filter]:bg-card/80">
-      <div className="mx-auto flex h-16 w-full max-w-7xl items-center gap-4 px-4">
+      <div className="mx-auto flex h-14 w-full max-w-7xl items-center gap-2 px-3 md:h-16 md:gap-4 md:px-4">
         <div className="flex min-w-0 items-center gap-0">
           <div className="flex h-10 w-7 shrink-0 items-center justify-start">
             <BrandIcon className="h-6 w-6 text-primary" />
           </div>
-          <div className="min-w-0">
+          <div className="hidden min-w-0 sm:block">
             <div className="truncate text-base font-semibold">
               <MeshLlmWordmark />
             </div>
@@ -1228,7 +1233,7 @@ function AppHeader({
                 </TooltipTrigger>
                 <TooltipContent>API</TooltipContent>
               </Tooltip>
-              <PopoverContent className="w-[420px] space-y-3" align="end">
+              <PopoverContent className="w-[calc(100vw-2rem)] max-w-[420px] space-y-3" align="end">
               <div className="space-y-1">
                 <div className="flex items-center gap-2 text-sm font-medium">
                   <Braces className="h-4 w-4 text-muted-foreground" />
@@ -1325,7 +1330,7 @@ function AppHeader({
                 </TooltipTrigger>
                 <TooltipContent>Invite</TooltipContent>
               </Tooltip>
-              <PopoverContent className="w-[420px] space-y-3" align="end">
+              <PopoverContent className="w-[calc(100vw-2rem)] max-w-[420px] space-y-3" align="end">
               <div className="space-y-1">
                 <div className="flex items-center gap-2 text-sm font-medium">
                   <UserPlus className="h-4 w-4 text-muted-foreground" />
