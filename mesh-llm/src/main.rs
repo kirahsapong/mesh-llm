@@ -176,7 +176,16 @@ enum Command {
     },
     /// Rotate the Nostr identity key (forces new keypair on next --publish)
     RotateKey,
-
+    /// Launch Goose with mesh-llm as the inference provider
+    #[command(name = "goose")]
+    Goose {
+        /// Model to use (default: first available model)
+        #[arg(long)]
+        model: Option<String>,
+        /// API port of the running mesh-llm instance (default: 9337)
+        #[arg(long, default_value = "9337")]
+        port: u16,
+    },
 }
 
 #[tokio::main]
@@ -235,6 +244,9 @@ async fn main() -> Result<()> {
             }
             Command::RotateKey => {
                 return nostr::rotate_keys().map_err(Into::into);
+            }
+            Command::Goose { model, port } => {
+                return run_goose(model.clone(), *port).await;
             }
 
         }
@@ -1878,6 +1890,145 @@ async fn run_drop(model_name: &str, port: u16) -> Result<()> {
         eprintln!("✅ Dropped model: {model_name}");
     } else {
         eprintln!("❌ Failed to drop model: {}", resp.lines().last().unwrap_or("unknown error"));
+    }
+
+    Ok(())
+}
+
+async fn run_goose(model: Option<String>, port: u16) -> Result<()> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()?;
+
+    // 1. Check if mesh-llm is already running; if not, start a client in the background
+    let url = format!("http://127.0.0.1:{port}/v1/models");
+    let mut started_client = false;
+    if client.get(&url).send().await.is_err() {
+        eprintln!("🔍 No mesh-llm on port {port} — starting client...");
+        let exe = std::env::current_exe().unwrap_or_else(|_| "mesh-llm".into());
+        std::process::Command::new(&exe)
+            .args(["--client", "--auto", "--port", &port.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .context("Failed to start mesh-llm client")?;
+        started_client = true;
+
+        // Wait for it to come up and find models
+        eprintln!("   Waiting for mesh discovery...");
+        let mut found = false;
+        for i in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            if let Ok(resp) = client.get(&url).send().await {
+                if let Ok(body) = resp.json::<serde_json::Value>().await {
+                    let n = body["data"].as_array().map(|a| a.len()).unwrap_or(0);
+                    if n > 0 {
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            if i % 5 == 4 {
+                eprintln!("   Still waiting... ({:.0}s)", (i + 1) as f64 * 3.0);
+            }
+        }
+        if !found {
+            anyhow::bail!("Timed out waiting for mesh-llm to discover models. Check network/Nostr.");
+        }
+    }
+
+    // 2. Query available models
+    let resp = client.get(&url).send().await
+        .with_context(|| format!("Can't connect to mesh-llm on port {port}"))?;
+    let body: serde_json::Value = resp.json().await?;
+    let models: Vec<String> = body["data"]
+        .as_array()
+        .unwrap_or(&vec![])
+        .iter()
+        .filter_map(|m| m["id"].as_str().map(String::from))
+        .collect();
+
+    if models.is_empty() {
+        anyhow::bail!("No models available on port {port}. Is the mesh healthy?");
+    }
+
+    // 3. Pick the model — if none specified, use "auto" (mesh proxy routes to best model)
+    let chosen = if let Some(ref m) = model {
+        if !models.iter().any(|n| n == m) {
+            anyhow::bail!("Model '{}' not available. Available: {}", m, models.join(", "));
+        }
+        m.clone()
+    } else {
+        // Use first model as default — the mesh proxy handles routing
+        let auto = models[0].clone();
+        if started_client {
+            eprintln!("   Auto-selected: {auto}");
+        }
+        auto
+    };
+
+    // 3. Write custom provider JSON
+    // Goose uses ~/.config/goose/ on all platforms (XDG-style, not macOS Library)
+    let goose_config_dir = dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".config")
+        .join("goose")
+        .join("custom_providers");
+    std::fs::create_dir_all(&goose_config_dir)?;
+
+    let provider_models: Vec<serde_json::Value> = models.iter().map(|name| {
+        serde_json::json!({
+            "name": name,
+            "context_limit": 65536
+        })
+    }).collect();
+
+    let provider = serde_json::json!({
+        "name": "mesh",
+        "engine": "openai",
+        "display_name": "mesh-llm",
+        "description": "Distributed LLM inference via mesh-llm",
+        "api_key_env": "",
+        "base_url": format!("http://localhost:{port}"),
+        "models": provider_models,
+        "timeout_seconds": 600,
+        "supports_streaming": true,
+        "requires_auth": false
+    });
+
+    let provider_path = goose_config_dir.join("mesh.json");
+    std::fs::write(&provider_path, serde_json::to_string_pretty(&provider)?)?;
+    eprintln!("✅ Wrote {}", provider_path.display());
+    eprintln!("   Models: {}", models.join(", "));
+    eprintln!("   Using: {chosen}");
+
+    // 4. Launch Goose
+    let goose_app = std::path::Path::new("/Applications/Goose.app");
+    if goose_app.exists() {
+        eprintln!("🪿 Launching Goose.app...");
+        std::process::Command::new("open")
+            .arg("-a")
+            .arg(goose_app)
+            .env("GOOSE_PROVIDER", "mesh")
+            .env("GOOSE_MODEL", &chosen)
+            .spawn()?;
+    } else {
+        // Fall back to CLI goose
+        eprintln!("🪿 Launching goose session...");
+        let status = std::process::Command::new("goose")
+            .arg("session")
+            .env("GOOSE_PROVIDER", "mesh")
+            .env("GOOSE_MODEL", &chosen)
+            .status();
+        match status {
+            Ok(s) if s.success() => {}
+            Ok(s) => eprintln!("goose exited with {s}"),
+            Err(_) => {
+                eprintln!("goose not found. Install: https://github.com/block/goose");
+                eprintln!("Or run manually:");
+                eprintln!("  GOOSE_PROVIDER=mesh GOOSE_MODEL={chosen} goose session");
+            }
+        }
     }
 
     Ok(())
