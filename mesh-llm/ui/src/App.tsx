@@ -73,7 +73,7 @@ import githubBlackLogo from './assets/icons/github-invertocat-black.svg';
 import githubWhiteLogo from './assets/icons/github-invertocat-white.svg';
 
 const DOCS_URL = 'https://docs.anarchai.org';
-const FLY_DOMAINS = ['mesh-llm-console.fly.dev', 'mesh-llm-api.fly.dev'];
+const FLY_DOMAINS = ['mesh-llm-console.fly.dev', 'www.mesh-llm.com', 'www.anarchai.org'];
 
 type MeshModel = {
   name: string;
@@ -1044,6 +1044,7 @@ export function App() {
                 inviteToken={status?.token ?? ''}
                 isPublicMesh={status?.nostr_discovery ?? false}
                 isFlyHosted={isFlyHosted}
+                inflightRequests={status?.inflight_requests ?? 0}
                 warmModels={warmModels}
                 modelStatsByName={modelStatsByName}
                 selectedModel={selectedModel}
@@ -1545,6 +1546,7 @@ function ChatPage(props: {
   inviteToken: string;
   isPublicMesh: boolean;
   isFlyHosted: boolean;
+  inflightRequests: number;
   warmModels: string[];
   modelStatsByName: Record<string, ModelServingStat>;
   selectedModel: string;
@@ -1872,6 +1874,30 @@ function ChatPage(props: {
         </div>
       </CardHeader>
       <Separator />
+      {props.isFlyHosted ? (
+        <div className={cn(
+          'border-b px-4 py-2 text-xs',
+          props.inflightRequests > 2
+            ? 'bg-orange-500/10 text-orange-700 dark:text-orange-400'
+            : 'bg-muted/40 text-muted-foreground',
+        )}>
+          {props.inflightRequests > 2 ? (
+            <>
+              <span className="font-medium">⏳ Busy</span> — {props.inflightRequests} requests in flight, responses may be slow.{' '}
+              For direct access run <code className="rounded bg-muted px-1 py-0.5 font-mono">mesh-llm --auto</code>{' '}
+              <a href={DOCS_URL} target="_blank" rel="noopener noreferrer" className="underline hover:text-foreground">Learn more →</a>
+            </>
+          ) : (
+            <>
+              <span className="font-medium">Community demo</span> — best-effort public instance.
+              For direct, faster access run{' '}
+              <code className="rounded bg-muted px-1 py-0.5 font-mono">mesh-llm --auto</code>{' '}
+              to join the mesh or start your own.{' '}
+              <a href={DOCS_URL} target="_blank" rel="noopener noreferrer" className="underline hover:text-foreground">Learn more →</a>
+            </>
+          )}
+        </div>
+      ) : null}
       {/* Mobile conversation sheet */}
       <Sheet open={mobileSidebarOpen} onOpenChange={setMobileSidebarOpen}>
         <SheetContent side="left" className="w-72 p-0">
@@ -1899,13 +1925,6 @@ function ChatPage(props: {
                 messages.length === 0 ? '' : 'space-y-4',
               )}
             >
-              {props.isFlyHosted ? (
-                <div className="mb-3 rounded-md border border-dashed border-muted-foreground/25 bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
-                  <span className="font-medium">Community demo</span> — this is a best-effort public instance. For direct access, run{' '}
-                  <code className="rounded bg-muted px-1 py-0.5">mesh-llm --auto</code> to join the mesh or start your own.{' '}
-                  <a href={DOCS_URL} target="_blank" rel="noopener noreferrer" className="underline hover:text-foreground">Learn more →</a>
-                </div>
-              ) : null}
               {messages.length === 0 ? (
                 <div className="flex min-h-full items-center justify-center">
                   <InviteFriendEmptyState inviteToken={inviteToken} selectedModel={selectedModel || warmModels[0] || ''} isPublicMesh={props.isPublicMesh} />
