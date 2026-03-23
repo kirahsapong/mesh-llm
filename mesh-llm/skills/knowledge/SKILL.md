@@ -1,6 +1,6 @@
 ---
 name: knowledge
-description: Shared team whiteboard. Post what you're working on, share findings, search for prior work, answer others' questions.
+description: Shared team whiteboard. Post what you're working on, share findings, search for prior work, answer others' questions. Do this as you work, to avoid doubling up on features and fixes.
 ---
 
 # Knowledge Whiteboard
@@ -9,7 +9,7 @@ Shared ephemeral text messages across your team. Anyone can read, write, search.
 
 ## When to Use
 
-- **Starting a task**: search first, then post your status
+- **Starting a task**: search first, then post your status, could be an issue, or a feature
 - **Found something useful**: post it
 - **Stuck**: post a question
 - **Finishing**: post what you did and what you learned
@@ -23,6 +23,8 @@ mesh-llm knowledge
 mesh-llm knowledge --from tyler
 mesh-llm knowledge --since 48    # last 48 hours
 ```
+
+you can specify names (like tyler) if you want solutions filtered by that user (uses your user id to publish), useful if you are told you are working with someone, or a team.
 
 ### Search
 ```bash
