@@ -5,7 +5,7 @@
 
 use crate::{election, mesh, router, tunnel};
 use anyhow::Result;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
 // ── Request parsing ──
@@ -55,26 +55,6 @@ pub fn extract_session_hint(buf: &[u8]) -> Option<String> {
     None
 }
 
-/// Find the end of HTTP headers (position after \r\n\r\n).
-fn find_header_end(buf: &[u8]) -> Option<usize> {
-    let s = std::str::from_utf8(buf).ok()?;
-    s.find("\r\n\r\n").map(|i| i + 4)
-}
-
-/// Parse Content-Length from HTTP headers.
-fn parse_content_length(buf: &[u8]) -> Option<usize> {
-    let s = std::str::from_utf8(buf).ok()?;
-    let headers = s.split("\r\n\r\n").next()?;
-    for line in headers.split("\r\n") {
-        if let Some(val) = line.strip_prefix("Content-Length: ")
-            .or_else(|| line.strip_prefix("content-length: "))
-        {
-            return val.trim().parse().ok();
-        }
-    }
-    None
-}
-
 /// Try to parse the JSON body from a peeked HTTP request buffer.
 pub fn extract_body_json(buf: &[u8]) -> Option<serde_json::Value> {
     let s = std::str::from_utf8(buf).ok()?;
@@ -102,7 +82,7 @@ pub fn is_drop_request(buf: &[u8]) -> bool {
 /// by model name (or falls back to any host), and tunnels the request via QUIC.
 ///
 /// Set `track_demand` to record requests for demand-based rebalancing.
-pub async fn handle_mesh_request(node: mesh::Node, mut tcp_stream: TcpStream, track_demand: bool) {
+pub async fn handle_mesh_request(node: mesh::Node, tcp_stream: TcpStream, track_demand: bool) {
     let mut buf = vec![0u8; 32768];
     let (n, model_name) = match peek_request(&tcp_stream, &mut buf).await {
         Ok(v) => v,
@@ -167,72 +147,18 @@ pub async fn handle_mesh_request(node: mesh::Node, mut tcp_stream: TcpStream, tr
         target_hosts
     };
 
-    // Read the full HTTP request from TCP so we can buffer it for retry.
-    // The peek gave us `n` bytes — read those, then check Content-Length for body remainder.
-    let mut request_buf = vec![0u8; n];
-    if let Err(e) = tcp_stream.read_exact(&mut request_buf).await {
-        tracing::debug!("Failed to read request from TCP: {e}");
-        return;
-    }
-    // Check if there's more body to read based on Content-Length
-    if let Some(total) = parse_content_length(&request_buf) {
-        if let Some(header_end) = find_header_end(&request_buf) {
-            let body_so_far = request_buf.len() - header_end;
-            if body_so_far < total {
-                let remaining = total - body_so_far;
-                let mut rest = vec![0u8; remaining];
-                if let Err(e) = tcp_stream.read_exact(&mut rest).await {
-                    tracing::debug!("Failed to read request body remainder: {e}");
-                    return;
-                }
-                request_buf.extend_from_slice(&rest);
-            }
-        }
-    }
-
-    // Try each host in order — if tunnel open fails OR the remote doesn't
-    // respond (first-byte timeout), retry with the next host.
+    // Try each host in order — if tunnel fails, retry with next.
     // On first failure, trigger background gossip refresh so future requests
     // have a fresh routing table (doesn't block the retry loop).
     let mut last_err = None;
     let mut refreshed = false;
     for target_host in &target_hosts {
         match node.open_http_tunnel(*target_host).await {
-            Ok((mut quic_send, quic_recv)) => {
-                // Send the buffered request over QUIC (don't finish — keep stream open
-                // for bidirectional relay, the host reads Content-Length then responds)
-                if let Err(e) = quic_send.write_all(&request_buf).await {
-                    tracing::warn!("Failed to send request to host {}: {e}, trying next", target_host.fmt_short());
-                    last_err = Some(e.into());
-                    if !refreshed {
-                        let refresh_node = node.clone();
-                        tokio::spawn(async move { refresh_node.gossip_one_peer().await; });
-                        refreshed = true;
-                    }
-                    continue;
+            Ok((quic_send, quic_recv)) => {
+                if let Err(e) = tunnel::relay_tcp_via_quic(tcp_stream, quic_send, quic_recv).await {
+                    tracing::debug!("HTTP tunnel relay ended: {e}");
                 }
-
-                // Wait for first response byte — if this fails, we haven't
-                // written anything to the client TCP stream yet, so we can retry.
-                match tunnel::relay_quic_first_byte(quic_recv, &mut tcp_stream).await {
-                    Ok(quic_recv) => {
-                        // First bytes committed to client — relay the rest.
-                        // No more retry possible after this point.
-                        let (tcp_read, tcp_write) = tokio::io::split(tcp_stream);
-                        let _ = tunnel::relay_remainder(tcp_read, tcp_write, quic_send, quic_recv).await;
-                        return;
-                    }
-                    Err(e) => {
-                        tracing::warn!("Host {} failed before responding: {e}, trying next", target_host.fmt_short());
-                        last_err = Some(e);
-                        if !refreshed {
-                            let refresh_node = node.clone();
-                            tokio::spawn(async move { refresh_node.gossip_one_peer().await; });
-                            refreshed = true;
-                        }
-                        continue;
-                    }
-                }
+                return;
             }
             Err(e) => {
                 tracing::warn!("Failed to tunnel to host {}: {e}, trying next", target_host.fmt_short());
