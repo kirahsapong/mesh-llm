@@ -348,7 +348,7 @@ fn tegrastats_ram_total_mb() -> Option<u64> {
 ///
 /// Looks for the `RAM used/totalMB` token, e.g. `RAM 10400/62838MB`.
 #[cfg(target_os = "linux")]
-pub fn parse_tegrastats_ram_mb(line: &str) -> Option<u64> {
+fn parse_tegrastats_ram_mb(line: &str) -> Option<u64> {
     // Locate the "RAM " token
     let after_ram = line.split_once("RAM ")?.1;
     // Expect "used/totalMB" — skip the used portion
@@ -361,7 +361,7 @@ pub fn parse_tegrastats_ram_mb(line: &str) -> Option<u64> {
 /// Return `true` if this line was produced by tegrastats on a Tegra/Jetson device.
 /// Presence of `GR3D_FREQ` confirms an on-chip GPU.
 #[cfg(target_os = "linux")]
-pub fn tegrastats_line_has_gpu(line: &str) -> bool {
+fn tegrastats_line_has_gpu(line: &str) -> bool {
     line.contains("GR3D_FREQ")
 }
 
