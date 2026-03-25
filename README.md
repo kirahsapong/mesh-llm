@@ -11,7 +11,7 @@ Pool spare GPU capacity to run LLMs at larger scale. Models that don't fit on on
 ## Install (macOS Apple Silicon)
 
 ```bash
-curl -fsSL https://github.com/michaelneale/mesh-llm/releases/latest/download/mesh-bundle.tar.gz | tar xz && mv mesh-bundle/* ~/.local/bin/
+curl -fsSL https://github.com/michaelneale/mesh-llm/releases/latest/download/mesh-bundle.tar.gz | tar xz && mkdir -p ~/.local/bin && mv mesh-bundle/* ~/.local/bin/
 ```
 
 Then run:
