@@ -1,8 +1,14 @@
 use anyhow::{anyhow, bail, Context, Result};
 use prost::Message;
+use rmcp::model::{
+    CallToolResult as McpCallToolResult, ErrorCode, InitializeRequestParams,
+    ListToolsResult, PaginatedRequestParams, ServerInfo,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -10,7 +16,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 pub const BLACKBOARD_PLUGIN_ID: &str = "blackboard";
-const PROTOCOL_VERSION: u32 = 2;
+pub(crate) const PROTOCOL_VERSION: u32 = 1;
 const CONNECT_TIMEOUT_SECS: u64 = 10;
 const REQUEST_TIMEOUT_SECS: u64 = 30;
 const HEALTH_CHECK_INTERVAL_SECS: u64 = 15;
@@ -74,6 +80,29 @@ pub struct ToolCallResult {
     pub is_error: bool,
 }
 
+#[derive(Clone, Debug)]
+pub struct RpcResult {
+    pub result_json: String,
+}
+
+pub(crate) type BridgeFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
+
+pub trait PluginRpcBridge: Send + Sync {
+    fn handle_request(
+        &self,
+        plugin_name: String,
+        method: String,
+        params_json: String,
+    ) -> BridgeFuture<Result<RpcResult, proto::ErrorResponse>>;
+
+    fn handle_notification(
+        &self,
+        plugin_name: String,
+        method: String,
+        params_json: String,
+    ) -> BridgeFuture<()>;
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct PluginSummary {
     pub name: String,
@@ -101,13 +130,16 @@ pub struct PluginManager {
 
 struct PluginManagerInner {
     plugins: BTreeMap<String, ExternalPlugin>,
+    rpc_bridge: Arc<Mutex<Option<Arc<dyn PluginRpcBridge>>>>,
 }
 
 struct ExternalPlugin {
     spec: ExternalPluginSpec,
     summary: Arc<Mutex<PluginSummary>>,
+    server_info: Arc<Mutex<Option<ServerInfo>>>,
     runtime: Arc<Mutex<Option<PluginRuntime>>>,
     mesh_tx: mpsc::Sender<PluginMeshEvent>,
+    rpc_bridge: Arc<Mutex<Option<Arc<dyn PluginRpcBridge>>>>,
     restart_lock: Arc<Mutex<()>>,
     next_request_id: AtomicU64,
     next_generation: AtomicU64,
@@ -120,7 +152,7 @@ struct PluginRuntime {
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<proto::Envelope>>>>>,
 }
 
-enum LocalStream {
+pub(crate) enum LocalStream {
     #[cfg(unix)]
     Unix(tokio::net::UnixStream),
     #[cfg(windows)]
@@ -161,7 +193,6 @@ pub fn resolve_plugins(config: &MeshConfig) -> Result<ResolvedPlugins> {
     let mut externals = Vec::new();
     let mut names = BTreeMap::<String, ()>::new();
     let mut blackboard_enabled = true;
-
     for entry in &config.plugins {
         if names.insert(entry.name.clone(), ()).is_some() {
             bail!("Duplicate plugin entry '{}'", entry.name);
@@ -231,6 +262,7 @@ impl PluginManager {
             );
         }
 
+        let rpc_bridge = Arc::new(Mutex::new(None));
         let mut plugins = BTreeMap::new();
         for spec in &specs.externals {
             tracing::info!(
@@ -239,7 +271,7 @@ impl PluginManager {
                 args = %format_args_for_log(&spec.args),
                 "Loading plugin"
             );
-            let plugin = match ExternalPlugin::spawn(spec, mesh_tx.clone()).await {
+            let plugin = match ExternalPlugin::spawn(spec, mesh_tx.clone(), rpc_bridge.clone()).await {
                 Ok(plugin) => plugin,
                 Err(err) => {
                     tracing::error!(
@@ -261,7 +293,7 @@ impl PluginManager {
             plugins.insert(spec.name.clone(), plugin);
         }
         let manager = Self {
-            inner: Arc::new(PluginManagerInner { plugins }),
+            inner: Arc::new(PluginManagerInner { plugins, rpc_bridge }),
         };
         manager.start_supervisor();
         Ok(manager)
@@ -294,7 +326,7 @@ impl PluginManager {
             .plugins
             .get(name)
             .with_context(|| format!("Unknown plugin '{name}'"))?;
-        Ok(plugin.summary.lock().await.tools.clone())
+        plugin.list_tools().await
     }
 
     pub async fn call_tool(
@@ -309,6 +341,54 @@ impl PluginManager {
             .get(plugin_name)
             .with_context(|| format!("Unknown plugin '{plugin_name}'"))?;
         plugin.call_tool(tool_name, arguments_json).await
+    }
+
+    pub async fn mcp_request<T, P>(&self, plugin_name: &str, method: &str, params: P) -> Result<T>
+    where
+        T: serde::de::DeserializeOwned,
+        P: Serialize,
+    {
+        let plugin = self
+            .inner
+            .plugins
+            .get(plugin_name)
+            .with_context(|| format!("Unknown plugin '{plugin_name}'"))?;
+        plugin.mcp_request(method, params).await
+    }
+
+    pub async fn mcp_notify<P>(&self, plugin_name: &str, method: &str, params: P) -> Result<()>
+    where
+        P: Serialize,
+    {
+        let plugin = self
+            .inner
+            .plugins
+            .get(plugin_name)
+            .with_context(|| format!("Unknown plugin '{plugin_name}'"))?;
+        plugin.mcp_notify(method, params).await
+    }
+
+    pub async fn server_info(&self, name: &str) -> Result<ServerInfo> {
+        let plugin = self
+            .inner
+            .plugins
+            .get(name)
+            .with_context(|| format!("Unknown plugin '{name}'"))?;
+        plugin.server_info().await
+    }
+
+    pub async fn list_server_infos(&self) -> Vec<(String, ServerInfo)> {
+        let mut infos = Vec::new();
+        for (name, plugin) in &self.inner.plugins {
+            if let Ok(info) = plugin.server_info().await {
+                infos.push((name.clone(), info));
+            }
+        }
+        infos
+    }
+
+    pub async fn set_rpc_bridge(&self, bridge: Option<Arc<dyn PluginRpcBridge>>) {
+        *self.inner.rpc_bridge.lock().await = bridge;
     }
 
     pub async fn dispatch_channel_message(&self, event: PluginMeshEvent) -> Result<()> {
@@ -368,7 +448,11 @@ impl PluginManager {
 }
 
 impl ExternalPlugin {
-    async fn spawn(spec: &ExternalPluginSpec, mesh_tx: mpsc::Sender<PluginMeshEvent>) -> Result<Self> {
+    async fn spawn(
+        spec: &ExternalPluginSpec,
+        mesh_tx: mpsc::Sender<PluginMeshEvent>,
+        rpc_bridge: Arc<Mutex<Option<Arc<dyn PluginRpcBridge>>>>,
+    ) -> Result<Self> {
         let plugin = Self {
             spec: spec.clone(),
             summary: Arc::new(Mutex::new(PluginSummary {
@@ -383,8 +467,10 @@ impl ExternalPlugin {
                 tools: Vec::new(),
                 error: None,
             })),
+            server_info: Arc::new(Mutex::new(None)),
             runtime: Arc::new(Mutex::new(None)),
             mesh_tx,
+            rpc_bridge,
             restart_lock: Arc::new(Mutex::new(())),
             next_request_id: AtomicU64::new(1),
             next_generation: AtomicU64::new(1),
@@ -479,6 +565,7 @@ impl ExternalPlugin {
         let (outbound_tx, outbound_rx) = mpsc::channel(256);
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        let outbound_tx_for_runtime = outbound_tx.clone();
         *self.runtime.lock().await = Some(PluginRuntime {
             generation,
             _child: child,
@@ -492,21 +579,24 @@ impl ExternalPlugin {
             self.mesh_tx.clone(),
             self.spec.name.clone(),
             self.summary.clone(),
+            self.rpc_bridge.clone(),
             self.runtime.clone(),
+            outbound_tx_for_runtime,
             generation,
         ));
 
         let (_, outbound_tx, pending) = self.runtime_handles().await?;
         let init_result: Result<proto::InitializeResponse> = async {
+            let host_info_json = serde_json::to_string(&InitializeRequestParams::default())?;
             let response = self
                 .request_once(
                     generation,
-                    outbound_tx,
-                    pending,
+                    outbound_tx.clone(),
+                    pending.clone(),
                     proto::envelope::Payload::InitializeRequest(proto::InitializeRequest {
                         host_protocol_version: PROTOCOL_VERSION,
                         host_version: crate::VERSION.to_string(),
-                        requested_capabilities: Vec::new(),
+                        host_info_json,
                     }),
                 )
                 .await?;
@@ -553,45 +643,165 @@ impl ExternalPlugin {
             }
         };
 
+        let server_info: ServerInfo = serde_json::from_str(&init.server_info_json)
+            .with_context(|| format!("Plugin '{}' returned invalid server_info_json", self.spec.name))?;
+        *self.server_info.lock().await = Some(server_info.clone());
+
+        let tools = if server_info.capabilities.tools.is_some() {
+            let response = self
+                .request_once(
+                    generation,
+                    outbound_tx.clone(),
+                    pending.clone(),
+                    proto::envelope::Payload::RpcRequest(proto::RpcRequest {
+                        method: "tools/list".into(),
+                        params_json: serialize_params(Option::<PaginatedRequestParams>::None)?,
+                    }),
+                )
+                .await;
+            match response {
+                Ok(envelope) => match envelope.payload {
+                    Some(proto::envelope::Payload::RpcResponse(resp)) => {
+                        let result: ListToolsResult =
+                            serde_json::from_str(&resp.result_json).with_context(|| {
+                                format!(
+                                    "Plugin '{}' returned invalid result for 'tools/list'",
+                                    self.spec.name
+                                )
+                            })?;
+                        result
+                            .tools
+                            .into_iter()
+                            .map(|tool| ToolSummary {
+                                name: tool.name.to_string(),
+                                description: tool.description.unwrap_or_default().to_string(),
+                                input_schema_json: serde_json::to_string(tool.input_schema.as_ref())
+                                    .unwrap_or_else(|_| "{}".into()),
+                            })
+                            .collect()
+                    }
+                    Some(proto::envelope::Payload::ErrorResponse(err)) => {
+                        tracing::warn!(
+                            plugin = %self.spec.name,
+                            error = %plugin_error(&self.spec.name, "tools/list", &err),
+                            "Plugin tools/list failed during startup"
+                        );
+                        Vec::new()
+                    }
+                    _ => {
+                        tracing::warn!(
+                            plugin = %self.spec.name,
+                            "Plugin returned unexpected payload for tools/list during startup"
+                        );
+                        Vec::new()
+                    }
+                },
+                Err(err) => {
+                    tracing::warn!(
+                        plugin = %self.spec.name,
+                        error = %err,
+                        "Plugin tools/list request failed during startup"
+                    );
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
         let mut summary = self.summary.lock().await;
         summary.status = "running".into();
         summary.version = Some(init.plugin_version);
-        summary.capabilities = init.capabilities;
-        summary.tools = init
-            .tool_schemas
-            .into_iter()
-            .map(|tool| ToolSummary {
-                name: tool.name,
-                description: tool.description,
-                input_schema_json: tool.input_schema_json,
-            })
-            .collect();
+        summary.capabilities = summarize_capabilities(&server_info, &init.capabilities);
+        summary.tools = tools;
         summary.error = None;
         Ok(())
     }
 
+    async fn server_info(&self) -> Result<ServerInfo> {
+        self.ensure_running().await?;
+        self.server_info
+            .lock()
+            .await
+            .clone()
+            .with_context(|| format!("Plugin '{}' did not publish server info", self.spec.name))
+    }
+
+    async fn list_tools(&self) -> Result<Vec<ToolSummary>> {
+        let info = self.server_info().await?;
+        if info.capabilities.tools.is_none() {
+            return Ok(Vec::new());
+        }
+        let result: ListToolsResult = self.mcp_request("tools/list", None::<PaginatedRequestParams>).await?;
+        Ok(result
+            .tools
+            .into_iter()
+            .map(|tool| ToolSummary {
+                name: tool.name.to_string(),
+                description: tool.description.unwrap_or_default().to_string(),
+                input_schema_json: serde_json::to_string(tool.input_schema.as_ref()).unwrap_or_else(|_| "{}".into()),
+            })
+            .collect())
+    }
+
     async fn call_tool(&self, tool_name: &str, arguments_json: &str) -> Result<ToolCallResult> {
+        let arguments = parse_optional_json(arguments_json)?;
+        let result: McpCallToolResult = self
+            .mcp_request(
+                "tools/call",
+                serde_json::json!({
+                    "name": tool_name,
+                    "arguments": arguments,
+                }),
+            )
+            .await?;
+        Ok(ToolCallResult {
+            content_json: serde_json::to_string(&result)?,
+            is_error: result.is_error.unwrap_or(false),
+        })
+    }
+
+    async fn mcp_request<T, P>(&self, method: &str, params: P) -> Result<T>
+    where
+        T: serde::de::DeserializeOwned,
+        P: Serialize,
+    {
+        let params_json = serialize_params(params)?;
         let response = self
-            .request(proto::envelope::Payload::ToolCallRequest(
-                proto::ToolCallRequest {
-                    name: tool_name.to_string(),
-                    arguments_json: arguments_json.to_string(),
-                },
-            ))
+            .request(proto::envelope::Payload::RpcRequest(proto::RpcRequest {
+                method: method.to_string(),
+                params_json,
+            }))
             .await?;
         match response.payload {
-            Some(proto::envelope::Payload::ToolCallResponse(resp)) => Ok(ToolCallResult {
-                content_json: resp.content_json,
-                is_error: resp.is_error,
-            }),
-            Some(proto::envelope::Payload::ErrorResponse(err)) => {
-                bail!("Plugin tool call failed: {}", err.message)
+            Some(proto::envelope::Payload::RpcResponse(resp)) => {
+                serde_json::from_str(&resp.result_json).with_context(|| {
+                    format!(
+                        "Plugin '{}' returned invalid result for '{}'",
+                        self.spec.name, method
+                    )
+                })
             }
+            Some(proto::envelope::Payload::ErrorResponse(err)) => Err(plugin_error(&self.spec.name, method, &err)),
             _ => bail!(
-                "Plugin '{}' returned an unexpected tool payload",
-                self.spec.name
+                "Plugin '{}' returned an unexpected RPC payload for '{}'",
+                self.spec.name,
+                method
             ),
         }
+    }
+
+    async fn mcp_notify<P>(&self, method: &str, params: P) -> Result<()>
+    where
+        P: Serialize,
+    {
+        self.send_unsolicited(
+            proto::envelope::Payload::RpcNotification(proto::RpcNotification {
+                method: method.to_string(),
+                params_json: serialize_params(params)?,
+            }),
+            method,
+        )
+        .await
     }
 
     async fn send_channel_message(&self, message: proto::ChannelMessage) -> Result<()> {
@@ -753,7 +963,9 @@ async fn connection_loop(
     mesh_tx: mpsc::Sender<PluginMeshEvent>,
     plugin_name: String,
     summary: Arc<Mutex<PluginSummary>>,
+    rpc_bridge: Arc<Mutex<Option<Arc<dyn PluginRpcBridge>>>>,
     runtime: Arc<Mutex<Option<PluginRuntime>>>,
+    outbound_tx: mpsc::Sender<proto::Envelope>,
     generation: u64,
 ) {
     let result: Result<()> = async {
@@ -793,6 +1005,22 @@ async fn connection_loop(
                                     message,
                                 })
                                 .await;
+                        }
+                        Some(proto::envelope::Payload::RpcRequest(request)) => {
+                            forward_plugin_request(
+                                plugin_name.clone(),
+                                request_id,
+                                request,
+                                rpc_bridge.clone(),
+                                outbound_tx.clone(),
+                            );
+                        }
+                        Some(proto::envelope::Payload::RpcNotification(notification)) => {
+                            forward_plugin_notification(
+                                plugin_name.clone(),
+                                notification,
+                                rpc_bridge.clone(),
+                            );
                         }
                         _ => {
                             let responder = pending.lock().await.remove(&request_id);
@@ -836,6 +1064,65 @@ async fn connection_loop(
     for (_, responder) in pending.drain() {
         let _ = responder.send(Err(anyhow!("Plugin '{}' disconnected", plugin_name)));
     }
+}
+
+fn forward_plugin_request(
+    plugin_name: String,
+    request_id: u64,
+    request: proto::RpcRequest,
+    rpc_bridge: Arc<Mutex<Option<Arc<dyn PluginRpcBridge>>>>,
+    outbound_tx: mpsc::Sender<proto::Envelope>,
+) {
+    tokio::spawn(async move {
+        let bridge = rpc_bridge.lock().await.clone();
+        let payload = match bridge {
+            Some(bridge) => match bridge
+                .handle_request(
+                    plugin_name.clone(),
+                    request.method.clone(),
+                    request.params_json.clone(),
+                )
+                .await
+            {
+                Ok(result) => proto::envelope::Payload::RpcResponse(proto::RpcResponse {
+                    result_json: result.result_json,
+                }),
+                Err(err) => proto::envelope::Payload::ErrorResponse(err),
+            },
+            None => proto::envelope::Payload::ErrorResponse(proto::ErrorResponse {
+                code: ErrorCode::INTERNAL_ERROR.0,
+                message: "No active MCP bridge".into(),
+                data_json: String::new(),
+            }),
+        };
+
+        let _ = outbound_tx
+            .send(proto::Envelope {
+                protocol_version: PROTOCOL_VERSION,
+                plugin_id: plugin_name,
+                request_id,
+                payload: Some(payload),
+            })
+            .await;
+    });
+}
+
+fn forward_plugin_notification(
+    plugin_name: String,
+    notification: proto::RpcNotification,
+    rpc_bridge: Arc<Mutex<Option<Arc<dyn PluginRpcBridge>>>>,
+) {
+    tokio::spawn(async move {
+        if let Some(bridge) = rpc_bridge.lock().await.clone() {
+            bridge
+                .handle_notification(
+                    plugin_name,
+                    notification.method,
+                    notification.params_json,
+                )
+                .await;
+        }
+    });
 }
 
 impl LocalListener {
@@ -945,314 +1232,12 @@ pub async fn run_plugin_process(name: String) -> Result<()> {
     let stream = connect_to_host(&endpoint, &transport).await?;
 
     match name.as_str() {
-        BLACKBOARD_PLUGIN_ID => run_blackboard_plugin(name, stream).await,
+        BLACKBOARD_PLUGIN_ID => crate::plugins::blackboard::run_plugin(name, stream).await,
         _ => bail!("Unknown built-in plugin '{}'", name),
     }
 }
 
-async fn run_blackboard_plugin(name: String, mut stream: LocalStream) -> Result<()> {
-    use crate::blackboard::{
-        BlackboardItem, BlackboardMessage, BlackboardStore, FeedRequest, PostRequest, SearchRequest,
-        BLACKBOARD_CHANNEL,
-    };
-
-    fn blackboard_channel_message(
-        target_peer_id: String,
-        body: Vec<u8>,
-    ) -> proto::ChannelMessage {
-        proto::ChannelMessage {
-            channel: BLACKBOARD_CHANNEL.to_string(),
-            source_peer_id: String::new(),
-            target_peer_id,
-            content_type: "application/json".into(),
-            body,
-            message_kind: "blackboard".into(),
-            correlation_id: String::new(),
-            metadata_json: String::new(),
-        }
-    }
-
-    let store = BlackboardStore::new(true);
-    loop {
-        let envelope = read_envelope(&mut stream).await?;
-        match envelope.payload {
-            Some(proto::envelope::Payload::InitializeRequest(_)) => {
-                let response = proto::Envelope {
-                    protocol_version: PROTOCOL_VERSION,
-                    plugin_id: name.clone(),
-                    request_id: envelope.request_id,
-                    payload: Some(proto::envelope::Payload::InitializeResponse(
-                        proto::InitializeResponse {
-                            plugin_id: name.clone(),
-                            plugin_protocol_version: PROTOCOL_VERSION,
-                            plugin_version: crate::VERSION.to_string(),
-                            capabilities: vec![
-                                "channel:blackboard".into(),
-                                "mcp:blackboard".into(),
-                            ],
-                            tool_schemas: vec![
-                                proto::ToolSchema {
-                                    name: "feed".into(),
-                                    description: "Read the recent blackboard feed.".into(),
-                                    input_schema_json: serde_json::json!({
-                                        "type": "object",
-                                        "properties": {
-                                            "since": {"type": "integer"},
-                                            "from": {"type": "string"},
-                                            "limit": {"type": "integer"}
-                                        }
-                                    })
-                                    .to_string(),
-                                },
-                                proto::ToolSchema {
-                                    name: "search".into(),
-                                    description: "Search blackboard messages.".into(),
-                                    input_schema_json: serde_json::json!({
-                                        "type": "object",
-                                        "properties": {
-                                            "query": {"type": "string"},
-                                            "since": {"type": "integer"},
-                                            "limit": {"type": "integer"}
-                                        },
-                                        "required": ["query"]
-                                    })
-                                    .to_string(),
-                                },
-                                proto::ToolSchema {
-                                    name: "post".into(),
-                                    description: "Post a blackboard message.".into(),
-                                    input_schema_json: serde_json::json!({
-                                        "type": "object",
-                                        "properties": {
-                                            "text": {"type": "string"},
-                                            "from": {"type": "string"},
-                                            "peer_id": {"type": "string"}
-                                        },
-                                        "required": ["text"]
-                                    })
-                                    .to_string(),
-                                },
-                            ],
-                        },
-                    )),
-                };
-                write_envelope(&mut stream, &response).await?;
-                send_plugin_channel_message(
-                    &mut stream,
-                    &name,
-                    blackboard_channel_message(
-                        String::new(),
-                        serde_json::to_vec(&BlackboardMessage::SyncRequest)?,
-                    ),
-                )
-                .await?;
-            }
-            Some(proto::envelope::Payload::HealthRequest(_)) => {
-                let response = proto::Envelope {
-                    protocol_version: PROTOCOL_VERSION,
-                    plugin_id: name.clone(),
-                    request_id: envelope.request_id,
-                    payload: Some(proto::envelope::Payload::HealthResponse(
-                        proto::HealthResponse {
-                            status: proto::health_response::Status::Ok as i32,
-                            detail: "ok".into(),
-                        },
-                    )),
-                };
-                write_envelope(&mut stream, &response).await?;
-            }
-            Some(proto::envelope::Payload::ShutdownRequest(_)) => {
-                let response = proto::Envelope {
-                    protocol_version: PROTOCOL_VERSION,
-                    plugin_id: name.clone(),
-                    request_id: envelope.request_id,
-                    payload: Some(proto::envelope::Payload::ShutdownResponse(
-                        proto::ShutdownResponse {},
-                    )),
-                };
-                write_envelope(&mut stream, &response).await?;
-                break;
-            }
-            Some(proto::envelope::Payload::ToolCallRequest(call)) => {
-                let payload = match call.name.as_str() {
-                    "feed" => {
-                        let request = serde_json::from_str::<FeedRequest>(&call.arguments_json)
-                            .unwrap_or_default();
-                        let items = store.feed(request.since, request.from.as_deref(), request.limit).await;
-                        proto::envelope::Payload::ToolCallResponse(proto::ToolCallResponse {
-                            content_json: serde_json::to_string(&items)?,
-                            is_error: false,
-                        })
-                    }
-                    "search" => {
-                        match serde_json::from_str::<SearchRequest>(&call.arguments_json) {
-                            Ok(request) => {
-                                let mut items = store.search(&request.query, request.since).await;
-                                items.truncate(request.limit.max(1));
-                                proto::envelope::Payload::ToolCallResponse(
-                                    proto::ToolCallResponse {
-                                        content_json: serde_json::to_string(&items)?,
-                                        is_error: false,
-                                    },
-                                )
-                            }
-                            Err(err) => {
-                                proto::envelope::Payload::ErrorResponse(proto::ErrorResponse {
-                                    code: proto::error_response::Code::InvalidRequest as i32,
-                                    message: format!("Invalid search arguments: {err}"),
-                                })
-                            }
-                        }
-                    }
-                    "post" => {
-                        match serde_json::from_str::<PostRequest>(&call.arguments_json) {
-                            Ok(request) => {
-                                let from = if request.from.trim().is_empty() {
-                                    "mcp".to_string()
-                                } else {
-                                    request.from
-                                };
-                                let peer_id = if request.peer_id.trim().is_empty() {
-                                    "mcp".to_string()
-                                } else {
-                                    request.peer_id
-                                };
-                                let item = BlackboardItem::new(from, peer_id, request.text);
-                                match store.post(item).await {
-                                    Ok(posted) => {
-                                        send_plugin_channel_message(
-                                            &mut stream,
-                                            &name,
-                                            blackboard_channel_message(
-                                                String::new(),
-                                                serde_json::to_vec(&BlackboardMessage::Post(
-                                                    posted.clone(),
-                                                ))?,
-                                            ),
-                                        )
-                                        .await?;
-                                        proto::envelope::Payload::ToolCallResponse(
-                                            proto::ToolCallResponse {
-                                                content_json: serde_json::to_string(&posted)?,
-                                                is_error: false,
-                                            },
-                                        )
-                                    }
-                                    Err(reason) => {
-                                        proto::envelope::Payload::ErrorResponse(
-                                            proto::ErrorResponse {
-                                                code: proto::error_response::Code::InvalidRequest
-                                                    as i32,
-                                                message: reason,
-                                            },
-                                        )
-                                    }
-                                }
-                            }
-                            Err(err) => {
-                                proto::envelope::Payload::ErrorResponse(proto::ErrorResponse {
-                                    code: proto::error_response::Code::InvalidRequest as i32,
-                                    message: format!("Invalid post arguments: {err}"),
-                                })
-                            }
-                        }
-                    }
-                    _ => proto::envelope::Payload::ErrorResponse(proto::ErrorResponse {
-                        code: proto::error_response::Code::UnsupportedCapability as i32,
-                        message: format!("Unknown tool '{}'", call.name),
-                    }),
-                };
-                let response = proto::Envelope {
-                    protocol_version: PROTOCOL_VERSION,
-                    plugin_id: name.clone(),
-                    request_id: envelope.request_id,
-                    payload: Some(payload),
-                };
-                write_envelope(&mut stream, &response).await?;
-            }
-            Some(proto::envelope::Payload::ChannelMessage(message)) => {
-                if message.channel != BLACKBOARD_CHANNEL {
-                    continue;
-                }
-                let payload: BlackboardMessage = serde_json::from_slice(&message.body)?;
-                match payload {
-                    BlackboardMessage::Post(item) => {
-                        let _ = store.insert(item).await;
-                    }
-                    BlackboardMessage::SyncRequest => {
-                        let ids = store.ids().await;
-                        let response = BlackboardMessage::SyncDigest(ids);
-                        send_plugin_channel_message(
-                            &mut stream,
-                            &name,
-                            blackboard_channel_message(
-                                message.source_peer_id,
-                                serde_json::to_vec(&response)?,
-                            ),
-                        )
-                        .await?;
-                    }
-                    BlackboardMessage::SyncDigest(ids) => {
-                        let our_ids = store.ids().await;
-                        let missing: Vec<u64> = ids
-                            .into_iter()
-                            .filter(|id| !our_ids.contains(id))
-                            .collect();
-                        if !missing.is_empty() {
-                            send_plugin_channel_message(
-                                &mut stream,
-                                &name,
-                                blackboard_channel_message(
-                                    message.source_peer_id,
-                                    serde_json::to_vec(&BlackboardMessage::FetchRequest(missing))?,
-                                ),
-                            )
-                            .await?;
-                        }
-                    }
-                    BlackboardMessage::FetchRequest(ids) => {
-                        let items = store.get_by_ids(&ids).await;
-                        send_plugin_channel_message(
-                            &mut stream,
-                            &name,
-                            blackboard_channel_message(
-                                message.source_peer_id,
-                                serde_json::to_vec(&BlackboardMessage::FetchResponse(items))?,
-                            ),
-                        )
-                        .await?;
-                    }
-                    BlackboardMessage::FetchResponse(items) => {
-                        for item in items {
-                            let _ = store.insert(item).await;
-                        }
-                    }
-                }
-            }
-            Some(proto::envelope::Payload::MeshEvent(_)) => {
-                continue;
-            }
-            _ => {
-                let response = proto::Envelope {
-                    protocol_version: PROTOCOL_VERSION,
-                    plugin_id: name.clone(),
-                    request_id: envelope.request_id,
-                    payload: Some(proto::envelope::Payload::ErrorResponse(
-                        proto::ErrorResponse {
-                            code: proto::error_response::Code::InvalidRequest as i32,
-                            message: "Unsupported request".into(),
-                        },
-                    )),
-                };
-                write_envelope(&mut stream, &response).await?;
-            }
-        }
-    }
-
-    Ok(())
-}
-
-async fn send_plugin_channel_message(
+pub(crate) async fn send_plugin_channel_message(
     stream: &mut LocalStream,
     plugin_id: &str,
     message: proto::ChannelMessage,
@@ -1264,6 +1249,23 @@ async fn send_plugin_channel_message(
             plugin_id: plugin_id.to_string(),
             request_id: 0,
             payload: Some(proto::envelope::Payload::ChannelMessage(message)),
+        },
+    )
+    .await
+}
+
+pub(crate) async fn send_plugin_bulk_transfer_message(
+    stream: &mut LocalStream,
+    plugin_id: &str,
+    message: proto::BulkTransferMessage,
+) -> Result<()> {
+    write_envelope(
+        stream,
+        &proto::Envelope {
+            protocol_version: PROTOCOL_VERSION,
+            plugin_id: plugin_id.to_string(),
+            request_id: 0,
+            payload: Some(proto::envelope::Payload::BulkTransferMessage(message)),
         },
     )
     .await
@@ -1281,7 +1283,73 @@ async fn connect_to_host(endpoint: &str, transport: &str) -> Result<LocalStream>
     }
 }
 
-async fn write_envelope(stream: &mut LocalStream, envelope: &proto::Envelope) -> Result<()> {
+pub(crate) fn serialize_params<T: Serialize>(params: T) -> Result<String> {
+    serde_json::to_string(&params).context("serialize plugin RPC params")
+}
+
+pub(crate) fn parse_optional_json(raw: &str) -> Result<Option<serde_json::Value>> {
+    if raw.trim().is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(
+            serde_json::from_str(raw).context("parse plugin JSON payload")?,
+        ))
+    }
+}
+
+fn plugin_error(plugin_name: &str, method: &str, err: &proto::ErrorResponse) -> anyhow::Error {
+    if err.data_json.trim().is_empty() {
+        anyhow!(
+            "Plugin '{}' failed '{}' (code {}): {}",
+            plugin_name,
+            method,
+            err.code,
+            err.message
+        )
+    } else {
+        anyhow!(
+            "Plugin '{}' failed '{}' (code {}): {} ({})",
+            plugin_name,
+            method,
+            err.code,
+            err.message,
+            err.data_json
+        )
+    }
+}
+
+fn summarize_capabilities(server_info: &ServerInfo, extra: &[String]) -> Vec<String> {
+    let mut capabilities = extra.to_vec();
+    let caps = &server_info.capabilities;
+    if caps.tools.is_some() {
+        capabilities.push("mcp:tools".into());
+    }
+    if caps.prompts.is_some() {
+        capabilities.push("mcp:prompts".into());
+    }
+    if caps.resources.is_some() {
+        capabilities.push("mcp:resources".into());
+    }
+    if caps.completions.is_some() {
+        capabilities.push("mcp:completions".into());
+    }
+    if caps.logging.is_some() {
+        capabilities.push("mcp:logging".into());
+    }
+    if caps.tasks.is_some() {
+        capabilities.push("mcp:tasks".into());
+    }
+    if let Some(extensions) = &caps.extensions {
+        for key in extensions.keys() {
+            capabilities.push(format!("mcp:extension:{key}"));
+        }
+    }
+    capabilities.sort();
+    capabilities.dedup();
+    capabilities
+}
+
+pub(crate) async fn write_envelope(stream: &mut LocalStream, envelope: &proto::Envelope) -> Result<()> {
     let mut body = Vec::new();
     envelope.encode(&mut body)?;
     stream.write_all(&(body.len() as u32).to_le_bytes()).await?;
@@ -1289,7 +1357,7 @@ async fn write_envelope(stream: &mut LocalStream, envelope: &proto::Envelope) ->
     Ok(())
 }
 
-async fn read_envelope(stream: &mut LocalStream) -> Result<proto::Envelope> {
+pub(crate) async fn read_envelope(stream: &mut LocalStream) -> Result<proto::Envelope> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
     let len = u32::from_le_bytes(len_buf) as usize;

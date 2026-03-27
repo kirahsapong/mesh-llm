@@ -6,6 +6,7 @@
 pub mod mcp;
 
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -259,6 +260,405 @@ impl BlackboardStore {
             items.truncate(MAX_ITEMS);
         }
     }
+}
+
+pub(crate) async fn run_plugin(
+    name: String,
+    mut stream: crate::plugin::LocalStream,
+) -> anyhow::Result<()> {
+    use rmcp::model::{
+        CallToolResult, ErrorCode, Implementation, ListToolsResult, ServerCapabilities,
+        ServerInfo, Tool,
+    };
+    use std::sync::Arc;
+
+    fn blackboard_channel_message(
+        target_peer_id: String,
+        body: Vec<u8>,
+    ) -> crate::plugin::proto::ChannelMessage {
+        crate::plugin::proto::ChannelMessage {
+            channel: BLACKBOARD_CHANNEL.to_string(),
+            source_peer_id: String::new(),
+            target_peer_id,
+            content_type: "application/json".into(),
+            body,
+            message_kind: "blackboard".into(),
+            correlation_id: String::new(),
+            metadata_json: String::new(),
+        }
+    }
+
+    fn tools() -> Vec<Tool> {
+        vec![
+            Tool::new(
+                "feed",
+                "Read the recent blackboard feed.",
+                Arc::new(
+                    json!({
+                        "type": "object",
+                        "properties": {
+                            "since": {"type": "integer"},
+                            "from": {"type": "string"},
+                            "limit": {"type": "integer"}
+                        }
+                    })
+                    .as_object()
+                    .cloned()
+                    .unwrap(),
+                ),
+            ),
+            Tool::new(
+                "search",
+                "Search blackboard messages.",
+                Arc::new(
+                    json!({
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                            "since": {"type": "integer"},
+                            "limit": {"type": "integer"}
+                        },
+                        "required": ["query"]
+                    })
+                    .as_object()
+                    .cloned()
+                    .unwrap(),
+                ),
+            ),
+            Tool::new(
+                "post",
+                "Post a blackboard message.",
+                Arc::new(
+                    json!({
+                        "type": "object",
+                        "properties": {
+                            "text": {"type": "string"},
+                            "from": {"type": "string"},
+                            "peer_id": {"type": "string"}
+                        },
+                        "required": ["text"]
+                    })
+                    .as_object()
+                    .cloned()
+                    .unwrap(),
+                ),
+            ),
+        ]
+    }
+
+    fn error_response(
+        plugin_name: &str,
+        request_id: u64,
+        code: i32,
+        message: String,
+    ) -> crate::plugin::proto::Envelope {
+        crate::plugin::proto::Envelope {
+            protocol_version: crate::plugin::PROTOCOL_VERSION,
+            plugin_id: plugin_name.to_string(),
+            request_id,
+            payload: Some(crate::plugin::proto::envelope::Payload::ErrorResponse(
+                crate::plugin::proto::ErrorResponse {
+                    code,
+                    message,
+                    data_json: String::new(),
+                },
+            )),
+        }
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct ToolCallParams {
+        name: String,
+        #[serde(default)]
+        arguments: Option<serde_json::Map<String, serde_json::Value>>,
+    }
+
+    let store = BlackboardStore::new(true);
+    loop {
+        let envelope = crate::plugin::read_envelope(&mut stream).await?;
+        match envelope.payload {
+            Some(crate::plugin::proto::envelope::Payload::InitializeRequest(_)) => {
+                let server_info = ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+                    .with_server_info(
+                        Implementation::new("mesh-blackboard", crate::VERSION)
+                            .with_title("Mesh Blackboard Plugin")
+                            .with_description(
+                                "Shared blackboard across the mesh for status, questions, findings, and tips.",
+                            ),
+                    )
+                    .with_instructions(
+                        "Use blackboard.feed to inspect the recent feed, blackboard.search to find relevant posts, and blackboard.post to share findings.",
+                    );
+                let response = crate::plugin::proto::Envelope {
+                    protocol_version: crate::plugin::PROTOCOL_VERSION,
+                    plugin_id: name.clone(),
+                    request_id: envelope.request_id,
+                    payload: Some(crate::plugin::proto::envelope::Payload::InitializeResponse(
+                        crate::plugin::proto::InitializeResponse {
+                            plugin_id: name.clone(),
+                            plugin_protocol_version: crate::plugin::PROTOCOL_VERSION,
+                            plugin_version: crate::VERSION.to_string(),
+                            server_info_json: serde_json::to_string(&server_info)?,
+                            capabilities: vec!["channel:blackboard".into()],
+                        },
+                    )),
+                };
+                crate::plugin::write_envelope(&mut stream, &response).await?;
+                crate::plugin::send_plugin_channel_message(
+                    &mut stream,
+                    &name,
+                    blackboard_channel_message(
+                        String::new(),
+                        serde_json::to_vec(&BlackboardMessage::SyncRequest)?,
+                    ),
+                )
+                .await?;
+            }
+            Some(crate::plugin::proto::envelope::Payload::HealthRequest(_)) => {
+                let response = crate::plugin::proto::Envelope {
+                    protocol_version: crate::plugin::PROTOCOL_VERSION,
+                    plugin_id: name.clone(),
+                    request_id: envelope.request_id,
+                    payload: Some(crate::plugin::proto::envelope::Payload::HealthResponse(
+                        crate::plugin::proto::HealthResponse {
+                            status: crate::plugin::proto::health_response::Status::Ok as i32,
+                            detail: "ok".into(),
+                        },
+                    )),
+                };
+                crate::plugin::write_envelope(&mut stream, &response).await?;
+            }
+            Some(crate::plugin::proto::envelope::Payload::ShutdownRequest(_)) => {
+                let response = crate::plugin::proto::Envelope {
+                    protocol_version: crate::plugin::PROTOCOL_VERSION,
+                    plugin_id: name.clone(),
+                    request_id: envelope.request_id,
+                    payload: Some(crate::plugin::proto::envelope::Payload::ShutdownResponse(
+                        crate::plugin::proto::ShutdownResponse {},
+                    )),
+                };
+                crate::plugin::write_envelope(&mut stream, &response).await?;
+                break;
+            }
+            Some(crate::plugin::proto::envelope::Payload::RpcRequest(call)) => {
+                let response = match call.method.as_str() {
+                    "tools/list" => crate::plugin::proto::Envelope {
+                        protocol_version: crate::plugin::PROTOCOL_VERSION,
+                        plugin_id: name.clone(),
+                        request_id: envelope.request_id,
+                        payload: Some(crate::plugin::proto::envelope::Payload::RpcResponse(
+                            crate::plugin::proto::RpcResponse {
+                                result_json: serde_json::to_string(&ListToolsResult {
+                                    tools: tools(),
+                                    meta: None,
+                                    next_cursor: None,
+                                })?,
+                            },
+                        )),
+                    },
+                    "tools/call" => {
+                        let params: ToolCallParams = serde_json::from_str(&call.params_json)?;
+                        let arguments_json =
+                            serde_json::Value::Object(params.arguments.unwrap_or_default()).to_string();
+                        let result = match params.name.as_str() {
+                            "feed" => {
+                                let request = serde_json::from_str::<FeedRequest>(&arguments_json)
+                                    .unwrap_or_default();
+                                CallToolResult::structured(json!(
+                                    store
+                                        .feed(
+                                            request.since,
+                                            request.from.as_deref(),
+                                            request.limit,
+                                        )
+                                        .await
+                                ))
+                            }
+                            "search" => match serde_json::from_str::<SearchRequest>(&arguments_json) {
+                                Ok(request) => {
+                                    let mut items = store.search(&request.query, request.since).await;
+                                    items.truncate(request.limit.max(1));
+                                    CallToolResult::structured(json!(items))
+                                }
+                                Err(err) => {
+                                    crate::plugin::write_envelope(
+                                        &mut stream,
+                                        &error_response(
+                                            &name,
+                                            envelope.request_id,
+                                            ErrorCode::INVALID_PARAMS.0,
+                                            format!("Invalid search arguments: {err}"),
+                                        ),
+                                    )
+                                    .await?;
+                                    continue;
+                                }
+                            },
+                            "post" => match serde_json::from_str::<PostRequest>(&arguments_json) {
+                                Ok(request) => {
+                                    let from = if request.from.trim().is_empty() {
+                                        "mcp".to_string()
+                                    } else {
+                                        request.from
+                                    };
+                                    let peer_id = if request.peer_id.trim().is_empty() {
+                                        "mcp".to_string()
+                                    } else {
+                                        request.peer_id
+                                    };
+                                    let item = BlackboardItem::new(from, peer_id, request.text);
+                                    match store.post(item).await {
+                                        Ok(posted) => {
+                                            crate::plugin::send_plugin_channel_message(
+                                                &mut stream,
+                                                &name,
+                                                blackboard_channel_message(
+                                                    String::new(),
+                                                    serde_json::to_vec(&BlackboardMessage::Post(
+                                                        posted.clone(),
+                                                    ))?,
+                                                ),
+                                            )
+                                            .await?;
+                                            CallToolResult::structured(json!(posted))
+                                        }
+                                        Err(reason) => {
+                                            crate::plugin::write_envelope(
+                                                &mut stream,
+                                                &error_response(
+                                                    &name,
+                                                    envelope.request_id,
+                                                    ErrorCode::INVALID_PARAMS.0,
+                                                    reason,
+                                                ),
+                                            )
+                                            .await?;
+                                            continue;
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    crate::plugin::write_envelope(
+                                        &mut stream,
+                                        &error_response(
+                                            &name,
+                                            envelope.request_id,
+                                            ErrorCode::INVALID_PARAMS.0,
+                                            format!("Invalid post arguments: {err}"),
+                                        ),
+                                    )
+                                    .await?;
+                                    continue;
+                                }
+                            },
+                            _ => {
+                                crate::plugin::write_envelope(
+                                    &mut stream,
+                                    &error_response(
+                                        &name,
+                                        envelope.request_id,
+                                        ErrorCode::METHOD_NOT_FOUND.0,
+                                        format!("Unknown tool '{}'", params.name),
+                                    ),
+                                )
+                                .await?;
+                                continue;
+                            }
+                        };
+
+                        crate::plugin::proto::Envelope {
+                            protocol_version: crate::plugin::PROTOCOL_VERSION,
+                            plugin_id: name.clone(),
+                            request_id: envelope.request_id,
+                            payload: Some(crate::plugin::proto::envelope::Payload::RpcResponse(
+                                crate::plugin::proto::RpcResponse {
+                                    result_json: serde_json::to_string(&result)?,
+                                },
+                            )),
+                        }
+                    }
+                    _ => error_response(
+                        &name,
+                        envelope.request_id,
+                        ErrorCode::METHOD_NOT_FOUND.0,
+                        format!("Unsupported MCP method '{}'", call.method),
+                    ),
+                };
+                crate::plugin::write_envelope(&mut stream, &response).await?;
+            }
+            Some(crate::plugin::proto::envelope::Payload::ChannelMessage(message)) => {
+                if message.channel != BLACKBOARD_CHANNEL {
+                    continue;
+                }
+                let payload: BlackboardMessage = serde_json::from_slice(&message.body)?;
+                match payload {
+                    BlackboardMessage::Post(item) => {
+                        let _ = store.insert(item).await;
+                    }
+                    BlackboardMessage::SyncRequest => {
+                        let ids = store.ids().await;
+                        let response = BlackboardMessage::SyncDigest(ids);
+                        crate::plugin::send_plugin_channel_message(
+                            &mut stream,
+                            &name,
+                            blackboard_channel_message(
+                                message.source_peer_id,
+                                serde_json::to_vec(&response)?,
+                            ),
+                        )
+                        .await?;
+                    }
+                    BlackboardMessage::SyncDigest(ids) => {
+                        let our_ids = store.ids().await;
+                        let missing: Vec<u64> = ids
+                            .into_iter()
+                            .filter(|id| !our_ids.contains(id))
+                            .collect();
+                        if !missing.is_empty() {
+                            crate::plugin::send_plugin_channel_message(
+                                &mut stream,
+                                &name,
+                                blackboard_channel_message(
+                                    message.source_peer_id,
+                                    serde_json::to_vec(&BlackboardMessage::FetchRequest(missing))?,
+                                ),
+                            )
+                            .await?;
+                        }
+                    }
+                    BlackboardMessage::FetchRequest(ids) => {
+                        let items = store.get_by_ids(&ids).await;
+                        crate::plugin::send_plugin_channel_message(
+                            &mut stream,
+                            &name,
+                            blackboard_channel_message(
+                                message.source_peer_id,
+                                serde_json::to_vec(&BlackboardMessage::FetchResponse(items))?,
+                            ),
+                        )
+                        .await?;
+                    }
+                    BlackboardMessage::FetchResponse(items) => {
+                        for item in items {
+                            let _ = store.insert(item).await;
+                        }
+                    }
+                }
+            }
+            Some(crate::plugin::proto::envelope::Payload::MeshEvent(_)) => {}
+            _ => {
+                let response = error_response(
+                    &name,
+                    envelope.request_id,
+                    ErrorCode::INVALID_REQUEST.0,
+                    "Unsupported request".into(),
+                );
+                crate::plugin::write_envelope(&mut stream, &response).await?;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 // ── PII filter ──

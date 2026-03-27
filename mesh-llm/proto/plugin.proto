@@ -15,11 +15,12 @@ message Envelope {
     ShutdownRequest shutdown_request = 14;
     ShutdownResponse shutdown_response = 15;
     MeshEvent mesh_event = 16;
-    ToolCallRequest tool_call_request = 17;
-    ToolCallResponse tool_call_response = 18;
-    ChannelMessage channel_message = 19;
+    RpcRequest rpc_request = 17;
+    RpcResponse rpc_response = 18;
+    RpcNotification rpc_notification = 19;
     ErrorResponse error_response = 20;
-    BulkTransferMessage bulk_transfer_message = 21;
+    ChannelMessage channel_message = 21;
+    BulkTransferMessage bulk_transfer_message = 22;
   }
 }
 
@@ -28,15 +29,15 @@ message Empty {}
 message InitializeRequest {
   uint32 host_protocol_version = 1;
   string host_version = 2;
-  repeated string requested_capabilities = 3;
+  string host_info_json = 3;
 }
 
 message InitializeResponse {
   string plugin_id = 1;
   uint32 plugin_protocol_version = 2;
   string plugin_version = 3;
-  repeated string capabilities = 4;
-  repeated ToolSchema tool_schemas = 5;
+  string server_info_json = 4;
+  repeated string capabilities = 5;
 }
 
 message HealthRequest {}
@@ -91,20 +92,18 @@ message MeshEvent {
   string detail_json = 5;
 }
 
-message ToolSchema {
-  string name = 1;
-  string description = 2;
-  string input_schema_json = 3;
+message RpcRequest {
+  string method = 1;
+  string params_json = 2;
 }
 
-message ToolCallRequest {
-  string name = 1;
-  string arguments_json = 2;
+message RpcResponse {
+  string result_json = 1;
 }
 
-message ToolCallResponse {
-  string content_json = 1;
-  bool is_error = 2;
+message RpcNotification {
+  string method = 1;
+  string params_json = 2;
 }
 
 message ChannelMessage {
@@ -157,15 +156,7 @@ message MeshBulkFrame {
 }
 
 message ErrorResponse {
-  enum Code {
-    CODE_UNSPECIFIED = 0;
-    UNKNOWN = 1;
-    INVALID_REQUEST = 2;
-    UNSUPPORTED_CAPABILITY = 3;
-    PROTOCOL_MISMATCH = 4;
-    INTERNAL = 5;
-  }
-
-  Code code = 1;
+  int32 code = 1;
   string message = 2;
+  string data_json = 3;
 }

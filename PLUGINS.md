@@ -246,7 +246,9 @@ Core message families:
 - initialize
 - health
 - shutdown
-- tool calls
+- MCP RPC requests
+- MCP RPC responses
+- MCP RPC notifications
 - channel messages
 - bulk transfer
 - mesh events
@@ -264,8 +266,8 @@ The plugin must provide:
 - `plugin_id`
 - `plugin_protocol_version`
 - `plugin_version`
+- `server_info_json`
 - `capabilities`
-- `tool_schemas`
 
 The host currently requires protocol version equality.
 
@@ -316,27 +318,45 @@ At runtime, external plugins are supervised by the host. If the plugin disconnec
 responding, or fails health checks, the host marks it as restarting and attempts to relaunch it on
 the next supervision round before redelivering control, bulk, or mesh events.
 
-### Tool Schemas
+### MCP RPC
 
-Tool schemas are advertised in `InitializeResponse.tool_schemas`.
+Plugins expose standard MCP server methods through generic RPC envelopes.
 
-Each schema includes:
+Common methods include:
 
-- `name`
-- `description`
-- `input_schema_json`
+- `tools/list`
+- `tools/call`
+- `prompts/list`
+- `prompts/get`
+- `resources/list`
+- `resources/templates/list`
+- `resources/read`
+- `resources/subscribe`
+- `resources/unsubscribe`
+- `completion/complete`
+- `logging/setLevel`
+- task methods such as `tasks/list`, `tasks/get`, `tasks/result`, and `tasks/cancel`
 
-These schemas are used for:
+Plugins can also send host-directed MCP client requests and notifications over the same envelope
+surface, including:
+
+- `roots/list`
+- `sampling/createMessage`
+- `elicitation/create`
+- standard MCP notifications such as resource updates and list-changed events
+
+The `server_info_json` field in `InitializeResponse` carries the canonical MCP capability
+declaration for the plugin. The host uses that MCP server info for:
 
 - management API discovery
-- MCP tool exposure
+- aggregated MCP server exposure
 
 ### Tool Calls
 
-Tool execution uses:
+Tool execution is now standard MCP:
 
-- `ToolCallRequest`
-- `ToolCallResponse`
+- `tools/list`
+- `tools/call`
 
 `arguments_json` is passed through as JSON text.
 
@@ -495,11 +515,29 @@ It is:
 
 The runtime reuses shared blackboard data types from:
 
-- [`mesh-llm/src/blackboard.rs`](/Users/jdumay/.codex/worktrees/16af/decentralized-inference/mesh-llm/src/blackboard.rs)
+- [`mesh-llm/src/plugins/blackboard/mod.rs`](/Users/jdumay/code/mesh-llm/mesh-llm/src/plugins/blackboard/mod.rs)
 
 The generic MCP adapter for plugins is in:
 
-- [`mesh-llm/src/plugin_mcp.rs`](/Users/jdumay/.codex/worktrees/16af/decentralized-inference/mesh-llm/src/plugin_mcp.rs)
+- [`mesh-llm/src/plugin_mcp.rs`](/Users/jdumay/code/mesh-llm/mesh-llm/src/plugin_mcp.rs)
+
+## Example Surface Plugin
+
+The repo also includes a standalone example plugin executable under:
+
+- [`mesh-llm/examples/plugin-surface`](/Users/jdumay/code/mesh-llm/mesh-llm/examples/plugin-surface)
+
+It demonstrates:
+
+- tool schemas and tool calls
+- MCP exposure through the generic plugin MCP adapter
+- targeted and broadcast `ChannelMessage` delivery
+- targeted and broadcast `BulkTransferMessage` delivery
+- inbound mesh event observation
+
+It is useful for validating plugin behavior on a real mesh without inventing a new production feature first.
+
+It is not built into `mesh-llm`, and it is not part of the normal `mesh-llm` distribution. To use it, compile the example executable separately and point a config entry at that binary.
 
 ## Implementation Checklist For New Plugins
 
@@ -508,7 +546,7 @@ If you are building a new plugin, the minimum checklist is:
 1. Implement an executable that can be launched locally.
 2. Read the host-provided environment variables.
 3. Connect to the host over the provided local IPC transport.
-4. Speak the framed protobuf protocol from [`plugin.proto`](/Users/jdumay/.codex/worktrees/16af/decentralized-inference/mesh-llm/proto/plugin.proto).
+4. Speak the framed protobuf protocol from [`plugin.proto`](/Users/jdumay/code/mesh-llm/mesh-llm/proto/plugin.proto).
 5. Respond correctly to `InitializeRequest`.
 6. Return stable tool schemas and tool outputs.
 7. If using mesh traffic, define a stable `channel` name and message body format.
