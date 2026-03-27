@@ -16,9 +16,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: Linux
+          - name: Linux CPU
             os: ubuntu-latest
-            artifact_name: release-linux
+            artifact_name: release-linux-cpu
           - name: macOS
             os: macos-14
             artifact_name: release-macos
