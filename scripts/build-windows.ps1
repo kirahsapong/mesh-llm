@@ -79,7 +79,7 @@ function Invoke-NativeCommand {
     & $Command @Arguments
     if ($LASTEXITCODE -ne 0) {
         $argString = if ($Arguments.Count -gt 0) { " " + ($Arguments -join " ") } else { "" }
-        throw "Command failed with exit code $LASTEXITCODE: $Command$argString"
+        throw "Command failed with exit code ${LASTEXITCODE}: $Command$argString"
     }
 }
 
