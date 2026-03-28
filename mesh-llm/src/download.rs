@@ -893,8 +893,9 @@ mod tests {
     #[test]
     fn test_free_disk_space() {
         // Should return Some for an existing path
-        let free = free_disk_space(std::path::Path::new("/tmp/test_file.gguf"));
-        assert!(free.is_some(), "should get free space for /tmp");
+        let tmp = std::env::temp_dir().join("test_file.gguf");
+        let free = free_disk_space(&tmp);
+        assert!(free.is_some(), "should get free space for temp dir");
         let bytes = free.unwrap();
         assert!(bytes > 1_000_000_000, "should have >1GB free, got {bytes}");
         eprintln!("Free disk space on /tmp: {:.1} GB", bytes as f64 / 1e9);
