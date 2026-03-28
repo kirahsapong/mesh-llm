@@ -69,6 +69,20 @@ function Import-CmdEnvironment {
     }
 }
 
+function Invoke-NativeCommand {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Command,
+        [string[]]$Arguments = @()
+    )
+
+    & $Command @Arguments
+    if ($LASTEXITCODE -ne 0) {
+        $argString = if ($Arguments.Count -gt 0) { " " + ($Arguments -join " ") } else { "" }
+        throw "Command failed with exit code $LASTEXITCODE: $Command$argString"
+    }
+}
+
 function Normalize-RecipeArgument {
     param(
         [AllowEmptyString()]
@@ -464,17 +478,17 @@ switch ($backendName) {
 Invoke-InRepo {
     if (-not (Test-Path $llamaDir)) {
         Write-Host "Cloning michaelneale/llama.cpp (rebase-upstream-master branch)..."
-        git clone -b rebase-upstream-master https://github.com/michaelneale/llama.cpp.git $llamaDir
+        Invoke-NativeCommand "git" @("clone", "-b", "rebase-upstream-master", "https://github.com/michaelneale/llama.cpp.git", $llamaDir)
     } else {
         Push-Location $llamaDir
         try {
-            $currentBranch = git branch --show-current
+            $currentBranch = (& git branch --show-current).Trim()
             if ($currentBranch -ne "rebase-upstream-master") {
                 Write-Host "Switching llama.cpp from '$currentBranch' to rebase-upstream-master..."
-                git checkout rebase-upstream-master
+                Invoke-NativeCommand "git" @("checkout", "rebase-upstream-master")
             }
             Write-Host "Pulling latest rebase-upstream-master from origin..."
-            git pull --ff-only origin rebase-upstream-master
+            Invoke-NativeCommand "git" @("pull", "--ff-only", "origin", "rebase-upstream-master")
         } finally {
             Pop-Location
         }
@@ -489,7 +503,9 @@ Invoke-InRepo {
         "-DGGML_HIP=OFF",
         "-DGGML_VULKAN=OFF",
         "-DBUILD_SHARED_LIBS=OFF",
-        "-DLLAMA_OPENSSL=OFF"
+        "-DLLAMA_OPENSSL=OFF",
+        "-DLLAMA_BUILD_TESTS=OFF",
+        "-DGGML_BUILD_TESTS=OFF"
     )
 
     if (Resolve-CommandPath "ninja") {
@@ -526,22 +542,22 @@ Invoke-InRepo {
     }
 
     $parallelJobs = [Environment]::ProcessorCount
-    & cmake @cmakeArgs
-    & cmake --build $buildDir --config Release --parallel $parallelJobs
+    Invoke-NativeCommand "cmake" $cmakeArgs
+    Invoke-NativeCommand "cmake" @("--build", $buildDir, "--config", "Release", "--parallel", "$parallelJobs")
     Write-Host "Build complete: $buildDir\bin\"
 
     if (Test-Path $meshUiDir) {
         Write-Host "Building mesh-llm UI..."
         Push-Location $meshUiDir
         try {
-            npm ci
-            npm run build
+            Invoke-NativeCommand "npm" @("ci")
+            Invoke-NativeCommand "npm" @("run", "build")
         } finally {
             Pop-Location
         }
     }
 
     Write-Host "Building mesh-llm..."
-    cargo build --release --locked -p mesh-llm
+    Invoke-NativeCommand "cargo" @("build", "--release", "--locked", "-p", "mesh-llm")
     Write-Host "Mesh binary: target\release\mesh-llm.exe"
 }

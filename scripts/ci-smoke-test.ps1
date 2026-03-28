@@ -12,7 +12,17 @@ $ErrorActionPreference = "Stop"
 $apiPort = 9337
 $consolePort = 3131
 $maxWaitSeconds = 180
-$logPath = Join-Path ([System.IO.Path]::GetTempPath()) "mesh-llm-ci.log"
+$stdoutLogPath = Join-Path ([System.IO.Path]::GetTempPath()) "mesh-llm-ci.stdout.log"
+$stderrLogPath = Join-Path ([System.IO.Path]::GetTempPath()) "mesh-llm-ci.stderr.log"
+
+function Write-ProcessLogs {
+    foreach ($path in @($stdoutLogPath, $stderrLogPath)) {
+        if (Test-Path $path) {
+            Write-Host "--- $path ---"
+            Get-Content $path -Tail 80 | Write-Host
+        }
+    }
+}
 
 Write-Host "=== CI Smoke Test ==="
 Write-Host "  mesh-llm:  $MeshLlm"
@@ -43,8 +53,8 @@ try {
     $process = Start-Process `
         -FilePath $MeshLlm `
         -ArgumentList $arguments `
-        -RedirectStandardOutput $logPath `
-        -RedirectStandardError $logPath `
+        -RedirectStandardOutput $stdoutLogPath `
+        -RedirectStandardError $stderrLogPath `
         -PassThru
     Write-Host "  PID: $($process.Id)"
 
@@ -52,9 +62,7 @@ try {
     for ($i = 1; $i -le $maxWaitSeconds; $i++) {
         if ($process.HasExited) {
             Write-Host "❌ mesh-llm exited unexpectedly"
-            if (Test-Path $logPath) {
-                Get-Content $logPath -Tail 80 | Write-Host
-            }
+            Write-ProcessLogs
             throw "mesh-llm exited before llama_ready"
         }
 
@@ -69,9 +77,7 @@ try {
 
         if ($i -eq $maxWaitSeconds) {
             Write-Host "❌ Model failed to load within ${maxWaitSeconds}s"
-            if (Test-Path $logPath) {
-                Get-Content $logPath -Tail 80 | Write-Host
-            }
+            Write-ProcessLogs
             throw "Timed out waiting for llama_ready"
         }
 

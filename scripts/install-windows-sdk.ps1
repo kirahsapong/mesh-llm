@@ -49,6 +49,20 @@ function Normalize-RecipeArgument {
     return $normalized.Trim()
 }
 
+function Invoke-NativeCommand {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Command,
+        [string[]]$Arguments = @()
+    )
+
+    & $Command @Arguments
+    if ($LASTEXITCODE -ne 0) {
+        $argString = if ($Arguments.Count -gt 0) { " " + ($Arguments -join " ") } else { "" }
+        throw "Command failed with exit code $LASTEXITCODE: $Command$argString"
+    }
+}
+
 function Add-GitHubPath([string]$PathEntry) {
     if (-not $PathEntry) {
         return
@@ -122,7 +136,7 @@ switch ($Backend.ToLowerInvariant()) {
     'cpu' {
     }
     'cuda' {
-        choco install cuda -y --no-progress
+        Invoke-NativeCommand 'choco' @('install', 'cuda', '-y', '--no-progress')
 
         $cudaRoot = $env:CUDA_PATH
         if (-not $cudaRoot -or -not (Test-Path $cudaRoot)) {
@@ -190,7 +204,7 @@ switch ($Backend.ToLowerInvariant()) {
         Set-GitHubEnv 'HIP_PATH' $rocmRoot
     }
     'vulkan' {
-        choco install vulkan-sdk -y --no-progress
+        Invoke-NativeCommand 'choco' @('install', 'vulkan-sdk', '-y', '--no-progress')
 
         $sdk = Get-ChildItem 'C:\VulkanSDK' -Directory -ErrorAction SilentlyContinue |
             Sort-Object Name -Descending |
