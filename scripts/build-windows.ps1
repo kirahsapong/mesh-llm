@@ -51,6 +51,24 @@ function Resolve-CommandPath {
     return $null
 }
 
+function Import-CmdEnvironment {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$CommandLine
+    )
+
+    $output = & cmd.exe /s /c "$CommandLine && set"
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to initialize Windows build environment with command: $CommandLine"
+    }
+
+    foreach ($line in $output) {
+        if ($line -match '^(?<name>[^=]+)=(?<value>.*)$') {
+            Set-Item -Path "env:$($Matches.name)" -Value $Matches.value
+        }
+    }
+}
+
 function Normalize-RecipeArgument {
     param(
         [AllowEmptyString()]
@@ -91,6 +109,42 @@ function Normalize-RecipeArgument {
     }
 
     return $normalized.Trim()
+}
+
+function Ensure-MsvcToolchain {
+    if ((Resolve-CommandPath "cl") -and (Resolve-CommandPath "link") -and (Resolve-CommandPath "lib")) {
+        return
+    }
+
+    $vswhereCandidates = @()
+    if ($env:ProgramFiles_x86) {
+        $vswhereCandidates += (Join-Path $env:ProgramFiles_x86 "Microsoft Visual Studio\Installer\vswhere.exe")
+    }
+    if ($env:ProgramFiles) {
+        $vswhereCandidates += (Join-Path $env:ProgramFiles "Microsoft Visual Studio\Installer\vswhere.exe")
+    }
+
+    $vswhere = $vswhereCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if (-not $vswhere) {
+        throw "vswhere.exe not found. Install Visual Studio Build Tools with the MSVC C++ toolchain."
+    }
+
+    $installationPathOutput = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Select-Object -First 1
+    $installationPath = if ($installationPathOutput) { $installationPathOutput.Trim() } else { "" }
+    if (-not $installationPath) {
+        throw "Visual Studio Build Tools with the MSVC C++ toolchain were not found."
+    }
+
+    $vcvars64 = Join-Path $installationPath "VC\Auxiliary\Build\vcvars64.bat"
+    if (-not (Test-Path $vcvars64)) {
+        throw "vcvars64.bat not found under Visual Studio installation: $installationPath"
+    }
+
+    Import-CmdEnvironment "`"$vcvars64`" >nul"
+
+    if (-not (Resolve-CommandPath "cl")) {
+        throw "MSVC toolchain initialization completed, but cl.exe is still not available in PATH."
+    }
 }
 
 function Resolve-RocmRoot {
@@ -293,6 +347,8 @@ $RocmArch = Normalize-RecipeArgument $RocmArch @("rocm_arch", "rocmarch", "amd_a
 
 $backendName = Resolve-Backend $Backend
 Write-Host "Using Windows backend: $backendName"
+
+Ensure-MsvcToolchain
 
 switch ($backendName) {
     "cuda" {
