@@ -297,7 +297,36 @@ jobs:
         run: |
           just build backend=${{ matrix.backend }}
 
+      - name: Cache model
+        if: matrix.backend == 'cpu'
+        id: cache-model-windows
+        uses: actions/cache@v4
+        with:
+          path: ~\.models\${{ env.MODEL_FILE }}
+          key: windows-model-${{ env.MODEL_FILE }}
+
+      - name: Download model
+        if: matrix.backend == 'cpu' && steps.cache-model-windows.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $modelDir = Join-Path $env:USERPROFILE '.models'
+          New-Item -ItemType Directory -Path $modelDir -Force | Out-Null
+          $modelPath = Join-Path $modelDir '${{ env.MODEL_FILE }}'
+          Invoke-WebRequest -Uri '${{ env.MODEL_URL }}' -OutFile $modelPath
+          Get-Item $modelPath | Format-List FullName,Length
+
+      - name: Smoke test (real inference)
+        if: matrix.backend == 'cpu'
+        shell: pwsh
+        run: |
+          $modelPath = Join-Path $env:USERPROFILE '.models\${{ env.MODEL_FILE }}'
+          .\scripts\ci-smoke-test.ps1 `
+            -MeshLlm .\target\release\mesh-llm.exe `
+            -BinDir .\llama.cpp\build\bin `
+            -ModelPath $modelPath
+
       - name: CLI smoke test
+        if: matrix.backend != 'cpu'
         shell: pwsh
         run: |
           target\release\mesh-llm.exe --version
