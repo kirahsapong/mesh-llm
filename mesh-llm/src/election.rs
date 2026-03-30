@@ -97,17 +97,31 @@ pub struct ModelTargets {
 }
 
 impl ModelTargets {
-    /// Get target for a specific model. Round-robins across multiple hosts.
+    /// Get all candidate entrypoints for a specific model, in priority order.
+    pub fn candidates(&self, model: &str) -> Vec<InferenceTarget> {
+        self.targets
+            .get(model)
+            .map(|targets| {
+                targets
+                    .iter()
+                    .filter(|target| !matches!(target, InferenceTarget::None))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Get the first target for a specific model.
     pub fn get(&self, model: &str) -> InferenceTarget {
-        match self.targets.get(model) {
-            Some(targets) if !targets.is_empty() => {
-                // Simple round-robin using a hash of the model + counter
-                // (counter isn't shared across clones, but combined with
-                // request timing gives reasonable distribution)
-                let idx = (self.counter as usize) % targets.len();
-                targets[idx].clone()
-            }
-            _ => InferenceTarget::None,
+        let targets = self.candidates(model);
+        if targets.is_empty() {
+            InferenceTarget::None
+        } else {
+            // Simple round-robin using a hash of the model + counter
+            // (counter isn't shared across clones, but combined with
+            // request timing gives reasonable distribution)
+            let idx = (self.counter as usize) % targets.len();
+            targets[idx].clone()
         }
     }
 
@@ -818,25 +832,31 @@ async fn moe_election_loop(
 
 /// Update the model targets map — sets our model's target and includes
 /// targets for other models we know about from peers.
-/// When multiple nodes serve the same model, all are included for load balancing.
+/// Hosts stay first; serving workers are appended as fallback HTTP entrypoints.
 fn extend_targets_from_peer(
     targets: &mut HashMap<String, Vec<InferenceTarget>>,
     peer_models: &[String],
     role: &NodeRole,
     peer_id: iroh::EndpointId,
 ) {
-    // Only confirmed hosts can serve HTTP inference traffic.
-    // Split workers may advertise the model they're helping serve, but they
-    // only run rpc-server and will drop tunneled chat requests.
-    if !matches!(role, NodeRole::Host { .. }) {
-        return;
-    }
-
     for serving in peer_models {
-        targets
-            .entry(serving.clone())
-            .or_default()
-            .push(InferenceTarget::Remote(peer_id));
+        let entry = targets.entry(serving.clone()).or_default();
+        match role {
+            NodeRole::Host { .. } => {
+                let insert_at = entry
+                    .iter()
+                    .position(|target| {
+                        !matches!(
+                            target,
+                            InferenceTarget::Local(_) | InferenceTarget::MoeLocal(_)
+                        )
+                    })
+                    .unwrap_or(entry.len());
+                entry.insert(insert_at, InferenceTarget::Remote(peer_id));
+            }
+            NodeRole::Worker => entry.push(InferenceTarget::Remote(peer_id)),
+            NodeRole::Client => {}
+        }
     }
 }
 
@@ -896,7 +916,7 @@ async fn update_targets(
         for (model, hosts) in &targets {
             if hosts.len() > 1 {
                 eprintln!(
-                    "⚡ [{}] {} hosts available (load balancing)",
+                    "⚡ [{}] {} entrypoints available (host preferred, worker fallback)",
                     model,
                     hosts.len()
                 );
@@ -1263,18 +1283,20 @@ mod tests {
     }
 
     #[test]
-    fn test_extend_targets_ignores_non_host_peer() {
+    fn test_extend_targets_keeps_worker_as_fallback_entrypoint() {
         let mut targets = HashMap::new();
         let worker_id = make_id(7);
         let models = vec!["Qwen3-Coder-Next-Q4_K_M".to_string()];
 
         extend_targets_from_peer(&mut targets, &models, &NodeRole::Worker, worker_id);
 
-        assert!(targets.is_empty());
+        let model_targets = targets.get("Qwen3-Coder-Next-Q4_K_M").unwrap();
+        assert_eq!(model_targets.len(), 1);
+        assert!(matches!(model_targets[0], InferenceTarget::Remote(id) if id == worker_id));
     }
 
     #[test]
-    fn test_extend_targets_worker_before_host_only_keeps_host() {
+    fn test_extend_targets_worker_before_host_prefers_host_but_keeps_worker_fallback() {
         let mut targets = HashMap::new();
         let worker_id = make_id(7);
         let host_id = make_id(8);
@@ -1289,8 +1311,9 @@ mod tests {
         );
 
         let model_targets = targets.get("Qwen3-Coder-Next-Q4_K_M").unwrap();
-        assert_eq!(model_targets.len(), 1);
+        assert_eq!(model_targets.len(), 2);
         assert!(matches!(model_targets[0], InferenceTarget::Remote(id) if id == host_id));
+        assert!(matches!(model_targets[1], InferenceTarget::Remote(id) if id == worker_id));
     }
 
     #[test]
@@ -1315,8 +1338,33 @@ mod tests {
 
         let model_targets = targets.get("Qwen3-8B-Q4_K_M").unwrap();
         assert_eq!(model_targets.len(), 2);
-        assert!(matches!(model_targets[0], InferenceTarget::Remote(id) if id == host_a));
-        assert!(matches!(model_targets[1], InferenceTarget::Remote(id) if id == host_b));
+        assert!(matches!(model_targets[0], InferenceTarget::Remote(id) if id == host_b));
+        assert!(matches!(model_targets[1], InferenceTarget::Remote(id) if id == host_a));
+    }
+
+    #[test]
+    fn test_extend_targets_keeps_local_host_before_remote_host_and_worker() {
+        let mut targets = HashMap::new();
+        let host_id = make_id(8);
+        let worker_id = make_id(9);
+        targets.insert(
+            "Qwen3-Coder-Next-Q4_K_M".to_string(),
+            vec![InferenceTarget::Local(9337)],
+        );
+        let models = vec!["Qwen3-Coder-Next-Q4_K_M".to_string()];
+
+        extend_targets_from_peer(&mut targets, &models, &NodeRole::Worker, worker_id);
+        extend_targets_from_peer(
+            &mut targets,
+            &models,
+            &NodeRole::Host { http_port: 8080 },
+            host_id,
+        );
+
+        let model_targets = targets.get("Qwen3-Coder-Next-Q4_K_M").unwrap();
+        assert!(matches!(model_targets[0], InferenceTarget::Local(9337)));
+        assert!(matches!(model_targets[1], InferenceTarget::Remote(id) if id == host_id));
+        assert!(matches!(model_targets[2], InferenceTarget::Remote(id) if id == worker_id));
     }
 
     // ── Session hash routing ──

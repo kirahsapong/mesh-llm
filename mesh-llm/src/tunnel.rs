@@ -35,6 +35,7 @@ pub struct Manager {
     node: Node,
     rpc_port: Arc<AtomicU16>,
     http_port: Arc<AtomicU16>,
+    api_port: Arc<AtomicU16>,
     /// EndpointId → local tunnel port
     tunnel_ports: Arc<Mutex<HashMap<EndpointId, u16>>>,
     /// Port rewrite map for B2B: orchestrator tunnel port → local tunnel port
@@ -48,6 +49,7 @@ impl Manager {
     pub async fn start(
         node: Node,
         rpc_port: u16,
+        api_port: u16,
         mut tunnel_stream_rx: tokio::sync::mpsc::Receiver<(
             iroh::endpoint::SendStream,
             iroh::endpoint::RecvStream,
@@ -62,6 +64,7 @@ impl Manager {
             node: node.clone(),
             rpc_port: Arc::new(AtomicU16::new(rpc_port)),
             http_port: Arc::new(AtomicU16::new(0)),
+            api_port: Arc::new(AtomicU16::new(api_port)),
             tunnel_ports: Arc::new(Mutex::new(HashMap::new())),
             port_rewrite_map,
         };
@@ -91,19 +94,28 @@ impl Manager {
             }
         });
 
-        // Handle inbound HTTP tunnel streams (plain byte relay to llama-server)
+        // Handle inbound HTTP tunnel streams. Hosts relay directly to llama-server;
+        // workers/clients fall back to their local API proxy so they can act as
+        // remote HTTP entrypoints when the real host is reachable only inside the mesh.
         let http_port_ref = mgr.http_port.clone();
+        let api_port_ref = mgr.api_port.clone();
         let http_node = mgr.node.clone();
         tokio::spawn(async move {
             while let Some((send, recv)) = tunnel_http_rx.recv().await {
-                let port = http_port_ref.load(Ordering::Relaxed);
-                if port == 0 {
-                    tracing::warn!("Inbound HTTP tunnel but no llama-server running, dropping");
+                let http_port = http_port_ref.load(Ordering::Relaxed);
+                let api_port = api_port_ref.load(Ordering::Relaxed);
+                let upstream = choose_http_tunnel_upstream(http_port, api_port);
+                let Some((port, target_label)) = upstream else {
+                    tracing::warn!(
+                        "Inbound HTTP tunnel but no llama-server or API proxy running, dropping"
+                    );
                     continue;
-                }
+                };
                 let node = http_node.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_inbound_http_stream(node, send, recv, port).await {
+                    if let Err(e) =
+                        handle_inbound_http_stream(node, send, recv, port, target_label).await
+                    {
                         tracing::warn!("Inbound HTTP tunnel stream error: {e}");
                     }
                 });
@@ -281,15 +293,26 @@ async fn handle_inbound_http_stream(
     node: Node,
     quic_send: iroh::endpoint::SendStream,
     quic_recv: iroh::endpoint::RecvStream,
-    http_port: u16,
+    target_port: u16,
+    target_label: &'static str,
 ) -> Result<()> {
-    tracing::info!("Inbound HTTP tunnel stream → llama-server :{http_port}");
-    let tcp_stream = TcpStream::connect(format!("127.0.0.1:{http_port}")).await?;
+    tracing::info!("Inbound HTTP tunnel stream → {target_label} :{target_port}");
+    let tcp_stream = TcpStream::connect(format!("127.0.0.1:{target_port}")).await?;
     tcp_stream.set_nodelay(true)?;
     let _inflight = node.begin_inflight_request();
 
     let (tcp_read, tcp_write) = tokio::io::split(tcp_stream);
     relay_bidirectional(tcp_read, tcp_write, quic_send, quic_recv).await
+}
+
+fn choose_http_tunnel_upstream(http_port: u16, api_port: u16) -> Option<(u16, &'static str)> {
+    if http_port != 0 {
+        Some((http_port, "llama-server"))
+    } else if api_port != 0 {
+        Some((api_port, "api proxy"))
+    } else {
+        None
+    }
 }
 
 /// Relay a TCP stream through a QUIC bi-stream. Used by the lite client
@@ -411,4 +434,83 @@ async fn relay_quic_to_tcp(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{choose_http_tunnel_upstream, Manager};
+    use crate::mesh::{Node, NodeRole};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    #[test]
+    fn test_choose_http_tunnel_upstream_prefers_llama_server() {
+        assert_eq!(
+            choose_http_tunnel_upstream(8080, 9337),
+            Some((8080, "llama-server"))
+        );
+    }
+
+    #[test]
+    fn test_choose_http_tunnel_upstream_falls_back_to_api_proxy() {
+        assert_eq!(
+            choose_http_tunnel_upstream(0, 9337),
+            Some((9337, "api proxy"))
+        );
+    }
+
+    #[test]
+    fn test_choose_http_tunnel_upstream_none_when_no_targets_exist() {
+        assert_eq!(choose_http_tunnel_upstream(0, 0), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_http_tunnel_to_worker_falls_back_to_api_proxy() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api_port = listener.local_addr().unwrap().port();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let n = stream.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(req.starts_with("GET / HTTP/1.1"));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+        });
+
+        let (worker, worker_channels) = Node::start(NodeRole::Worker, &[], None, None, false)
+            .await
+            .unwrap();
+        worker.start_accepting();
+        let _worker_mgr = Manager::start(
+            worker.clone(),
+            0,
+            api_port,
+            worker_channels.rpc,
+            worker_channels.http,
+        )
+        .await
+        .unwrap();
+
+        let (client, _client_channels) = Node::start(NodeRole::Client, &[], None, None, false)
+            .await
+            .unwrap();
+        client.start_accepting();
+        client.join(&worker.invite_token()).await.unwrap();
+
+        let (mut send, mut recv) = client.open_http_tunnel(worker.id()).await.unwrap();
+        send.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+
+        let response = recv.read_to_end(64 * 1024).await.unwrap();
+        let text = String::from_utf8(response).unwrap();
+        assert!(text.contains("HTTP/1.1 200 OK"));
+        assert!(text.ends_with("ok"));
+
+        server.await.unwrap();
+    }
 }

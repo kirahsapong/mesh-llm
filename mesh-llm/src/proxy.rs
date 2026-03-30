@@ -192,49 +192,74 @@ pub async fn handle_mesh_request(node: mesh::Node, tcp_stream: TcpStream, track_
 /// Route a request to a known inference target (local llama-server or remote host).
 ///
 /// Used by the API proxy after election has determined the target.
-pub async fn route_to_target(
+pub async fn route_to_targets(
     node: mesh::Node,
     tcp_stream: TcpStream,
-    target: election::InferenceTarget,
+    targets: Vec<election::InferenceTarget>,
 ) {
-    match target {
-        election::InferenceTarget::Local(port) | election::InferenceTarget::MoeLocal(port) => {
-            match TcpStream::connect(format!("127.0.0.1:{port}")).await {
-                Ok(upstream) => {
-                    let _inflight = node.begin_inflight_request();
-                    let _ = upstream.set_nodelay(true);
-                    if let Err(e) = tunnel::relay_tcp_streams(tcp_stream, upstream).await {
-                        tracing::debug!("API proxy (local) ended: {e}");
+    let mut stream = Some(tcp_stream);
+    let mut refreshed = false;
+    let mut last_err = None;
+
+    for target in targets {
+        let client_stream = stream
+            .take()
+            .expect("client stream is only consumed after an upstream opens");
+        match target {
+            election::InferenceTarget::Local(port) | election::InferenceTarget::MoeLocal(port) => {
+                match TcpStream::connect(format!("127.0.0.1:{port}")).await {
+                    Ok(upstream) => {
+                        let _inflight = node.begin_inflight_request();
+                        let _ = upstream.set_nodelay(true);
+                        if let Err(e) = tunnel::relay_tcp_streams(client_stream, upstream).await {
+                            tracing::debug!("API proxy (local) ended: {e}");
+                        }
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::warn!("API proxy: can't reach llama-server on {port}: {e}");
+                        last_err = Some(anyhow::anyhow!(e));
+                        stream = Some(client_stream);
                     }
                 }
-                Err(e) => {
-                    tracing::warn!("API proxy: can't reach llama-server on {port}: {e}");
-                    let _ = send_503(tcp_stream).await;
-                }
             }
-        }
-        election::InferenceTarget::Remote(host_id)
-        | election::InferenceTarget::MoeRemote(host_id) => {
-            match node.open_http_tunnel(host_id).await {
-                Ok((quic_send, quic_recv)) => {
-                    if let Err(e) =
-                        tunnel::relay_tcp_via_quic(tcp_stream, quic_send, quic_recv).await
-                    {
-                        tracing::debug!("API proxy (remote) ended: {e}");
+            election::InferenceTarget::Remote(host_id)
+            | election::InferenceTarget::MoeRemote(host_id) => {
+                match node.open_http_tunnel(host_id).await {
+                    Ok((quic_send, quic_recv)) => {
+                        if let Err(e) =
+                            tunnel::relay_tcp_via_quic(client_stream, quic_send, quic_recv).await
+                        {
+                            tracing::debug!("API proxy (remote) ended: {e}");
+                        }
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::warn!("API proxy: can't tunnel to {}: {e}", host_id.fmt_short());
+                        last_err = Some(e);
+                        stream = Some(client_stream);
+                        if !refreshed {
+                            let refresh_node = node.clone();
+                            tokio::spawn(async move {
+                                refresh_node.gossip_one_peer().await;
+                            });
+                            refreshed = true;
+                        }
                     }
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        "API proxy: can't tunnel to host {}: {e}",
-                        host_id.fmt_short()
-                    );
-                    let _ = send_503(tcp_stream).await;
-                }
+            }
+            election::InferenceTarget::None => {
+                let _ = send_503(client_stream).await;
+                return;
             }
         }
-        election::InferenceTarget::None => {
-            let _ = send_503(tcp_stream).await;
-        }
+    }
+
+    if let Some(e) = last_err {
+        tracing::warn!("API proxy: all inference targets failed: {e}");
+    }
+    if let Some(client_stream) = stream {
+        let _ = send_503(client_stream).await;
     }
 }
 

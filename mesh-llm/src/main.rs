@@ -1429,8 +1429,14 @@ async fn run_auto(
     .await?;
     tracing::info!("rpc-server on 127.0.0.1:{rpc_port} serving {model_name}");
 
-    let tunnel_mgr =
-        tunnel::Manager::start(node.clone(), rpc_port, channels.rpc, channels.http).await?;
+    let tunnel_mgr = tunnel::Manager::start(
+        node.clone(),
+        rpc_port,
+        api_port,
+        channels.rpc,
+        channels.http,
+    )
+    .await?;
 
     // Election publishes per-model targets
     let (target_tx, target_rx) = tokio::sync::watch::channel(election::ModelTargets::default());
@@ -2055,25 +2061,25 @@ async fn api_proxy(
                     }
 
                     // MoE routing: use session hint for sticky routing across shards
-                    let target = if targets.moe.is_some() {
+                    let candidate_targets = if targets.moe.is_some() {
                         let session_hint = proxy::extract_session_hint(&buf[..n])
                             .unwrap_or_else(|| format!("{_addr}"));
-                        targets
+                        vec![targets
                             .get_moe_target(&session_hint)
-                            .unwrap_or(first_available_target(&targets))
+                            .unwrap_or(first_available_target(&targets))]
                     } else if let Some(ref name) = effective_model {
-                        let t = targets.get(name);
-                        if matches!(t, election::InferenceTarget::None) {
+                        let candidates = targets.candidates(name);
+                        if candidates.is_empty() {
                             tracing::debug!("Model '{}' not found, trying first available", name);
-                            first_available_target(&targets)
+                            first_available_targets(&targets)
                         } else {
-                            t
+                            candidates
                         }
                     } else {
-                        first_available_target(&targets)
+                        first_available_targets(&targets)
                     };
 
-                    proxy::route_to_target(node, tcp_stream, target).await;
+                    proxy::route_to_targets(node, tcp_stream, candidate_targets).await;
                 }
                 Err(_) => return,
             };
@@ -2124,14 +2130,24 @@ async fn bootstrap_proxy(
 }
 
 fn first_available_target(targets: &election::ModelTargets) -> election::InferenceTarget {
+    first_available_targets(targets)
+        .into_iter()
+        .next()
+        .unwrap_or(election::InferenceTarget::None)
+}
+
+fn first_available_targets(targets: &election::ModelTargets) -> Vec<election::InferenceTarget> {
     for hosts in targets.targets.values() {
-        for target in hosts {
-            if !matches!(target, election::InferenceTarget::None) {
-                return target.clone();
-            }
+        let available: Vec<_> = hosts
+            .iter()
+            .filter(|target| !matches!(target, election::InferenceTarget::None))
+            .cloned()
+            .collect();
+        if !available.is_empty() {
+            return available;
         }
     }
-    election::InferenceTarget::None
+    vec![election::InferenceTarget::None]
 }
 
 fn bundled_bin_names(name: &str) -> Vec<String> {
