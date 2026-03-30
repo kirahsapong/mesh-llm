@@ -318,7 +318,7 @@ fn bundle_install_dir(
     let file_name = exe.file_name()?.to_str()?;
     #[cfg(windows)]
     {
-        if !file_name.eq_ignore_ascii_case(mesh_binary_name()) {
+        if !file_name.eq_ignore_ascii_case(&mesh_binary_name()) {
             return None;
         }
     }
