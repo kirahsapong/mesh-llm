@@ -3017,7 +3017,7 @@ impl Node {
                     hostname: p.hostname.clone(),
                     is_soc: p.is_soc,
                     gpu_vram: p.gpu_vram.clone(),
-                    gpu_bandwidth_gbps: None,
+                    gpu_bandwidth_gbps: p.gpu_bandwidth_gbps.clone(),
                 })
                 .collect()
         };
