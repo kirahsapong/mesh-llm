@@ -26,6 +26,8 @@ B_CONSOLE_PORT=3142
 C_API_PORT=9349
 C_CONSOLE_PORT=3143
 MAX_WAIT=180
+MAX_CLIENT_ROUTE_WAIT=60
+MAX_INFERENCE_ATTEMPTS=8
 LOG_A=/tmp/mesh-llm-split-a.log
 LOG_B=/tmp/mesh-llm-split-b.log
 LOG_C=/tmp/mesh-llm-split-c.log
@@ -200,8 +202,92 @@ for i in $(seq 1 60); do
     sleep 1
 done
 
-# Give gossip a moment to propagate targets
-sleep 3
+MODEL_NAME=$(basename "$MODEL" .gguf)
+
+# Wait until the client learns a truly routable Host for the requested model.
+# `serving_models` is advertised before the host is actually ready to accept
+# inference traffic; `hosted_models` is the durable signal that the host has
+# made the model routable through its local API proxy.
+echo "Waiting for client to learn a routable host for ${MODEL_NAME}..."
+for i in $(seq 1 "$MAX_CLIENT_ROUTE_WAIT"); do
+    STATUS=$(curl -sf "http://localhost:${C_CONSOLE_PORT}/api/status" 2>/dev/null || echo "")
+    if [ -n "$STATUS" ]; then
+        ROUTABLE=$(echo "$STATUS" | python3 -c '
+import json, sys
+model = sys.argv[1]
+status = json.load(sys.stdin)
+for peer in status.get("peers", []):
+    hosted_models = peer.get("hosted_models", []) or []
+    if peer.get("role") == "Host" and model in hosted_models:
+        print("1")
+        break
+else:
+    print("0")
+' "$MODEL_NAME" 2>/dev/null || echo "0")
+        if [ "$ROUTABLE" = "1" ]; then
+            echo "  ✅ Client sees a host for ${MODEL_NAME} in ${i}s"
+            break
+        fi
+    fi
+
+    if [ "$i" -eq "$MAX_CLIENT_ROUTE_WAIT" ]; then
+        echo "❌ Client never learned a routable host for ${MODEL_NAME}"
+        echo "--- Client status ---"
+        curl -sf "http://localhost:${C_CONSOLE_PORT}/api/status" || true
+        echo ""
+        echo "--- Client log tail ---"
+        tail -40 "$LOG_C" || true
+        echo "--- Host log tail ---"
+        tail -40 "$LOG_A" || true
+        tail -40 "$LOG_B" || true
+        exit 1
+    fi
+
+    sleep 1
+done
+
+# Wait for the host API itself to answer inference directly before using the
+# client proxy path. This avoids counting a normal election/bootstrap window as
+# a split-routing failure on slower runners.
+echo ""
+echo "Waiting for host API (port $HOST_API) to accept direct inference..."
+HOST_READY=""
+for i in $(seq 1 "$MAX_INFERENCE_ATTEMPTS"); do
+    HOST_RESPONSE=$(curl -s --max-time 30 -w "\n%{http_code}" "http://localhost:${HOST_API}/v1/chat/completions" \
+        -H "Content-Type: application/json" \
+        -d "{
+            \"model\": \"${MODEL_NAME}\",
+            \"messages\": [{\"role\": \"user\", \"content\": \"Say hi.\"}],
+            \"max_tokens\": 16,
+            \"temperature\": 0
+        }" 2>&1) || true
+
+    HOST_HTTP_CODE=$(echo "$HOST_RESPONSE" | tail -1)
+    HOST_BODY=$(echo "$HOST_RESPONSE" | sed '$d')
+
+    if [ "$HOST_HTTP_CODE" = "200" ]; then
+        HOST_READY=$(echo "$HOST_BODY" | python3 -c "import sys,json; r=json.load(sys.stdin); print(r['choices'][0]['message']['content'])" 2>/dev/null || echo "")
+        if [ -n "$HOST_READY" ]; then
+            echo "  ✅ Host direct inference ready in attempt $i: $HOST_READY"
+            break
+        fi
+    else
+        echo "  ⚠️  Host attempt $i: HTTP $HOST_HTTP_CODE (still starting)"
+    fi
+
+    if [ "$i" -lt "$MAX_INFERENCE_ATTEMPTS" ]; then
+        sleep 3
+    fi
+done
+
+if [ -z "$HOST_READY" ]; then
+    echo "❌ Host direct inference never became ready"
+    echo "  Last HTTP code: $HOST_HTTP_CODE"
+    echo "  Last body: $HOST_BODY"
+    echo "--- Host log tail ---"
+    tail -20 "$LOG_A" "$LOG_B" || true
+    exit 1
+fi
 
 # ── Verify topology from client's perspective ──
 echo ""
@@ -216,14 +302,13 @@ for p in s.get('peers', []):
 
 # ── THE TEST: inference through the client ──
 echo ""
-MODEL_NAME=$(basename "$MODEL" .gguf)
 echo "Testing /v1/chat/completions through Client (port $C_API_PORT)..."
 echo "  Client has no local inference — must route to a peer."
 echo "  If it picks the Worker (rpc-server only), this fails."
 
 # Retry a few times — tunnel establishment can take a moment
 CONTENT=""
-for attempt in 1 2 3 4 5; do
+for attempt in $(seq 1 "$MAX_INFERENCE_ATTEMPTS"); do
     RESPONSE=$(curl -s --max-time 30 -w "\n%{http_code}" "http://localhost:${C_API_PORT}/v1/chat/completions" \
         -H "Content-Type: application/json" \
         -d "{
@@ -248,13 +333,13 @@ for attempt in 1 2 3 4 5; do
         echo "  ⚠️  Attempt $attempt: HTTP $HTTP_CODE (tunnel may not be ready)"
     fi
 
-    if [ "$attempt" -lt 5 ]; then
+    if [ "$attempt" -lt "$MAX_INFERENCE_ATTEMPTS" ]; then
         sleep 3
     fi
 done
 
 if [ -z "$CONTENT" ]; then
-    echo "❌ Client inference failed after 5 attempts"
+    echo "❌ Client inference failed after ${MAX_INFERENCE_ATTEMPTS} attempts"
     echo "  Last HTTP code: $HTTP_CODE"
     echo "  Last body: $BODY"
     echo "--- Client log tail ---"

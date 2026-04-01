@@ -638,6 +638,23 @@ pub async fn send_400(mut stream: TcpStream, msg: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+pub async fn send_error(mut stream: TcpStream, code: u16, msg: &str) -> std::io::Result<()> {
+    let status = match code {
+        404 => "Not Found",
+        409 => "Conflict",
+        422 => "Unprocessable Content",
+        _ => "Bad Request",
+    };
+    let body = serde_json::json!({"error": msg}).to_string();
+    let resp = format!(
+        "HTTP/1.1 {code} {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(), body
+    );
+    stream.write_all(resp.as_bytes()).await?;
+    stream.shutdown().await?;
+    Ok(())
+}
+
 pub async fn send_503(mut stream: TcpStream) -> std::io::Result<()> {
     let body = r#"{"error":"No inference server available — election in progress"}"#;
     let resp = format!(

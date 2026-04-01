@@ -31,6 +31,8 @@ message PeerAnnouncement {
   repeated ModelDemandEntry demand = 20;             // demand map entries (self entry only)
   map<string, uint64> available_model_sizes = 21;   // file sizes (bytes) per GGUF model name
   bytes serialized_addr = 22;                        // JSON-serialized EndpointAddr (includes network addresses for peer discovery)
+  repeated string hosted_models = 23;                // actually routable / healthy
+  optional bool hosted_models_known = 24;            // false/absent when relayed from legacy JSON peers
 }
 
 message CompactModelMetadata {

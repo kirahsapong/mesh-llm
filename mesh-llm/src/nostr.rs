@@ -366,20 +366,19 @@ pub async fn publish_loop(
 
         // "Actually serving" = a Host node has llama-server running for this model.
         let my_role = node.role().await;
-        let my_serving = node.serving().await;
         let mut actually_serving: Vec<String> = Vec::new();
         if matches!(my_role, crate::mesh::NodeRole::Host { .. }) {
-            if let Some(ref s) = my_serving {
-                if !actually_serving.contains(s) {
-                    actually_serving.push(s.clone());
+            for model in node.hosted_models().await {
+                if !actually_serving.contains(&model) {
+                    actually_serving.push(model);
                 }
             }
         }
         for p in &peers {
             if matches!(p.role, crate::mesh::NodeRole::Host { .. }) {
-                if let Some(ref s) = p.serving {
-                    if !actually_serving.contains(s) {
-                        actually_serving.push(s.clone());
+                for model in p.routable_models() {
+                    if !actually_serving.contains(&model) {
+                        actually_serving.push(model);
                     }
                 }
             }

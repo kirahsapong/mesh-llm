@@ -60,6 +60,10 @@ struct PeerSummary {
     capabilities: Vec<String>,
     models: Vec<String>,
     serving_models: Vec<String>,
+    available_models: Vec<String>,
+    requested_models: Vec<String>,
+    hosted_models: Vec<String>,
+    hosted_models_known: bool,
     rtt_ms: Option<u32>,
 }
 
@@ -953,6 +957,10 @@ fn peer_summary(peer: &proto::MeshPeer) -> PeerSummary {
         capabilities: peer.capabilities.clone(),
         models: peer.models.clone(),
         serving_models: peer.serving_models.clone(),
+        available_models: peer.available_models.clone(),
+        requested_models: peer.requested_models.clone(),
+        hosted_models: peer.hosted_models.clone(),
+        hosted_models_known: peer.hosted_models_known.unwrap_or(false),
         rtt_ms: peer.rtt_ms,
     }
 }

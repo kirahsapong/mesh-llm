@@ -5,13 +5,14 @@ Rust sidecar for distributed llama.cpp inference over QUIC. See the [project REA
 ```
 src/
 ├── main.rs        CLI, orchestration, startup flows (auto, idle, passive)
+├── backend.rs     Backend registry and launch/control abstraction (llama today, MLX next)
 ├── mesh.rs        QUIC endpoint, gossip, peer management, request rate sharing
 ├── election.rs    Per-model host election, latency-aware split, llama-server lifecycle
 ├── proxy.rs       HTTP proxy plumbing: request parsing, model routing, response helpers
-├── api.rs         Mesh management API (:3131): status, events, discover, join, chat proxy
+├── api.rs         Mesh management API (:3131): status, events, runtime load/unload, discover, join, chat proxy
 ├── tunnel.rs      TCP ↔ QUIC relay (RPC + HTTP), B2B rewrite map
 ├── rewrite.rs     REGISTER_PEER interception and endpoint rewriting
-├── launch.rs      rpc-server and llama-server process management
+├── launch.rs      rpc-server and backend inference process management
 ├── download.rs    Model catalog and HuggingFace download (reqwest, resume support)
 ├── nostr.rs       Nostr publish/discover: mesh listings, smart auto-join, publish watchdog
 ├── hardware.rs    GPU/host hardware detection: Collector trait, DefaultCollector, TegraCollector
@@ -37,6 +38,8 @@ src/
 **Event-driven** — death detected via tunnel failure + 60s heartbeat. Dead peers broadcast, not re-added by gossip. Cost proportional to topology changes, not node count.
 
 **Passive scaling** — clients don't gossip, use routing tables only. Zero per-client state on servers.
+
+**Backend-pluggable local runtime** — the control plane now launches inference through a backend registry. `llama` is the only concrete backend today, but runtime load/unload and process tracking are no longer hard-wired to one launcher.
 
 ## Nostr discovery
 
@@ -66,13 +69,13 @@ mesh-llm --auto --model GLM-4.7-Flash-Q4_K_M --mesh-name "poker-night"
 
 The first person to run it creates the mesh and starts serving. Everyone else discovers "poker-night" and joins automatically. `--mesh-name` implies `--publish` and strictly filters discovery to that name only — your group won't accidentally land in someone else's mesh.
 
-## Idle mode
+## No-arg behavior
 
 ```bash
 mesh-llm    # no args
 ```
 
-Shows getting-started instructions and opens a read-only console on `:3131`. The node stays dormant — no inbound QUIC connections or heartbeat — until you start or join a mesh via CLI flags.
+Prints the standard `--help` output and exits. It does not bind the console or API ports until you start or join a mesh with CLI flags.
 
 ## Live demo
 

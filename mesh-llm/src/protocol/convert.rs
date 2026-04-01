@@ -58,11 +58,13 @@ pub(crate) fn local_ann_to_proto_ann(
         catalog_models: ann.models.clone(),
         vram_bytes: ann.vram_bytes,
         model_source: ann.model_source.clone(),
-        primary_serving: ann.serving.clone(),
+        primary_serving: ann.serving_models.first().cloned(),
         mesh_id: ann.mesh_id.clone(),
         demand,
         available_model_sizes: ann.available_model_sizes.clone(),
         serialized_addr,
+        hosted_models: ann.hosted_models.clone().unwrap_or_default(),
+        hosted_models_known: Some(ann.hosted_models.is_some()),
     }
 }
 
@@ -110,14 +112,18 @@ pub(crate) fn proto_ann_to_local(
             )
         })
         .collect();
+    let hosted_models = pa
+        .hosted_models_known
+        .unwrap_or(!pa.hosted_models.is_empty())
+        .then(|| pa.hosted_models.clone());
     let ann = PeerAnnouncement {
         addr: addr.clone(),
         role,
         models: pa.catalog_models.clone(),
         vram_bytes: pa.vram_bytes,
         model_source: pa.model_source.clone(),
-        serving: pa.primary_serving.clone(),
         serving_models: pa.serving_models.clone(),
+        hosted_models,
         available_models: pa.available_models.clone(),
         requested_models: pa.requested_models.clone(),
         version: pa.version.clone(),

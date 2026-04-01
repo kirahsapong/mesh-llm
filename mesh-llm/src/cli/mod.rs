@@ -1,7 +1,10 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+use crate::cli::runtime::RuntimeCommand;
+
 pub mod models;
+pub(crate) mod runtime;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -171,13 +174,33 @@ pub(crate) enum Command {
         #[arg(long)]
         draft: bool,
     },
-    /// Drop a model from the mesh.
+    /// Inspect and manage local runtime-served models.
     #[command(hide = true)]
-    Drop {
-        /// Model name to drop
+    Runtime {
+        #[command(subcommand)]
+        command: Option<RuntimeCommand>,
+    },
+    /// Load a local model into a running mesh-llm instance.
+    Load {
+        /// Model name/path/url to load
         name: String,
-        /// API port of the running mesh-llm instance (default: 9337)
-        #[arg(long, default_value = "9337")]
+        /// Console/API port of the running mesh-llm instance (default: 3131)
+        #[arg(long, default_value = "3131")]
+        port: u16,
+    },
+    /// Unload a local model from a running mesh-llm instance.
+    #[command(alias = "drop")]
+    Unload {
+        /// Model name to unload
+        name: String,
+        /// Console/API port of the running mesh-llm instance (default: 3131)
+        #[arg(long, default_value = "3131")]
+        port: u16,
+    },
+    /// Show local model status on a running mesh-llm instance.
+    Status {
+        /// Console/API port of the running mesh-llm instance (default: 3131)
+        #[arg(long, default_value = "3131")]
         port: u16,
     },
     /// Discover meshes on Nostr and optionally auto-join one.

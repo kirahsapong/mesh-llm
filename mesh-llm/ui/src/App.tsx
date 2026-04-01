@@ -168,9 +168,12 @@ type Peer = {
   id: string;
   role: string;
   models: string[];
+  available_models?: string[];
+  requested_models?: string[];
   vram_gb: number;
-  serving?: string | null;
   serving_models?: string[];
+  hosted_models?: string[];
+  hosted_models_known?: boolean;
   rtt_ms?: number | null;
   hostname?: string;
   is_soc?: boolean;
@@ -188,6 +191,7 @@ type StatusPayload = {
   llama_ready: boolean;
   model_name: string;
   serving_models?: string[];
+  hosted_models?: string[];
   api_port: number;
   my_vram_gb: number;
   model_size_gb: number;
@@ -265,6 +269,40 @@ const CHAT_SAVE_DEBOUNCE_MS = 500;
 const CHAT_MAX_CONVERSATIONS = 80;
 const CHAT_MAX_MESSAGES_PER_CONVERSATION = 240;
 const CHAT_MAX_TEXT_CHARS = 12000;
+
+function peerAssignedModels(peer: Peer): string[] {
+  return peer.serving_models?.filter(Boolean) ?? [];
+}
+
+function peerRoutableModels(peer: Peer): string[] {
+  const hosted = peer.hosted_models?.filter(Boolean) ?? [];
+  if (peer.hosted_models_known === false)
+    return hosted.length ? hosted : peerAssignedModels(peer);
+  return hosted;
+}
+
+function localRoutableModels(status: StatusPayload | null): string[] {
+  if (!status || status.is_client) return [];
+  const hosted = status.hosted_models?.filter(Boolean) ?? [];
+  if (hosted.length > 0) return hosted;
+  const serving = status.serving_models?.filter(Boolean) ?? [];
+  if (serving.length > 0) return serving;
+  return status.model_name ? [status.model_name] : [];
+}
+
+function peerPrimaryModel(peer: Peer): string {
+  return peerRoutableModels(peer)[0] ?? peerAssignedModels(peer)[0] ?? '';
+}
+
+function peerStatusLabel(peer: Peer): string {
+  if (peer.role === "Client") return "Client";
+  if (peerRoutableModels(peer).some((model) => model !== "(idle)"))
+    return "Serving";
+  if (peerAssignedModels(peer).some((model) => model !== "(idle)"))
+    return "Assigned";
+  if (peer.role === "Host") return "Host";
+  return "Idle";
+}
 
 function sectionFromPathname(pathname: string): TopSection | null {
   if (pathname === "/dashboard" || pathname === "/dashboard/")
@@ -614,12 +652,14 @@ export function App() {
       stats[modelName].vramGb += Math.max(0, vramGb || 0);
     };
 
-    if (!status.is_client && status.model_name)
-      addServingNode(status.model_name, status.my_vram_gb);
+    for (const model of new Set(localRoutableModels(status))) {
+      if (model && model !== "(idle)") addServingNode(model, status.my_vram_gb);
+    }
     for (const peer of status.peers ?? []) {
-      if (peer.role === "Client" || !peer.serving || peer.serving === "(idle)")
-        continue;
-      addServingNode(peer.serving, peer.vram_gb);
+      if (peer.role === 'Client') continue;
+      for (const model of new Set(peerRoutableModels(peer))) {
+        if (model && model !== '(idle)') addServingNode(model, peer.vram_gb);
+      }
     }
 
     for (const model of status.mesh_models ?? []) {
@@ -1296,13 +1336,6 @@ export function App() {
     setInput("");
   }
 
-  const peerStatusLabel = (peer: Peer): string => {
-    if (peer.role === "Client") return "Client";
-    if (peer.serving && peer.serving !== "(idle)") return "Serving";
-    if (peer.role === "Host") return "Host";
-    return "Idle";
-  };
-
   const topologyNodes = useMemo<TopologyNode[]>(() => {
     if (!status) return [];
     const nodes: TopologyNode[] = [];
@@ -1313,16 +1346,13 @@ export function App() {
         self: true,
         host: status.is_host,
         client: status.is_client,
-        serving: status.model_name || "",
-        servingModels:
-          status.serving_models && status.serving_models.length > 0
+        serving: status.model_name || '',
+        servingModels: (status.hosted_models && status.hosted_models.length > 0)
+          ? status.hosted_models
+          : (status.serving_models && status.serving_models.length > 0)
             ? status.serving_models
-            : status.model_name
-              ? [status.model_name]
-              : [],
-        statusLabel:
-          status.node_status ||
-          (status.is_client ? "Client" : status.is_host ? "Host" : "Idle"),
+          : (status.model_name ? [status.model_name] : []),
+        statusLabel: status.node_status || (status.is_client ? 'Client' : status.is_host ? 'Host' : 'Idle'),
         latencyMs: null,
         hostname: status.my_hostname,
         isSoc: status.my_is_soc,
@@ -1330,19 +1360,14 @@ export function App() {
       });
     }
     for (const p of status.peers ?? []) {
-      const pModels =
-        p.serving_models && p.serving_models.length > 0
-          ? p.serving_models
-          : p.serving
-            ? [p.serving]
-            : [];
+      const pModels = peerRoutableModels(p).length > 0 ? peerRoutableModels(p) : peerAssignedModels(p);
       nodes.push({
         id: p.id,
         vram: overviewVramGb(p.role === "Client", p.vram_gb),
         self: false,
         host: /^Host/.test(p.role),
-        client: p.role === "Client",
-        serving: p.serving || "",
+        client: p.role === 'Client',
+        serving: peerPrimaryModel(p),
         servingModels: pModels,
         statusLabel: peerStatusLabel(p),
         latencyMs: p.rtt_ms ?? null,
@@ -1395,6 +1420,7 @@ export function App() {
           {section === "chat" ? (
             <div className="mx-auto flex min-h-0 min-w-0 w-full max-w-7xl flex-1 flex-col overflow-hidden p-2 md:p-4">
               <ChatPage
+                status={status}
                 inviteToken={status?.token ?? ""}
                 isPublicMesh={status?.nostr_discovery ?? false}
                 isFlyHosted={isFlyHosted}
@@ -2016,6 +2042,7 @@ function AppHeader({
 }
 
 function ChatPage(props: {
+  status: StatusPayload | null;
   inviteToken: string;
   isPublicMesh: boolean;
   isFlyHosted: boolean;
@@ -2054,6 +2081,7 @@ function ChatPage(props: {
   onSubmit: () => void;
 }) {
   const {
+    status,
     inviteToken,
     warmModels,
     meshModelByName,
@@ -2939,18 +2967,11 @@ function DashboardPage({
   }, [status?.peers]);
   const peerRows = useMemo(() => {
     return sortedPeers.map((peer) => {
-      const statusLabel =
-        peer.role === "Client"
-          ? "Client"
-          : peer.serving && peer.serving !== "(idle)"
-            ? "Serving"
-            : peer.role === "Host"
-              ? "Host"
-              : "Idle";
-      const modelLabel =
-        peer.serving && peer.serving !== "(idle)"
-          ? shortName(peer.serving)
-          : "idle";
+      const statusLabel = peer.role === 'Client'
+        ? 'Client'
+        : peerStatusLabel(peer);
+      const primaryModel = peerPrimaryModel(peer);
+      const modelLabel = primaryModel && primaryModel !== '(idle)' ? shortName(primaryModel) : 'idle';
       const latencyLabel = formatLatency(peer.rtt_ms);
       const displayVramGb = overviewVramGb(
         peer.role === "Client",

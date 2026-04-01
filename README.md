@@ -147,11 +147,11 @@ curl localhost:9337/v1/chat/completions -d '{"model":"GLM-4.7-Flash-Q4_K_M", ...
 ```
 Different nodes serve different models. The API proxy routes by the `model` field.
 
-### Idle mode
+### No-arg behavior
 ```bash
-mesh-llm                                   # no args — shows instructions + console
+mesh-llm                                   # no args — prints --help and exits
 ```
-Opens a read-only console on `:3131`. Use the CLI to start or join a mesh.
+Does not start the console or bind any ports. Use the CLI flags shown in `--help` to start or join a mesh.
 
 ## Background service
 
@@ -438,6 +438,29 @@ mesh-llm models updates --check  # check cached HF repos for newer upstream revi
 mesh-llm models updates --all    # refresh all cached HF repos
 mesh-llm models updates Qwen/Qwen3-8B-GGUF
 ```
+
+## Local runtime control
+
+Stage one supports local-only hot load/unload on a running node.
+
+```bash
+mesh-llm load Llama-3.2-1B-Instruct-Q4_K_M
+mesh-llm unload Llama-3.2-1B-Instruct-Q4_K_M
+mesh-llm status
+```
+
+REST endpoints on the management API:
+
+```bash
+curl localhost:3131/api/runtime
+curl localhost:3131/api/runtime/processes
+curl -X POST localhost:3131/api/runtime/models \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"Llama-3.2-1B-Instruct-Q4_K_M"}'
+curl -X DELETE localhost:3131/api/runtime/models/Llama-3.2-1B-Instruct-Q4_K_M
+```
+
+This is intentionally node-local in stage one. Mesh-wide rebalancing and distributed load/unload are stage two.
 
 ## Community
 

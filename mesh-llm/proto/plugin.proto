@@ -79,6 +79,8 @@ message MeshPeer {
   repeated string requested_models = 9;
   optional uint32 rtt_ms = 10;
   string model_source = 11;
+  repeated string hosted_models = 12;
+  optional bool hosted_models_known = 13;
 }
 
 message MeshEvent {
