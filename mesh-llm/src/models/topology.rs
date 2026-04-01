@@ -48,13 +48,15 @@ pub fn infer_local_model_topology(
 
 fn infer_hf_metadata_topology(config: &Value) -> Option<ModelTopology> {
     let expert_count = config.get("num_experts").and_then(|value| value.as_u64())? as u32;
-    let used_expert_count = config
-        .get("num_experts_per_tok")
-        .and_then(|value| value.as_u64())
-        .unwrap_or(0) as u32;
     if expert_count <= 1 {
         return None;
     }
+    // Omit topology entirely when num_experts_per_tok is missing or zero to
+    // avoid surfacing impossible values like "top-0" in the UI.
+    let used_expert_count = config
+        .get("num_experts_per_tok")
+        .and_then(|value| value.as_u64())
+        .filter(|&v| v > 0)? as u32;
     Some(ModelTopology {
         moe: Some(ModelMoeInfo {
             expert_count,

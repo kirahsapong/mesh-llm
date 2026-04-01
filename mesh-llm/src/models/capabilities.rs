@@ -473,9 +473,13 @@ fn json_contains_tool_use_tokens(value: &Value) -> bool {
         Value::Array(items) => items.iter().any(json_contains_tool_use_tokens),
         Value::Object(map) => map.iter().any(|(key, value)| {
             let key_lower = key.to_lowercase();
-            key_lower.contains("tool")
-                || key_lower.contains("function")
-                || key_lower.contains("parallel_tool_calls")
+            key_lower == "tool_calls"
+                || key_lower == "tool_call"
+                || key_lower == "tool_use"
+                || key_lower == "tool_result"
+                || key_lower == "parallel_tool_calls"
+                || key_lower == "function_call"
+                || key_lower == "function_calls"
                 || json_contains_tool_use_tokens(value)
         }),
     }

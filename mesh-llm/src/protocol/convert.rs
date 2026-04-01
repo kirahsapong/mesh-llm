@@ -103,6 +103,19 @@ fn legacy_descriptor_from_identity(
     }
 }
 
+/// Returns `true` when a proto descriptor carries a non-empty model name.
+/// Descriptors without a valid identity are discarded so a partial list
+/// cannot suppress the legacy-identity backfill fallback.
+fn proto_descriptor_has_valid_identity(
+    descriptor: &crate::proto::node::ServedModelDescriptor,
+) -> bool {
+    descriptor
+        .identity
+        .as_ref()
+        .map(|id| !id.model_name.is_empty())
+        .unwrap_or(false)
+}
+
 pub(crate) fn sanitize_gossip_announcement_for_wire(ann: &PeerAnnouncement) -> PeerAnnouncement {
     let mut sanitized = ann.clone();
     sanitized.available_models.clear();
@@ -280,8 +293,10 @@ pub(crate) fn proto_ann_to_local(
         experts_summary: pa.experts_summary.clone(),
         available_model_sizes: HashMap::new(),
         served_model_descriptors: if !pa.served_model_descriptors.is_empty() {
-            pa.served_model_descriptors
+            let descriptors: Vec<_> = pa
+                .served_model_descriptors
                 .iter()
+                .filter(|descriptor| proto_descriptor_has_valid_identity(descriptor))
                 .map(|descriptor| crate::mesh::ServedModelDescriptor {
                     identity: descriptor
                         .identity
@@ -312,7 +327,16 @@ pub(crate) fn proto_ann_to_local(
                         }
                     }),
                 })
-                .collect()
+                .collect();
+            if descriptors.is_empty() {
+                // All descriptors were invalid — fall back to legacy identity list.
+                pa.served_model_identities
+                    .iter()
+                    .map(legacy_descriptor_from_identity)
+                    .collect()
+            } else {
+                descriptors
+            }
         } else {
             pa.served_model_identities
                 .iter()

@@ -1692,8 +1692,7 @@ function AppHeader({
             ))}
           </NavigationMenuList>
         </NavigationMenu>
-        <TooltipProvider>
-          <div className="ml-auto flex items-center gap-2">
+        <div className="ml-auto flex items-center gap-2">
             <Popover>
               <Tooltip>
                 <TooltipTrigger asChild>
@@ -2063,7 +2062,6 @@ function AppHeader({
               </PopoverContent>
             </Popover>
           </div>
-        </TooltipProvider>
       </div>
       {statusError ? (
         <div className="mx-auto w-full max-w-7xl px-4 pb-3">
@@ -3117,8 +3115,7 @@ function DashboardPage({
           </a>
         </AlertDescription>
       </Alert>
-      <TooltipProvider>
-        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
+      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
           <StatCard
             title="Node ID"
             value={status?.node_id ?? "n/a"}
@@ -3157,7 +3154,6 @@ function DashboardPage({
             tooltip="Current in-flight request count."
           />
         </div>
-      </TooltipProvider>
 
       <div className="grid items-start gap-4 lg:grid-cols-7">
         <div className="lg:col-span-5">
@@ -3239,9 +3235,9 @@ function DashboardPage({
                           <div className="flex flex-wrap items-center gap-2">
                             <div className="text-sm font-medium leading-5 [overflow-wrap:anywhere]">{shortName(model.name)}</div>
                             <div className="flex items-center gap-1 text-[11px] text-muted-foreground">
-                              {model.vision ? <span title="Vision">👁</span> : null}
-                              {model.reasoning ? <span title="Reasoning">🧠</span> : null}
-                              {model.moe ? <span title="Mixture of Experts">🧩</span> : null}
+                              {model.vision ? <span role="img" aria-label="Vision">👁</span> : null}
+                              {model.reasoning ? <span role="img" aria-label="Reasoning">🧠</span> : null}
+                              {model.moe ? <span role="img" aria-label="Mixture of Experts">🧩</span> : null}
                             </div>
                           </div>
                           <div className="text-xs leading-4 text-muted-foreground [overflow-wrap:anywhere]">{model.name}</div>
@@ -3257,7 +3253,7 @@ function DashboardPage({
                       <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
                         <span>{model.node_count} node{model.node_count === 1 ? '' : 's'}</span>
                         <span className="flex items-center gap-2">
-                          {model.vision && <span title="Vision — understands images">👁</span>}
+                          {model.vision && <span role="img" aria-label="Vision">👁</span>}
                           {model.size_gb.toFixed(1)} GB
                         </span>
                       </div>
@@ -4527,7 +4523,7 @@ function StatCard({
   return (
     <Tooltip>
       <TooltipTrigger asChild>
-        <div>{card}</div>
+        <div tabIndex={0}>{card}</div>
       </TooltipTrigger>
       <TooltipContent side="bottom" align="center" sideOffset={8}>
         {tooltip}
@@ -4825,7 +4821,7 @@ function CapabilityBadge({
   return (
     <Tooltip>
       <TooltipTrigger asChild>
-        <span className="inline-flex">{badge}</span>
+        <span className="inline-flex" tabIndex={0}>{badge}</span>
       </TooltipTrigger>
       <TooltipContent side="bottom" align="center" sideOffset={8}>
         {tooltip}
@@ -4862,7 +4858,7 @@ function ModelFactCard({
   return (
     <Tooltip>
       <TooltipTrigger asChild>
-        <div>{card}</div>
+        <div tabIndex={0}>{card}</div>
       </TooltipTrigger>
       <TooltipContent side="bottom" align="center" sideOffset={8}>
         {tooltip}
@@ -4906,7 +4902,7 @@ function StatusPill({
   return (
     <Tooltip>
       <TooltipTrigger asChild>
-        <span className="inline-flex">{badge}</span>
+        <span className="inline-flex" tabIndex={0}>{badge}</span>
       </TooltipTrigger>
       <TooltipContent side="bottom" align="center" sideOffset={8}>
         {tooltip}
