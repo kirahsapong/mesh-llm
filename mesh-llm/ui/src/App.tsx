@@ -4879,16 +4879,14 @@ function StatusPill({
   );
   if (!tooltip) return badge;
   return (
-    <TooltipProvider>
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <span className="inline-flex">{badge}</span>
-        </TooltipTrigger>
-        <TooltipContent side="bottom" align="center" sideOffset={8}>
-          {tooltip}
-        </TooltipContent>
-      </Tooltip>
-    </TooltipProvider>
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span className="inline-flex">{badge}</span>
+      </TooltipTrigger>
+      <TooltipContent side="bottom" align="center" sideOffset={8}>
+        {tooltip}
+      </TooltipContent>
+    </Tooltip>
   );
 }
 
