@@ -144,7 +144,7 @@ pub(super) fn start_new_mesh(cli: &mut Cli, _models: &[String], my_vram_gb: f64)
     }
 }
 
-pub(super) fn nostr_relays(cli_relays: &[String]) -> Vec<String> {
+pub(crate) fn nostr_relays(cli_relays: &[String]) -> Vec<String> {
     if cli_relays.is_empty() {
         nostr::DEFAULT_RELAYS
             .iter()
@@ -160,7 +160,7 @@ pub(super) fn nostr_relays(cli_relays: &[String]) -> Vec<String> {
 /// Launcher behavior: if nothing is listening yet, auto-start `mesh-llm --client --auto`
 /// (client node — tunnels to mesh peers without publishing to Nostr).
 /// Returns the child process handle if we spawned one, so callers can clean up on exit.
-pub(super) async fn check_mesh(
+pub(crate) async fn check_mesh(
     client: &reqwest::Client,
     port: u16,
     model: &Option<String>,

@@ -1,6 +1,15 @@
+mod blackboard;
+mod discover;
+mod integrations;
+mod plugin;
+
 use anyhow::Result;
 
 use crate::app;
+use crate::cli::commands::blackboard::{install_skill, run_blackboard};
+use crate::cli::commands::discover::{run_discover, run_stop};
+use crate::cli::commands::integrations::{run_claude, run_goose};
+use crate::cli::commands::plugin::run_plugin_command;
 use crate::cli::models::dispatch_models_command;
 use crate::cli::runtime::{run_drop, run_load, run_status, RuntimeCommand};
 use crate::cli::{Cli, Command};
@@ -53,7 +62,7 @@ pub(crate) async fn dispatch(cli: &Cli) -> Result<bool> {
         Command::Load { name, port } => run_load(name, *port).await,
         Command::Unload { name, port } => run_drop(name, *port).await,
         Command::Status { port } => run_status(*port).await,
-        Command::Stop => app::run_stop(),
+        Command::Stop => run_stop(),
         Command::Discover {
             model,
             min_vram,
@@ -61,7 +70,7 @@ pub(crate) async fn dispatch(cli: &Cli) -> Result<bool> {
             auto,
             relay,
         } => {
-            app::run_discover(
+            run_discover(
                 model.clone(),
                 *min_vram,
                 region.clone(),
@@ -71,8 +80,8 @@ pub(crate) async fn dispatch(cli: &Cli) -> Result<bool> {
             .await
         }
         Command::RotateKey => nostr::rotate_keys().map_err(Into::into),
-        Command::Goose { model, port } => app::run_goose(model.clone(), *port).await,
-        Command::Claude { model, port } => app::run_claude(model.clone(), *port).await,
+        Command::Goose { model, port } => run_goose(model.clone(), *port).await,
+        Command::Claude { model, port } => run_claude(model.clone(), *port).await,
         Command::Blackboard {
             text,
             search,
@@ -85,9 +94,9 @@ pub(crate) async fn dispatch(cli: &Cli) -> Result<bool> {
             if *mcp {
                 app::run_plugin_mcp(cli).await
             } else if text.as_deref() == Some("install-skill") {
-                app::install_skill()
+                install_skill()
             } else {
-                app::run_blackboard(
+                run_blackboard(
                     text.clone(),
                     search.clone(),
                     from.clone(),
@@ -98,7 +107,7 @@ pub(crate) async fn dispatch(cli: &Cli) -> Result<bool> {
                 .await
             }
         }
-        Command::Plugin { command } => app::run_plugin_command(command, cli).await,
+        Command::Plugin { command } => run_plugin_command(command, cli).await,
     }?;
     Ok(true)
 }
