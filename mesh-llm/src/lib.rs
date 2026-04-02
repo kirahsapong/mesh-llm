@@ -3,14 +3,11 @@ mod api;
 mod autoupdate;
 mod benchmark;
 mod cli;
-mod election;
 mod hardware;
-mod launch;
+mod inference;
 mod mesh;
 mod models;
-mod moe;
 mod nostr;
-mod pipeline;
 mod plugin;
 mod plugin_mcp;
 mod plugins;
@@ -28,6 +25,7 @@ pub mod proto {
 }
 
 pub(crate) use autoupdate::{latest_release_version, version_newer};
+pub(crate) use inference::{election, launch, moe, pipeline};
 pub use plugins::blackboard;
 pub use plugins::blackboard::mcp as blackboard_mcp;
 
