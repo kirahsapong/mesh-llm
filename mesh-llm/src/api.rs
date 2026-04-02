@@ -25,8 +25,6 @@ use tokio::sync::{watch, Mutex};
 
 static CONSOLE_DIST: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/ui/dist");
 const MESH_LLM_VERSION: &str = crate::VERSION;
-/// How often (in seconds) to refresh the local model inventory cache.
-const INVENTORY_CACHE_REFRESH_SECS: u64 = 60;
 
 // ── Shared state ──
 
@@ -94,9 +92,10 @@ struct ApiInner {
     runtime_control: Option<tokio::sync::mpsc::UnboundedSender<RuntimeControlRequest>>,
     local_processes: Vec<RuntimeProcessPayload>,
     sse_clients: Vec<tokio::sync::mpsc::UnboundedSender<String>>,
-    /// Cached result of the last local inventory scan.  Refreshed on a timer
-    /// so `status()` never blocks on filesystem/GGUF reads.
+    /// Cached result of the last local inventory scan so `status()` never
+    /// blocks on filesystem/GGUF reads.
     cached_inventory: crate::models::LocalModelInventorySnapshot,
+    inventory_cache_progress: Option<crate::models::ModelMetadataCacheProgress>,
 }
 
 #[derive(Serialize)]
@@ -170,6 +169,8 @@ struct StatusPayload {
     my_is_soc: Option<bool>,
     gpus: Vec<GpuEntry>,
     routing_affinity: affinity::AffinityStatsSnapshot,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inventory_cache_progress: Option<crate::models::ModelMetadataCacheProgress>,
 }
 
 #[derive(Serialize)]
@@ -293,13 +294,6 @@ fn likely_reasoning_model(name: &str, description: Option<&str>) -> bool {
         .any(|needle| haystack.contains(needle))
 }
 
-fn likely_vision_model(name: &str, description: Option<&str>) -> bool {
-    let haystack = format!("{} {}", name, description.unwrap_or_default()).to_ascii_lowercase();
-    ["vision", "-vl", "llava", "omni", "qwen2.5-vl", "mllama"]
-        .iter()
-        .any(|needle| haystack.contains(needle))
-}
-
 fn fit_hint_for_machine(size_gb: f64, my_vram_gb: f64) -> (String, String) {
     if size_gb <= 0.0 || my_vram_gb <= 0.0 {
         return (
@@ -377,6 +371,7 @@ impl MeshApi {
                 local_processes: Vec::new(),
                 sse_clients: Vec::new(),
                 cached_inventory: crate::models::LocalModelInventorySnapshot::default(),
+                inventory_cache_progress: None,
             })),
         }
     }
@@ -443,13 +438,40 @@ impl MeshApi {
     }
 
     /// Refresh the cached local inventory snapshot in a blocking thread pool task.
-    /// Called once at startup and periodically by the background timer in `start()`.
+    /// Called at startup and on explicit invalidation paths.
     async fn refresh_inventory_cache(&self) {
-        match tokio::task::spawn_blocking(crate::models::scan_local_inventory_snapshot).await {
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+        let progress_state = self.clone();
+        let progress_task = tokio::spawn(async move {
+            while let Some(progress) = progress_rx.recv().await {
+                {
+                    let mut inner = progress_state.inner.lock().await;
+                    inner.inventory_cache_progress = Some(progress);
+                }
+                progress_state.push_status().await;
+            }
+        });
+
+        match tokio::task::spawn_blocking(move || {
+            crate::models::scan_local_inventory_snapshot_with_progress(|progress| {
+                let _ = progress_tx.send(progress);
+            })
+        })
+        .await
+        {
             Ok(snapshot) => {
-                self.inner.lock().await.cached_inventory = snapshot;
+                let _ = progress_task.await;
+                {
+                    let mut inner = self.inner.lock().await;
+                    inner.cached_inventory = snapshot;
+                    inner.inventory_cache_progress = None;
+                }
+                self.push_status().await;
             }
             Err(e) => {
+                let _ = progress_task.await;
+                self.inner.lock().await.inventory_cache_progress = None;
+                self.push_status().await;
                 tracing::warn!("Local inventory cache refresh failed: {e}");
             }
         }
@@ -505,6 +527,7 @@ impl MeshApi {
             nostr_discovery,
             local_scan,
             local_processes,
+            inventory_cache_progress,
         ) = {
             let inner = self.inner.lock().await;
             (
@@ -526,6 +549,7 @@ impl MeshApi {
                 inner.nostr_discovery,
                 inner.cached_inventory.clone(),
                 inner.local_processes.clone(),
+                inner.inventory_cache_progress,
             )
         }; // inner lock dropped here
 
@@ -926,6 +950,7 @@ impl MeshApi {
                 )
             },
             routing_affinity,
+            inventory_cache_progress,
         }
     }
 
@@ -1023,15 +1048,11 @@ pub async fn start(
         state5.push_status().await;
     });
 
-    // Populate the inventory cache eagerly, then refresh it every INVENTORY_CACHE_REFRESH_SECS so
-    // `status()` never performs blocking filesystem/GGUF reads inline.
+    // Populate the inventory cache eagerly in the background so `status()` never performs
+    // blocking filesystem/GGUF reads inline.
     let state6 = state.clone();
     tokio::spawn(async move {
         state6.refresh_inventory_cache().await;
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(INVENTORY_CACHE_REFRESH_SECS)).await;
-            state6.refresh_inventory_cache().await;
-        }
     });
 
     let addr = if listen_all { "0.0.0.0" } else { "127.0.0.1" };
@@ -1773,16 +1794,6 @@ async fn respond_console_asset(stream: &mut TcpStream, path: &str) -> anyhow::Re
     )
     .await?;
     Ok(true)
-}
-
-async fn respond_bytes(
-    stream: &mut TcpStream,
-    code: u16,
-    status: &str,
-    content_type: &str,
-    body: &[u8],
-) -> anyhow::Result<()> {
-    respond_bytes_cached(stream, code, status, content_type, "no-cache", body).await
 }
 
 async fn respond_bytes_cached(

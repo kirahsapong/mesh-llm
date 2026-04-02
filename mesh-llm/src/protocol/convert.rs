@@ -1,4 +1,6 @@
-use crate::mesh::{ModelDemand, NodeRole, PeerAnnouncement, RouteEntry, RoutingTable};
+#[cfg(test)]
+use crate::mesh::RouteEntry;
+use crate::mesh::{ModelDemand, NodeRole, PeerAnnouncement, RoutingTable};
 use crate::protocol::NODE_PROTOCOL_GENERATION;
 use iroh::{EndpointAddr, EndpointId};
 use std::collections::HashMap;
@@ -364,6 +366,7 @@ pub(crate) fn routing_table_to_proto(table: &RoutingTable) -> crate::proto::node
     }
 }
 
+#[cfg(test)]
 pub(crate) fn proto_route_table_to_local(table: &crate::proto::node::RouteTable) -> RoutingTable {
     let hosts = table
         .entries

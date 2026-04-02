@@ -5,7 +5,7 @@
 //! Every mesh change: kill llama-server, re-elect, winner starts fresh.
 //! mesh-llm owns :api_port and proxies to the right host by model name.
 
-use crate::{launch, mesh, moe, tunnel};
+use crate::{launch, mesh, models, moe, tunnel};
 use mesh::NodeRole;
 use std::collections::HashMap;
 use std::path::Path;
@@ -214,7 +214,7 @@ fn lookup_moe_config(
     }
 
     // Tier 2: auto-detect from GGUF header
-    let info = moe::detect_moe(model_path)?;
+    let info = models::gguf::detect_moe(model_path)?;
     eprintln!(
         "🔍 Auto-detected MoE from GGUF: {} experts, top-{}",
         info.expert_count, info.expert_used_count

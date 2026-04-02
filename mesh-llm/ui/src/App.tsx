@@ -242,6 +242,10 @@ type StatusPayload = {
   my_hostname?: string;
   my_is_soc?: boolean;
   gpus?: { name: string; vram_bytes: number; bandwidth_gbps?: number }[];
+  inventory_cache_progress?: {
+    missing_cache_files_total: number;
+    missing_cache_files_done: number;
+  } | null;
 };
 
 type ChatMessage = {
@@ -2997,6 +3001,19 @@ function DashboardPage({
         (a, b) => b.node_count - a.node_count || a.name.localeCompare(b.name),
       );
   }, [status?.mesh_models, modelFilter]);
+  const inventoryCacheProgress = status?.inventory_cache_progress ?? null;
+  const inventoryCacheProgressTotal =
+    inventoryCacheProgress?.missing_cache_files_total ?? 0;
+  const inventoryCacheProgressDone = Math.min(
+    inventoryCacheProgress?.missing_cache_files_done ?? 0,
+    inventoryCacheProgressTotal,
+  );
+  const inventoryCacheProgressPct =
+    inventoryCacheProgressTotal > 0
+      ? Math.round(
+          (inventoryCacheProgressDone / inventoryCacheProgressTotal) * 100,
+        )
+      : 0;
   const totalMeshVramGb = useMemo(() => meshGpuVram(status), [status]);
   const sortedPeers = useMemo(() => {
     return [...(status?.peers ?? [])].sort((a, b) => {
@@ -3118,6 +3135,26 @@ function DashboardPage({
           </a>
         </AlertDescription>
       </Alert>
+      {inventoryCacheProgressTotal > 0 ? (
+        <Alert className="border-border/60 bg-card/80">
+          <Loader2 className="h-4 w-4 animate-spin" />
+          <AlertTitle className="text-sm font-medium">
+            Updating GGUF cache
+          </AlertTitle>
+          <AlertDescription className="space-y-2">
+            <div className="text-xs text-muted-foreground">
+              {inventoryCacheProgressDone} of {inventoryCacheProgressTotal}{" "}
+              missing cache files processed
+            </div>
+            <div className="h-2 overflow-hidden rounded-full bg-muted">
+              <div
+                className="h-full rounded-full bg-primary transition-[width] duration-300 ease-out"
+                style={{ width: `${inventoryCacheProgressPct}%` }}
+              />
+            </div>
+          </AlertDescription>
+        </Alert>
+      ) : null}
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
           <StatCard
             title="Node ID"

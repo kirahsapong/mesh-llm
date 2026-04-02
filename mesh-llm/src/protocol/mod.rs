@@ -26,6 +26,7 @@ use iroh::{Endpoint, EndpointAddr, EndpointId};
 use prost::Message;
 pub(crate) use v0::*;
 pub const ALPN_V1: &[u8] = b"mesh-llm/1";
+#[cfg(test)]
 pub const ALPN: &[u8] = ALPN_V1;
 pub(crate) const NODE_PROTOCOL_GENERATION: u32 = 1;
 pub(crate) const MAX_CONTROL_FRAME_BYTES: usize = 8 * 1024 * 1024; // 8 MiB
@@ -49,19 +50,34 @@ pub(crate) enum ControlProtocol {
 
 #[derive(Debug, PartialEq)]
 pub(crate) enum ControlFrameError {
-    OversizeFrame { size: usize },
-    BadGeneration { got: u32 },
-    InvalidEndpointId { got: usize },
-    InvalidSenderId { got: usize },
+    #[cfg(test)]
+    OversizeFrame {
+        size: usize,
+    },
+    BadGeneration {
+        got: u32,
+    },
+    InvalidEndpointId {
+        got: usize,
+    },
+    InvalidSenderId {
+        got: usize,
+    },
     MissingHttpPort,
+    #[cfg(test)]
     DecodeError(String),
-    WrongStreamType { expected: u8, got: u8 },
+    #[cfg(test)]
+    WrongStreamType {
+        expected: u8,
+        got: u8,
+    },
     ForgedSender,
 }
 
 impl std::fmt::Display for ControlFrameError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            #[cfg(test)]
             ControlFrameError::OversizeFrame { size } => write!(
                 f,
                 "control frame too large: {} bytes (max {})",
@@ -81,7 +97,9 @@ impl std::fmt::Display for ControlFrameError {
             ControlFrameError::MissingHttpPort => {
                 write!(f, "HOST-role peer annotation missing http_port")
             }
+            #[cfg(test)]
             ControlFrameError::DecodeError(msg) => write!(f, "protobuf decode error: {}", msg),
+            #[cfg(test)]
             ControlFrameError::WrongStreamType { expected, got } => write!(
                 f,
                 "wrong stream type: expected {:#04x}, got {:#04x}",
@@ -310,6 +328,7 @@ pub(crate) fn decode_gossip_payload(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn encode_control_frame(stream_type: u8, msg: &impl prost::Message) -> Vec<u8> {
     let proto_bytes = msg.encode_to_vec();
     let len = proto_bytes.len() as u32;
@@ -320,6 +339,7 @@ pub(crate) fn encode_control_frame(stream_type: u8, msg: &impl prost::Message) -
     buf
 }
 
+#[cfg(test)]
 pub(crate) fn decode_control_frame<T: ValidateControlFrame>(
     expected_stream_type: u8,
     data: &[u8],

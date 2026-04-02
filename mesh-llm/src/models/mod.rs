@@ -1,6 +1,7 @@
 pub mod capabilities;
 pub mod catalog;
 pub mod cli;
+pub mod gguf;
 pub mod inventory;
 pub mod local;
 pub mod topology;
@@ -8,13 +9,14 @@ pub mod topology;
 use anyhow::{anyhow, bail, Context, Result};
 use hf_hub::api::sync::{Api, ApiBuilder};
 use hf_hub::api::tokio::{Api as TokioApi, ApiBuilder as TokioApiBuilder};
-use hf_hub::api::RepoInfo;
+use hf_hub::api::{RepoInfo, RepoSummary};
 use hf_hub::cache::CacheInfo;
 use hf_hub::{Repo, RepoType};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use tokio::task::JoinSet;
 
 pub use capabilities::{CapabilityLevel, ModelCapabilities};
 pub use cli::{
@@ -22,8 +24,8 @@ pub use cli::{
     run_model_show, warn_about_legacy_model_usage,
 };
 pub use inventory::{
-    scan_all_model_metadata, scan_local_inventory_snapshot, scan_local_model_sizes,
-    LocalModelInventorySnapshot,
+    scan_local_inventory_snapshot_with_progress, LocalModelInventorySnapshot,
+    ModelMetadataCacheProgress,
 };
 pub use local::{
     exact_model_source_for_path, find_model_path, huggingface_hub_cache, huggingface_hub_cache_dir,
@@ -83,6 +85,12 @@ pub struct SearchHit {
     pub likes: Option<u64>,
     pub catalog: Option<&'static catalog::CatalogModel>,
     pub capabilities: ModelCapabilities,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SearchProgress {
+    SearchingHub,
+    InspectingRepos { completed: usize, total: usize },
 }
 
 #[derive(Clone, Debug)]
@@ -259,8 +267,18 @@ pub async fn show_exact_model(input: &str) -> Result<ModelDetails> {
 
 // Keep search custom for now. `hf-hub` handles cache and file transport well,
 // but it does not expose a Hub search surface in this crate version.
-pub async fn search_huggingface(query: &str, limit: usize) -> Result<Vec<SearchHit>> {
+pub async fn search_huggingface<F>(
+    query: &str,
+    limit: usize,
+    mut progress: F,
+) -> Result<Vec<SearchHit>>
+where
+    F: FnMut(SearchProgress),
+{
+    const SEARCH_CONCURRENCY: usize = 6;
+
     let repo_limit = limit.clamp(1, 100);
+    progress(SearchProgress::SearchingHub);
     let api = build_hf_tokio_api(false)?;
     let repos = api
         .search(RepoType::Model)
@@ -271,74 +289,107 @@ pub async fn search_huggingface(query: &str, limit: usize) -> Result<Vec<SearchH
         .await
         .context("Search Hugging Face")?;
 
-    let mut hits = Vec::new();
-    for repo in repos {
-        let detail = api
-            .repo(repo.repo())
-            .info()
-            .await
-            .with_context(|| format!("Fetch Hugging Face repo {}", repo.id))?;
+    let total = repos.len();
+    progress(SearchProgress::InspectingRepos {
+        completed: 0,
+        total,
+    });
 
-        let repo_id = detail
-            .id
-            .clone()
-            .or(detail.model_id.clone())
-            .unwrap_or(repo.id.clone());
-        let sibling_names: Vec<String> = detail
-            .siblings
-            .iter()
-            .map(|sibling| sibling.rfilename.clone())
-            .collect();
-        let mut files: Vec<String> = detail
-            .siblings
-            .into_iter()
-            .map(|sibling| sibling.rfilename)
-            .filter(|file| file.ends_with(".gguf"))
-            .collect();
-        if files.is_empty() {
-            continue;
-        }
-        files.sort_by(|left, right| {
-            file_preference_score(left)
-                .cmp(&file_preference_score(right))
-                .then_with(|| left.cmp(right))
-        });
-        if let Some(file) = files.into_iter().next() {
-            let catalog = matching_catalog_model_for_huggingface(&repo_id, None, &file);
-            let size_label = match catalog {
-                Some(model) => Some(model.size.to_string()),
-                None => remote_hf_size_label_with_api(&api, &repo_id, None, &file).await,
-            };
-            let remote_caps = capabilities::infer_remote_hf_capabilities(
-                &repo_id,
-                None,
-                &file,
-                Some(&sibling_names),
-            )
-            .await;
-            let capabilities = match catalog {
-                Some(model) => {
-                    let base = capabilities::infer_catalog_capabilities(model);
-                    merge_capabilities(base, remote_caps)
-                }
-                None => remote_caps,
-            };
-            hits.push(SearchHit {
-                repo_id: repo_id.clone(),
-                file: file.clone(),
-                exact_ref: format!("{repo_id}/{file}"),
-                size_label,
-                downloads: detail.downloads.or(repo.downloads),
-                likes: detail.likes.or(repo.likes),
-                catalog,
-                capabilities,
-            });
-            if hits.len() >= limit {
-                return Ok(hits);
-            }
+    let mut pending = repos.into_iter().enumerate();
+    let mut join_set = JoinSet::new();
+    for _ in 0..SEARCH_CONCURRENCY.min(total.max(1)) {
+        if let Some((index, repo)) = pending.next() {
+            let api = api.clone();
+            join_set.spawn(async move { (index, build_search_hit(api, repo).await) });
         }
     }
+
+    let mut completed = 0usize;
+    let mut indexed_hits = Vec::new();
+    while let Some(joined) = join_set.join_next().await {
+        let (index, result) = joined.context("Join Hugging Face repo inspection task")?;
+        completed += 1;
+        progress(SearchProgress::InspectingRepos { completed, total });
+        if let Some(hit) = result? {
+            indexed_hits.push((index, hit));
+        }
+        if let Some((next_index, repo)) = pending.next() {
+            let api = api.clone();
+            join_set.spawn(async move { (next_index, build_search_hit(api, repo).await) });
+        }
+    }
+
+    indexed_hits.sort_by_key(|(index, _)| *index);
+    let mut hits: Vec<SearchHit> = indexed_hits
+        .into_iter()
+        .map(|(_, hit)| hit)
+        .take(limit)
+        .collect();
+    if hits.len() > limit {
+        hits.truncate(limit);
+    }
     Ok(hits)
+}
+
+async fn build_search_hit(api: TokioApi, repo: RepoSummary) -> Result<Option<SearchHit>> {
+    let detail = api
+        .repo(repo.repo())
+        .info()
+        .await
+        .with_context(|| format!("Fetch Hugging Face repo {}", repo.id))?;
+
+    let repo_id = detail
+        .id
+        .clone()
+        .or(detail.model_id.clone())
+        .unwrap_or(repo.id.clone());
+    let sibling_names: Vec<String> = detail
+        .siblings
+        .iter()
+        .map(|sibling| sibling.rfilename.clone())
+        .collect();
+    let mut files: Vec<String> = detail
+        .siblings
+        .into_iter()
+        .map(|sibling| sibling.rfilename)
+        .filter(|file| file.ends_with(".gguf"))
+        .collect();
+    if files.is_empty() {
+        return Ok(None);
+    }
+    files.sort_by(|left, right| {
+        file_preference_score(left)
+            .cmp(&file_preference_score(right))
+            .then_with(|| left.cmp(right))
+    });
+    let Some(file) = files.into_iter().next() else {
+        return Ok(None);
+    };
+    let catalog = matching_catalog_model_for_huggingface(&repo_id, None, &file);
+    let size_label = match catalog {
+        Some(model) => Some(model.size.to_string()),
+        None => remote_hf_size_label_with_api(&api, &repo_id, None, &file).await,
+    };
+    let remote_caps =
+        capabilities::infer_remote_hf_capabilities(&repo_id, None, &file, Some(&sibling_names))
+            .await;
+    let capabilities = match catalog {
+        Some(model) => {
+            let base = capabilities::infer_catalog_capabilities(model);
+            merge_capabilities(base, remote_caps)
+        }
+        None => remote_caps,
+    };
+    Ok(Some(SearchHit {
+        repo_id: repo_id.clone(),
+        file: file.clone(),
+        exact_ref: format!("{repo_id}/{file}"),
+        size_label,
+        downloads: detail.downloads.or(repo.downloads),
+        likes: detail.likes.or(repo.likes),
+        catalog,
+        capabilities,
+    }))
 }
 
 pub fn run_migrate(apply: bool, prune: bool) -> Result<()> {
@@ -396,7 +447,7 @@ pub fn run_migrate(apply: bool, prune: bool) -> Result<()> {
         return run_prune(&entries);
     }
 
-    let api = build_hf_api(true)?;
+    let api = build_hf_api()?;
     let mut migrated = 0usize;
     let mut totals = MigrationCounts::default();
     let mut grouped = BTreeMap::<String, Vec<&MigrationEntry>>::new();
@@ -437,7 +488,7 @@ pub fn run_migrate(apply: bool, prune: bool) -> Result<()> {
 }
 
 pub fn run_update(repo: Option<&str>, all: bool, check: bool) -> Result<()> {
-    let api = build_hf_api(!check)?;
+    let api = build_hf_api()?;
     let repos = cached_repos()?;
     if repos.is_empty() {
         eprintln!("📦 No cached Hugging Face model repos found");
@@ -541,7 +592,7 @@ pub fn warn_about_updates_for_paths(paths: &[PathBuf]) {
         return;
     }
 
-    let api = match build_hf_api(false) {
+    let api = match build_hf_api() {
         Ok(api) => api,
         Err(err) => {
             eprintln!("Warning: could not initialize Hugging Face update checks: {err}");
@@ -580,8 +631,8 @@ pub fn installed_model_display_name(model_name: &str) -> String {
         .unwrap_or_else(|| model_name.to_string())
 }
 
-fn build_hf_api(progress: bool) -> Result<Api> {
-    let mut builder = ApiBuilder::from_cache(huggingface_hub_cache()).with_progress(progress);
+fn build_hf_api() -> Result<Api> {
+    let mut builder = ApiBuilder::from_cache(huggingface_hub_cache()).with_progress(false);
     if let Ok(endpoint) = std::env::var("HF_ENDPOINT") {
         let endpoint = endpoint.trim();
         if !endpoint.is_empty() {

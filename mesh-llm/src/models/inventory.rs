@@ -11,6 +11,12 @@ pub struct LocalModelInventorySnapshot {
     pub metadata_by_name: HashMap<String, crate::proto::node::CompactModelMetadata>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub struct ModelMetadataCacheProgress {
+    pub missing_cache_files_total: usize,
+    pub missing_cache_files_done: usize,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct CachedCompactModelMetadata {
     model_key: String,
@@ -30,6 +36,16 @@ struct CachedCompactModelMetadata {
     expert_count: u32,
     used_expert_count: u32,
     quantization_type: String,
+}
+
+#[derive(Clone, Debug)]
+struct InventoryScanEntry {
+    path: PathBuf,
+    size: u64,
+    model_key: String,
+    quantization_type: String,
+    scans_metadata: bool,
+    missing_cache_file: bool,
 }
 
 impl CachedCompactModelMetadata {
@@ -156,7 +172,7 @@ fn compact_metadata_from_gguf(
     model_key: String,
     quantization_type: String,
 ) -> crate::proto::node::CompactModelMetadata {
-    if let Some(m) = crate::moe::scan_gguf_compact_meta(path) {
+    if let Some(m) = crate::models::gguf::scan_gguf_compact_meta(path) {
         crate::proto::node::CompactModelMetadata {
             model_key: model_key.clone(),
             context_length: m.context_length,
@@ -211,8 +227,19 @@ fn cached_compact_metadata_for_path(
     meta
 }
 
-pub fn scan_local_inventory_snapshot() -> LocalModelInventorySnapshot {
-    let mut snapshot = LocalModelInventorySnapshot::default();
+fn metadata_cache_missing_for_path(path: &Path) -> bool {
+    let Some(cache_path) = gguf_metadata_cache_path(path) else {
+        return true;
+    };
+    let Ok(bytes) = std::fs::read(cache_path) else {
+        return true;
+    };
+    serde_json::from_slice::<CachedCompactModelMetadata>(&bytes).is_err()
+}
+
+fn inventory_scan_entries() -> Vec<InventoryScanEntry> {
+    let mut entries = Vec::new();
+    let mut metadata_seen = HashSet::new();
     for path in local_gguf_paths() {
         let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         if size < 500_000_000 {
@@ -223,45 +250,63 @@ pub fn scan_local_inventory_snapshot() -> LocalModelInventorySnapshot {
         };
         let model_key = split_gguf_base_name(stem).unwrap_or(stem).to_string();
         let quantization_type = derive_quantization_type(&model_key);
+        let scans_metadata = metadata_seen.insert(model_key.clone());
+        let missing_cache_file = scans_metadata && metadata_cache_missing_for_path(&path);
+        entries.push(InventoryScanEntry {
+            path,
+            size,
+            model_key,
+            quantization_type,
+            scans_metadata,
+            missing_cache_file,
+        });
+    }
+    entries
+}
 
-        snapshot.model_names.insert(model_key.clone());
+pub fn scan_local_inventory_snapshot_with_progress<F>(
+    mut on_progress: F,
+) -> LocalModelInventorySnapshot
+where
+    F: FnMut(ModelMetadataCacheProgress),
+{
+    let entries = inventory_scan_entries();
+    let missing_cache_files_total = entries
+        .iter()
+        .filter(|entry| entry.missing_cache_file)
+        .count();
+    let mut missing_cache_files_done = 0usize;
+    if missing_cache_files_total > 0 {
+        on_progress(ModelMetadataCacheProgress {
+            missing_cache_files_total,
+            missing_cache_files_done,
+        });
+    }
+
+    let mut snapshot = LocalModelInventorySnapshot::default();
+    for entry in entries {
+        snapshot.model_names.insert(entry.model_key.clone());
         snapshot
             .size_by_name
-            .entry(model_key.clone())
-            .and_modify(|total| *total += size)
-            .or_insert(size);
-        snapshot
-            .metadata_by_name
-            .entry(model_key.clone())
-            .or_insert_with(|| {
-                cached_compact_metadata_for_path(
-                    &path,
-                    model_key.clone(),
-                    quantization_type.clone(),
-                )
+            .entry(entry.model_key.clone())
+            .and_modify(|total| *total += entry.size)
+            .or_insert(entry.size);
+        if !entry.scans_metadata {
+            continue;
+        }
+        let meta = cached_compact_metadata_for_path(
+            &entry.path,
+            entry.model_key.clone(),
+            entry.quantization_type,
+        );
+        if entry.missing_cache_file {
+            missing_cache_files_done += 1;
+            on_progress(ModelMetadataCacheProgress {
+                missing_cache_files_total,
+                missing_cache_files_done,
             });
+        }
+        snapshot.metadata_by_name.insert(entry.model_key, meta);
     }
     snapshot
-}
-
-pub fn scan_local_models() -> Vec<String> {
-    let mut names: Vec<String> = scan_local_inventory_snapshot()
-        .model_names
-        .into_iter()
-        .collect();
-    names.sort();
-    names
-}
-
-pub fn scan_local_model_sizes() -> HashMap<String, u64> {
-    scan_local_inventory_snapshot().size_by_name
-}
-
-pub fn scan_all_model_metadata() -> Vec<crate::proto::node::CompactModelMetadata> {
-    let mut result: Vec<_> = scan_local_inventory_snapshot()
-        .metadata_by_name
-        .into_values()
-        .collect();
-    result.sort_by(|a, b| a.model_key.cmp(&b.model_key));
-    result
 }

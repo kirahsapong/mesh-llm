@@ -1,11 +1,13 @@
 //! Built-in model catalog plus managed acquisition helpers.
 
 use anyhow::{Context, Result};
+use hf_hub::api::Progress as HfProgress;
 use hf_hub::{Repo, RepoType};
 use serde::Deserialize;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -246,8 +248,86 @@ async fn download_hf_assets(label: &str, assets: Vec<HfAsset>) -> Result<Vec<Pat
         .context("Join Hugging Face download task")?
 }
 
+struct MeshDownloadProgress {
+    filename: String,
+    total: usize,
+    downloaded: usize,
+    last_draw: Option<Instant>,
+}
+
+impl MeshDownloadProgress {
+    fn new() -> Self {
+        Self {
+            filename: String::new(),
+            total: 0,
+            downloaded: 0,
+            last_draw: None,
+        }
+    }
+
+    fn draw(&mut self, force: bool) {
+        let now = Instant::now();
+        if !force
+            && self
+                .last_draw
+                .is_some_and(|last| now.duration_since(last) < Duration::from_millis(150))
+        {
+            return;
+        }
+        self.last_draw = Some(now);
+        let percent = if self.total == 0 {
+            0
+        } else {
+            ((self.downloaded as f64 / self.total as f64) * 100.0).round() as usize
+        };
+        eprint!(
+            "\r   ⏬ {} {:>3}% ({}/{})",
+            self.filename,
+            percent.min(100),
+            format_download_bytes(self.downloaded as u64),
+            format_download_bytes(self.total as u64)
+        );
+        let _ = std::io::stderr().flush();
+        if force {
+            eprintln!();
+        }
+    }
+}
+
+impl HfProgress for MeshDownloadProgress {
+    fn init(&mut self, size: usize, filename: &str) {
+        self.filename = filename.to_string();
+        self.total = size;
+        self.downloaded = 0;
+        self.last_draw = None;
+        self.draw(false);
+    }
+
+    fn update(&mut self, size: usize) {
+        self.downloaded = self.downloaded.saturating_add(size);
+        self.draw(false);
+    }
+
+    fn finish(&mut self) {
+        self.downloaded = self.total;
+        self.draw(true);
+    }
+}
+
+fn format_download_bytes(bytes: u64) -> String {
+    if bytes >= 1_000_000_000 {
+        format!("{:.1}GB", bytes as f64 / 1e9)
+    } else if bytes >= 1_000_000 {
+        format!("{:.0}MB", bytes as f64 / 1e6)
+    } else if bytes >= 1_000 {
+        format!("{:.0}KB", bytes as f64 / 1e3)
+    } else {
+        format!("{bytes}B")
+    }
+}
+
 fn download_hf_assets_blocking(label: &str, assets: Vec<HfAsset>) -> Result<Vec<PathBuf>> {
-    let api = super::build_hf_api(true)?;
+    let api = super::build_hf_api()?;
     let cache = crate::models::huggingface_hub_cache();
     let mut download_plan = std::collections::BTreeSet::new();
     let mut config_repos = std::collections::BTreeSet::new();
@@ -269,43 +349,52 @@ fn download_hf_assets_blocking(label: &str, assets: Vec<HfAsset>) -> Result<Vec<
         ));
     }
 
-    eprintln!(
-        "📥 Syncing {} into {}",
-        label,
-        crate::models::huggingface_hub_cache_dir().display()
-    );
+    eprintln!("📥 Ensuring {} is available locally...", label);
 
     let mut primary_paths = Vec::new();
-    let total = download_plan.len();
-    for (index, (required, asset)) in download_plan.into_iter().enumerate() {
+    for (required, asset) in download_plan {
         let repo_handle = asset.repo_handle();
         let cache_repo = cache.repo(repo_handle.clone());
         let api_repo = api.repo(repo_handle);
-        let prefix = if required { "model" } else { "meta" };
-        eprintln!("  🧭 [{}/{}] {} {}", index + 1, total, prefix, asset.file);
         let path = match cache_repo.get(&asset.file) {
             Some(path) => {
-                eprintln!("     ✅ cached {}", path.display());
+                if required {
+                    eprintln!("   ✅ Using cached model {}", asset.file);
+                } else {
+                    eprintln!("   🧾 Using cached model metadata");
+                }
                 path
             }
-            None => match api_repo.download(&asset.file) {
-                Ok(path) => {
-                    eprintln!("     ✅ ready {}", path.display());
-                    path
+            None => {
+                if required {
+                    eprintln!("   📥 Downloading model {}", asset.file);
                 }
-                Err(err) if !required && asset.file == "config.json" => {
-                    eprintln!("     ⚠ meta {} missing: {}", asset.repo, err);
-                    continue;
+                match if required {
+                    api_repo.download_with_progress(&asset.file, MeshDownloadProgress::new())
+                } else {
+                    api_repo.download(&asset.file)
+                } {
+                    Ok(path) => {
+                        if required {
+                            eprintln!("   ✅ Ready {}", asset.file);
+                        } else {
+                            eprintln!("   🧾 Downloaded model metadata");
+                        }
+                        path
+                    }
+                    Err(_) if !required && asset.file == "config.json" => {
+                        continue;
+                    }
+                    Err(err) => {
+                        return Err(err).with_context(|| {
+                            format!(
+                                "Cache Hugging Face asset {}/{}@{}",
+                                asset.repo, asset.file, asset.revision
+                            )
+                        });
+                    }
                 }
-                Err(err) => {
-                    return Err(err).with_context(|| {
-                        format!(
-                            "Cache Hugging Face asset {}/{}@{}",
-                            asset.repo, asset.file, asset.revision
-                        )
-                    });
-                }
-            },
+            }
         };
         if required && asset.file != "config.json" {
             primary_paths.push(path);

@@ -802,24 +802,6 @@ impl PeerInfo {
 /// Peers not directly verified within this window are considered stale
 /// and excluded from gossip propagation. After 2x this duration they're removed entirely.
 const PEER_STALE_SECS: u64 = 180; // 3 minutes
-
-pub type LocalModelInventorySnapshot = crate::models::inventory::LocalModelInventorySnapshot;
-
-pub fn scan_local_inventory_snapshot() -> LocalModelInventorySnapshot {
-    crate::models::scan_local_inventory_snapshot()
-}
-
-pub fn scan_local_models() -> Vec<String> {
-    crate::models::scan_local_models()
-}
-
-pub fn scan_local_model_sizes() -> HashMap<String, u64> {
-    crate::models::scan_local_model_sizes()
-}
-
-pub fn scan_all_model_metadata() -> Vec<crate::proto::node::CompactModelMetadata> {
-    crate::models::scan_all_model_metadata()
-}
 /// Detect available VRAM. On Apple Silicon, uses ~75% of system RAM
 /// (the rest is reserved for OS/apps on unified memory).
 /// Detect available memory for model loading, capped by max_vram_gb if set.
@@ -996,6 +978,7 @@ struct MeshState {
 /// Returns `true` if the given peer has completed gossip validation and is
 /// a full mesh member. Unadmitted peers are in `state.connections` but not
 /// in `state.peers` — they are quarantined until gossip succeeds.
+#[cfg(test)]
 pub(crate) fn is_peer_admitted(peers: &HashMap<EndpointId, PeerInfo>, id: &EndpointId) -> bool {
     peers.contains_key(id)
 }
@@ -1321,6 +1304,7 @@ impl Node {
         ))
     }
 
+    #[cfg(test)]
     #[cfg(test)]
     pub async fn new_for_tests(role: NodeRole) -> Result<Self> {
         use iroh::endpoint::QuicTransportConfig;
@@ -2776,6 +2760,7 @@ impl Node {
         RoutingTable { hosts, mesh_id }
     }
 
+    #[cfg(test)]
     pub async fn request_route_table(&self, conn: &Connection) -> Result<RoutingTable> {
         use prost::Message as _;
         let protocol = connection_protocol(conn);
