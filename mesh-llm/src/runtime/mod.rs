@@ -15,7 +15,7 @@ use crate::mesh::NodeRole;
 use crate::models::catalog;
 use crate::{
     affinity, api, autoupdate, benchmark, election, hardware, launch, mesh, models, nostr, plugin,
-    plugin_mcp, router, tunnel,
+    router, tunnel,
 };
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser};
@@ -792,7 +792,7 @@ pub(crate) async fn run_plugin_mcp(cli: &Cli) -> Result<()> {
         tracing::warn!("No plugins are enabled for MCP exposure");
     }
 
-    plugin_mcp::run_mcp_server(plugin_manager).await
+    plugin::mcp::run_mcp_server(plugin_manager).await
 }
 
 pub(crate) use self::discovery::{check_mesh, nostr_relays};

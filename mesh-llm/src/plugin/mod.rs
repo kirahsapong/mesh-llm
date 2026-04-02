@@ -1,4 +1,5 @@
 mod config;
+pub(crate) mod mcp;
 mod runtime;
 mod support;
 mod transport;

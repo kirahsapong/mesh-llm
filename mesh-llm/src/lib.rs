@@ -6,7 +6,6 @@ mod mesh;
 mod models;
 mod network;
 mod plugin;
-mod plugin_mcp;
 mod plugins;
 mod protocol;
 mod rewrite;
