@@ -616,7 +616,12 @@ fn spawn_moe_analyze_log_relay<R: std::io::Read + Send + 'static>(
                     }
                 }
                 if should_emit {
-                    render_moe_analysis_progress(&model_name, "full-analyze", current, Some(total));
+                    render_moe_analysis_progress(
+                        &model_name,
+                        "full-analyze",
+                        current.saturating_sub(1),
+                        Some(total),
+                    );
                 }
                 continue;
             }
@@ -689,12 +694,8 @@ fn ensure_full_analyze_ranking(
     if let Some(handle) = stderr_relay {
         let _ = handle.join();
     }
-    if progress
-        .lock()
-        .ok()
-        .and_then(|state| state.total_prompts)
-        .is_some()
-    {
+    if let Some(total) = progress.lock().ok().and_then(|state| state.total_prompts) {
+        render_moe_analysis_progress(model_name, "full-analyze", total, Some(total));
         finish_moe_analysis_progress();
     }
     anyhow::ensure!(status.success(), "llama-moe-analyze exited with {status}");
@@ -807,7 +808,6 @@ fn run_micro_analyze_ranking(
 
     for (idx, prompt) in prompts.iter().take(prompt_count).enumerate() {
         let output_path = tmp_dir.join(format!("prompt-{idx}.csv"));
-        render_moe_analysis_progress(model_name, "micro-analyze", idx + 1, Some(prompt_count));
         let mut command = Command::new(&analyze_bin);
         command.args([
             "-m",
@@ -853,6 +853,7 @@ fn run_micro_analyze_ranking(
         for row in load_analyze_mass_rows(&output_path)? {
             *mass_by_expert.entry(row.expert_id).or_insert(0.0) += row.gate_mass;
         }
+        render_moe_analysis_progress(model_name, "micro-analyze", idx + 1, Some(prompt_count));
     }
     finish_moe_analysis_progress();
 
