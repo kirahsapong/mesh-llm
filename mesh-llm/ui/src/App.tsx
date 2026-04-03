@@ -4889,6 +4889,7 @@ function NodeSidebar({
                 <StatusPill
                   label={node.role}
                   tone={nodeRoleTone(node.role)}
+                  tooltip={nodeRoleTooltip(node.role)}
                 />
                 <StatusPill
                   label={node.statusLabel}
@@ -4923,21 +4924,25 @@ function NodeSidebar({
             title="Latency"
             value={node.latencyLabel}
             icon={<Wifi className="h-4 w-4" />}
+            tooltip={nodeLatencyTooltip(node.self)}
           />
           <ModelFactCard
             title="Node VRAM"
             value={`${node.vramGb.toFixed(1)} GB`}
             icon={<MemoryStick className="h-4 w-4" />}
+            tooltip={nodeVramTooltip(node.role)}
           />
           <ModelFactCard
             title="Mesh Share"
             value={node.vramSharePct > 0 ? `${node.vramSharePct}%` : "n/a"}
             icon={<Gauge className="h-4 w-4" />}
+            tooltip={nodeMeshShareTooltip(node.role)}
           />
           <ModelFactCard
             title="Hot Models"
             value={`${modelRows.length}`}
             icon={<Sparkles className="h-4 w-4" />}
+            tooltip={nodeHotModelsTooltip()}
           />
         </div>
 
@@ -4986,6 +4991,7 @@ function NodeSidebar({
                                 key={flag}
                                 label={flag}
                                 tone={flag === "Serving" ? "good" : flag === "Requested" ? "warn" : "info"}
+                                tooltip={nodeModelFlagTooltip(flag)}
                               />
                             ))}
                           </div>
@@ -5008,6 +5014,7 @@ function NodeSidebar({
                                   : "neutral"
                             }
                             dot={row.meshStatus === "warm" || row.meshStatus === "cold"}
+                            tooltip={modelStatusTooltip(row.meshStatus)}
                           />
                         </TableCell>
                       </TableRow>
@@ -5676,6 +5683,57 @@ function modelStatusTooltip(status?: string) {
     return 'Downloaded locally, but not currently serving.';
   }
   return 'Current model availability in the mesh.';
+}
+
+function nodeRoleTooltip(role: string) {
+  if (role === 'Host') {
+    return 'Coordinates requests and mesh routing for this node.';
+  }
+  if (role === 'Worker') {
+    return 'Contributes VRAM and compute capacity to the mesh.';
+  }
+  if (role === 'Client') {
+    return 'Sends requests, but does not contribute VRAM.';
+  }
+  return 'Connected to the mesh, but not actively serving a model.';
+}
+
+function nodeLatencyTooltip(self: boolean) {
+  if (self) {
+    return 'This is the local node.';
+  }
+  return 'Observed round-trip latency from this node to the selected peer.';
+}
+
+function nodeVramTooltip(role: string) {
+  if (role === 'Client') {
+    return 'Clients do not contribute serving VRAM to the mesh.';
+  }
+  return 'Total GPU memory reported by this node.';
+}
+
+function nodeMeshShareTooltip(role: string) {
+  if (role === 'Client') {
+    return 'Clients do not contribute serving VRAM, so they have no mesh share.';
+  }
+  return 'Approximate share of total serving VRAM contributed by this node.';
+}
+
+function nodeHotModelsTooltip() {
+  return 'Distinct models this node is hosting, serving, or requesting right now.';
+}
+
+function nodeModelFlagTooltip(flag: string) {
+  if (flag === 'Serving') {
+    return 'This node is actively serving requests for this model.';
+  }
+  if (flag === 'Hosted') {
+    return 'This node has the model available locally for routing.';
+  }
+  if (flag === 'Requested') {
+    return 'This model has been requested on this node, but is not active yet.';
+  }
+  return 'Current model role on this node.';
 }
 
 function fitLabelTooltip(label?: string) {
