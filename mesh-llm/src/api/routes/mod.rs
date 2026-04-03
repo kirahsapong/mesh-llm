@@ -59,11 +59,13 @@ pub(super) async fn dispatch_request(
             objects::handle(stream, state, method, path_only, body).await?;
             Ok(true)
         }
-        (m, p) if m != "POST" && p.starts_with("/api/chat") => {
+        (m, p)
+            if m != "POST" && (p.starts_with("/api/chat") || p.starts_with("/api/responses")) =>
+        {
             chat::handle(stream, state, method, path_only, req).await?;
             Ok(true)
         }
-        ("POST", p) if p.starts_with("/api/chat") => {
+        ("POST", p) if p.starts_with("/api/chat") || p.starts_with("/api/responses") => {
             chat::handle(stream, state, method, path_only, req).await?;
             Ok(true)
         }

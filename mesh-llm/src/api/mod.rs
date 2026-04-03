@@ -8,7 +8,8 @@
 //!   DELETE /api/runtime/models/{model} — unload a local model
 //!   GET  /api/events    — SSE stream of status updates
 //!   GET  /api/discover  — browse Nostr-published meshes
-//!   POST /api/chat      — proxy to inference API
+//!   POST /api/chat      — proxy to chat completions API
+//!   POST /api/responses — proxy to responses API
 //!   POST /api/objects   — upload a request-scoped media object
 //!   GET  /              — embedded web dashboard
 //!
@@ -1305,6 +1306,48 @@ mod tests {
         (port, request_rx, handle)
     }
 
+    async fn spawn_streaming_upstream(
+        content_type: &str,
+        chunks: Vec<(Duration, Vec<u8>)>,
+    ) -> (u16, oneshot::Receiver<Vec<u8>>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let content_type = content_type.to_string();
+        let (request_tx, request_rx) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = proxy::read_http_request(&mut stream).await.unwrap();
+            let _ = request_tx.send(request.raw);
+
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+            );
+            if stream.write_all(header.as_bytes()).await.is_err() {
+                return;
+            }
+
+            for (delay, chunk) in chunks {
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                let chunk_header = format!("{:x}\r\n", chunk.len());
+                if stream.write_all(chunk_header.as_bytes()).await.is_err() {
+                    return;
+                }
+                if stream.write_all(&chunk).await.is_err() {
+                    return;
+                }
+                if stream.write_all(b"\r\n").await.is_err() {
+                    return;
+                }
+            }
+
+            let _ = stream.write_all(b"0\r\n\r\n").await;
+            let _ = stream.shutdown().await;
+        });
+        (port, request_rx, handle)
+    }
+
     fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
         haystack
             .windows(needle.len())
@@ -1490,6 +1533,103 @@ mod tests {
         assert!(raw.contains(r#""data":"UklGRg==""#));
         assert!(raw.contains(r#""format":"wav""#));
         assert!(raw.contains(r#""mime_type":"audio/wav""#));
+
+        handle.abort();
+        let _ = upstream_handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_api_responses_smoke_for_image_request() {
+        let (upstream_port, upstream_rx, upstream_handle) =
+            spawn_capturing_upstream(r#"{"id":"chatcmpl","object":"chat.completion","created":1,"model":"test-model","choices":[{"message":{"role":"assistant","content":"ok"}}]}"#).await;
+        let state = build_test_mesh_api_with_api_port(upstream_port).await;
+        state.update(true, true).await;
+        let (addr, handle) = spawn_management_test_server(state).await;
+
+        let body = serde_json::json!({
+            "model": "test-model",
+            "input": [{
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "describe this image"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,aGVsbG8="}
+                ]
+            }],
+            "stream": false
+        })
+        .to_string();
+        let request = format!(
+            "POST /api/responses HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream.write_all(request.as_bytes()).await.unwrap();
+        stream.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let response_text = String::from_utf8(response).unwrap();
+        let raw = String::from_utf8(upstream_rx.await.unwrap()).unwrap();
+
+        assert!(response_text.starts_with("HTTP/1.1 200 OK"));
+        assert!(raw.starts_with("POST /v1/chat/completions HTTP/1.1"));
+        assert!(raw.contains(r#""type":"image_url""#));
+        assert!(raw.contains("data:image/png;base64,aGVsbG8="));
+
+        handle.abort();
+        let _ = upstream_handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_api_responses_stream_smoke() {
+        let (upstream_port, upstream_rx, upstream_handle) = spawn_streaming_upstream(
+            "text/event-stream",
+            vec![(
+                Duration::ZERO,
+                br#"event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"hello"}
+
+event: done
+data: [DONE]
+
+"#
+                .to_vec(),
+            )],
+        )
+        .await;
+        let state = build_test_mesh_api_with_api_port(upstream_port).await;
+        state.update(true, true).await;
+        let (addr, handle) = spawn_management_test_server(state).await;
+
+        let body = serde_json::json!({
+            "model": "test-model",
+            "input": "say hello",
+            "stream": true
+        })
+        .to_string();
+        let request = format!(
+            "POST /api/responses HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream.write_all(request.as_bytes()).await.unwrap();
+        stream.shutdown().await.unwrap();
+        let response = read_until_contains(
+            &mut stream,
+            br#"event: response.output_text.delta"#,
+            Duration::from_secs(2),
+        )
+        .await;
+        let response_text = String::from_utf8(response).unwrap();
+        let raw = String::from_utf8(upstream_rx.await.unwrap()).unwrap();
+
+        assert!(response_text.starts_with("HTTP/1.1 200 OK"));
+        assert!(response_text.contains("event: response.output_text.delta"));
+        assert!(raw.starts_with("POST /v1/chat/completions HTTP/1.1"));
+        assert!(raw.contains(r#""stream":true"#));
 
         handle.abort();
         let _ = upstream_handle.await;

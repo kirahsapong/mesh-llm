@@ -63,6 +63,7 @@ pub struct BufferedHttpRequest {
 pub enum ResponseAdapter {
     None,
     OpenAiResponsesJson,
+    OpenAiResponsesStream,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -465,16 +466,17 @@ fn normalize_openai_compat_request(
     let mut response_adapter = ResponseAdapter::None;
 
     if path_only(path) == "/v1/responses" {
-        if object
+        let is_stream = object
             .get("stream")
             .and_then(|value| value.as_bool())
-            .unwrap_or(false)
-        {
-            bail!("streaming /v1/responses is not supported yet");
-        }
+            .unwrap_or(false);
         changed |= translate_openai_responses_input(object)?;
         rewritten_path = Some(rewrite_path_preserving_query(path, "/v1/chat/completions"));
-        response_adapter = ResponseAdapter::OpenAiResponsesJson;
+        response_adapter = if is_stream {
+            ResponseAdapter::OpenAiResponsesStream
+        } else {
+            ResponseAdapter::OpenAiResponsesJson
+        };
     }
 
     Ok(RequestNormalization {
@@ -566,11 +568,25 @@ fn translate_responses_content_item(item: &serde_json::Value) -> Result<serde_js
             Ok(serde_json::json!({"type": "input_audio", "input_audio": container}))
         }
         "input_file" | "file" => {
-            let container = object_or_url_container(
+            let mut container = object_or_url_container(
                 object.get("input_file").or_else(|| object.get("file")),
                 object.get("url").and_then(|value| value.as_str()),
             )
             .ok_or_else(|| anyhow!("responses input_file block is missing input_file/file/url"))?;
+            for key in [
+                "mime_type",
+                "file_name",
+                "filename",
+                "mesh_token",
+                "blob_token",
+                "token",
+            ] {
+                if let Some(value) = object.get(key) {
+                    container
+                        .entry(key.to_string())
+                        .or_insert_with(|| value.clone());
+                }
+            }
             Ok(serde_json::json!({"type": "input_file", "input_file": container}))
         }
         other => bail!("unsupported /v1/responses content block type '{other}'"),
@@ -1165,6 +1181,230 @@ fn translate_chat_completion_to_responses(body: &[u8]) -> Result<Vec<u8>> {
     serde_json::to_vec(&response).context("serialize translated /v1/responses body")
 }
 
+fn sse_frame(event: Option<&str>, data: &str) -> Vec<u8> {
+    let mut frame = Vec::new();
+    if let Some(event_name) = event {
+        frame.extend_from_slice(format!("event: {event_name}\n").as_bytes());
+    }
+    for line in data.lines() {
+        frame.extend_from_slice(b"data: ");
+        frame.extend_from_slice(line.as_bytes());
+        frame.extend_from_slice(b"\n");
+    }
+    if data.is_empty() {
+        frame.extend_from_slice(b"data: \n");
+    }
+    frame.extend_from_slice(b"\n");
+    frame
+}
+
+async fn write_chunked_bytes(stream: &mut TcpStream, bytes: &[u8]) -> std::io::Result<()> {
+    let header = format!("{:x}\r\n", bytes.len());
+    stream.write_all(header.as_bytes()).await?;
+    stream.write_all(bytes).await?;
+    stream.write_all(b"\r\n").await
+}
+
+async fn write_chunked_sse_event(
+    stream: &mut TcpStream,
+    event: Option<&str>,
+    data: &str,
+) -> std::io::Result<()> {
+    let frame = sse_frame(event, data);
+    write_chunked_bytes(stream, &frame).await
+}
+
+fn responses_stream_created_event(model: &str, created_at: i64) -> serde_json::Value {
+    serde_json::json!({
+        "type": "response.created",
+        "response": {
+            "id": format!("resp_{created_at}"),
+            "object": "response",
+            "created_at": created_at,
+            "status": "in_progress",
+            "model": model,
+            "output": [],
+        }
+    })
+}
+
+fn responses_stream_delta_event(item_id: &str, delta: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "response.output_text.delta",
+        "item_id": item_id,
+        "output_index": 0,
+        "content_index": 0,
+        "delta": delta,
+    })
+}
+
+fn responses_stream_text_done_event(item_id: &str, text: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "response.output_text.done",
+        "item_id": item_id,
+        "output_index": 0,
+        "content_index": 0,
+        "text": text,
+    })
+}
+
+fn responses_stream_completed_event(
+    response_id: &str,
+    created_at: i64,
+    model: &str,
+    item_id: &str,
+    text: &str,
+    usage: Option<serde_json::Value>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "response.completed",
+        "response": {
+            "id": response_id,
+            "object": "response",
+            "created_at": created_at,
+            "status": "completed",
+            "error": serde_json::Value::Null,
+            "incomplete_details": serde_json::Value::Null,
+            "model": model,
+            "output": [{
+                "id": item_id,
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": text,
+                    "annotations": [],
+                }],
+            }],
+            "output_text": text,
+            "usage": usage.unwrap_or(serde_json::Value::Null),
+        }
+    })
+}
+
+fn upstream_usage_to_responses_usage(chunk: &serde_json::Value) -> Option<serde_json::Value> {
+    let usage = chunk.get("usage")?;
+    Some(serde_json::json!({
+        "input_tokens": usage.get("prompt_tokens").cloned().unwrap_or(serde_json::Value::Null),
+        "output_tokens": usage.get("completion_tokens").cloned().unwrap_or(serde_json::Value::Null),
+        "total_tokens": usage.get("total_tokens").cloned().unwrap_or(serde_json::Value::Null),
+    }))
+}
+
+async fn relay_translated_responses_stream<R: AsyncRead + Unpin>(
+    tcp_stream: &mut TcpStream,
+    reader: &mut R,
+    probe: ResponseProbe,
+    retry_context_overflow: bool,
+) -> Result<RouteAttemptResult> {
+    if retry_context_overflow && probe.retryable_context_overflow {
+        return Ok(RouteAttemptResult::RetryableContextOverflow);
+    }
+
+    if !(200..300).contains(&probe.status_code) {
+        tcp_stream.write_all(&probe.buffered).await?;
+        let _ = tcp_stream.shutdown().await;
+        return Ok(RouteAttemptResult::Delivered {
+            status_code: probe.status_code,
+        });
+    }
+
+    let parsed = try_parse_response_headers(&probe.buffered)?
+        .ok_or_else(|| anyhow!("incomplete HTTP response"))?;
+    let mut carry = String::from_utf8_lossy(&probe.buffered[parsed.header_end..]).to_string();
+    let created_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
+    let response_id = format!("resp_{created_at}");
+    let item_id = format!("msg_{created_at}");
+    let mut model = String::from("unknown");
+    let mut output_text = String::new();
+    let mut usage = None;
+    let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
+    tcp_stream.write_all(header.as_bytes()).await?;
+
+    let created = serde_json::to_string(&responses_stream_created_event(&model, created_at))
+        .context("serialize response.created stream event")?;
+    write_chunked_sse_event(tcp_stream, Some("response.created"), &created).await?;
+
+    let mut done_seen = false;
+    loop {
+        while let Some(frame_end) = carry.find("\n\n") {
+            let frame = carry[..frame_end].to_string();
+            carry = carry[frame_end + 2..].to_string();
+            let data_lines = frame
+                .lines()
+                .filter_map(|line| line.strip_prefix("data:"))
+                .map(str::trim_start)
+                .collect::<Vec<_>>();
+            if data_lines.is_empty() {
+                continue;
+            }
+            let data = data_lines.join("\n");
+            if data == "[DONE]" {
+                done_seen = true;
+                break;
+            }
+            let chunk: serde_json::Value =
+                serde_json::from_str(&data).context("parse upstream chat stream chunk")?;
+            if let Some(chunk_model) = chunk.get("model").and_then(|value| value.as_str()) {
+                model = chunk_model.to_string();
+            }
+            if let Some(delta) = chunk
+                .get("choices")
+                .and_then(|value| value.as_array())
+                .and_then(|choices| choices.first())
+                .and_then(|choice| choice.get("delta"))
+                .and_then(|delta| delta.get("content"))
+                .and_then(|value| value.as_str())
+            {
+                output_text.push_str(delta);
+                let event = serde_json::to_string(&responses_stream_delta_event(&item_id, delta))
+                    .context("serialize response.output_text.delta event")?;
+                write_chunked_sse_event(tcp_stream, Some("response.output_text.delta"), &event)
+                    .await?;
+            }
+            if usage.is_none() {
+                usage = upstream_usage_to_responses_usage(&chunk);
+            }
+        }
+
+        if done_seen {
+            break;
+        }
+
+        let mut chunk = [0u8; 8192];
+        let n = reader.read(&mut chunk).await?;
+        if n == 0 {
+            break;
+        }
+        carry.push_str(&String::from_utf8_lossy(&chunk[..n]));
+    }
+
+    let text_done =
+        serde_json::to_string(&responses_stream_text_done_event(&item_id, &output_text))
+            .context("serialize response.output_text.done event")?;
+    write_chunked_sse_event(tcp_stream, Some("response.output_text.done"), &text_done).await?;
+    let completed = serde_json::to_string(&responses_stream_completed_event(
+        &response_id,
+        created_at,
+        &model,
+        &item_id,
+        &output_text,
+        usage,
+    ))
+    .context("serialize response.completed event")?;
+    write_chunked_sse_event(tcp_stream, Some("response.completed"), &completed).await?;
+    write_chunked_sse_event(tcp_stream, Some("done"), "[DONE]").await?;
+    let _ = tcp_stream.write_all(b"0\r\n\r\n").await;
+    let _ = tcp_stream.shutdown().await;
+    Ok(RouteAttemptResult::Delivered {
+        status_code: probe.status_code,
+    })
+}
+
 async fn relay_translated_responses_json<R: AsyncRead + Unpin>(
     tcp_stream: &mut TcpStream,
     reader: &mut R,
@@ -1319,6 +1559,15 @@ async fn relay_probed_response<R: AsyncRead + Unpin>(
     if response_adapter == ResponseAdapter::OpenAiResponsesJson {
         return relay_translated_responses_json(tcp_stream, reader, probe, retry_context_overflow)
             .await;
+    }
+    if response_adapter == ResponseAdapter::OpenAiResponsesStream {
+        return relay_translated_responses_stream(
+            tcp_stream,
+            reader,
+            probe,
+            retry_context_overflow,
+        )
+        .await;
     }
 
     if retry_context_overflow && probe.retryable_context_overflow {
@@ -2229,16 +2478,22 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_openai_compat_request_rejects_streaming_responses() {
+    fn test_normalize_openai_compat_request_marks_streaming_responses_adapter() {
         let mut body = serde_json::json!({
             "model": "test",
             "stream": true,
             "input": "hello",
         });
-        let err = normalize_openai_compat_request("/v1/responses", &mut body).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("streaming /v1/responses is not supported yet"));
+        let normalization = normalize_openai_compat_request("/v1/responses", &mut body).unwrap();
+        assert_eq!(
+            normalization.response_adapter,
+            ResponseAdapter::OpenAiResponsesStream
+        );
+        assert_eq!(
+            normalization.rewritten_path.as_deref(),
+            Some("/v1/chat/completions")
+        );
+        assert_eq!(body["messages"][0]["content"], "hello");
     }
 
     #[test]
