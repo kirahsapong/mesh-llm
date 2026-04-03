@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use tokio::sync::{watch, Mutex};
 
+use crate::inference::moe;
 use crate::protocol::*;
 
 /// Demand signal for a model — tracks interest via API requests and --model declarations.
@@ -360,7 +361,26 @@ fn descriptor_from_identity(
     identity.model_name = model_name.to_string();
     let path = crate::models::find_model_path(model_name);
     let catalog = crate::models::find_catalog_model_exact(model_name);
-    let topology = crate::models::infer_local_model_topology(&path, catalog);
+    let mut topology = crate::models::infer_local_model_topology(&path, catalog);
+    if topology.is_none() {
+        if let Some(info) = moe::detect_moe(&path) {
+            topology = Some(crate::models::ModelTopology {
+                moe: Some(crate::models::ModelMoeInfo {
+                    expert_count: info.expert_count,
+                    used_expert_count: info.expert_used_count,
+                    min_experts_per_node: None,
+                    source: Some("gguf_header".to_string()),
+                    ranking_source: None,
+                    ranking_origin: None,
+                    ranking: Vec::new(),
+                    ranking_prompt_count: None,
+                    ranking_tokens: None,
+                    ranking_layer_scope: None,
+                }),
+            });
+        }
+    }
+    enrich_topology_with_local_shared_ranking(path.as_path(), &mut topology);
     let mut capabilities =
         crate::models::capabilities::infer_local_model_capabilities(model_name, &path, catalog);
     capabilities.moe = capabilities.moe
@@ -373,6 +393,121 @@ fn descriptor_from_identity(
         capabilities,
         topology,
     }
+}
+
+fn enrich_topology_with_local_shared_ranking(
+    path: &std::path::Path,
+    topology: &mut Option<crate::models::ModelTopology>,
+) {
+    let Some(moe_info) = topology.as_mut().and_then(|value| value.moe.as_mut()) else {
+        return;
+    };
+    let Some(artifact) = moe::best_shared_ranking_artifact(path) else {
+        return;
+    };
+    moe_info.ranking_source = Some(artifact.kind.label().to_string());
+    moe_info.ranking_origin = Some(artifact.origin.label().to_string());
+    moe_info.ranking = artifact.ranking;
+    moe_info.ranking_prompt_count = artifact.micro_prompt_count.map(|value| value as u32);
+    moe_info.ranking_tokens = artifact.micro_tokens;
+    moe_info.ranking_layer_scope = artifact.micro_layer_scope.map(|scope| match scope {
+        moe::MoeMicroLayerScope::All => "all".to_string(),
+        moe::MoeMicroLayerScope::First => "first".to_string(),
+    });
+}
+
+fn identities_match_exact(local: &ServedModelIdentity, remote: &ServedModelIdentity) -> bool {
+    if let (Some(local_hash), Some(remote_hash)) =
+        (local.identity_hash.as_ref(), remote.identity_hash.as_ref())
+    {
+        return local_hash == remote_hash;
+    }
+    if let (Some(local_ref), Some(remote_ref)) =
+        (local.canonical_ref.as_ref(), remote.canonical_ref.as_ref())
+    {
+        return local_ref == remote_ref;
+    }
+    matches!(
+        (
+            local.repository.as_ref(),
+            local.revision.as_ref(),
+            local.artifact.as_ref(),
+            remote.repository.as_ref(),
+            remote.revision.as_ref(),
+            remote.artifact.as_ref(),
+        ),
+        (
+            Some(local_repo),
+            Some(local_revision),
+            Some(local_artifact),
+            Some(remote_repo),
+            Some(remote_revision),
+            Some(remote_artifact),
+        ) if local_repo == remote_repo
+            && local_revision == remote_revision
+            && local_artifact == remote_artifact
+    )
+}
+
+fn shared_ranking_from_descriptor(
+    descriptor: &ServedModelDescriptor,
+) -> Option<moe::SharedRankingArtifact> {
+    let moe_info = descriptor.topology.as_ref()?.moe.as_ref()?;
+    if moe_info.ranking.is_empty() {
+        return None;
+    }
+    let kind = match moe_info.ranking_source.as_deref()? {
+        "analyze" => moe::SharedRankingKind::Analyze,
+        "micro-analyze" => moe::SharedRankingKind::MicroAnalyze,
+        _ => return None,
+    };
+    let micro_layer_scope = match moe_info.ranking_layer_scope.as_deref() {
+        Some("all") => Some(moe::MoeMicroLayerScope::All),
+        Some("first") => Some(moe::MoeMicroLayerScope::First),
+        _ => None,
+    };
+    Some(moe::SharedRankingArtifact {
+        kind,
+        origin: moe_info
+            .ranking_origin
+            .as_deref()
+            .and_then(moe::SharedRankingOrigin::from_label)
+            .unwrap_or(moe::SharedRankingOrigin::LegacyCache),
+        ranking: moe_info.ranking.clone(),
+        micro_prompt_count: moe_info.ranking_prompt_count.map(|value| value as usize),
+        micro_tokens: moe_info.ranking_tokens,
+        micro_layer_scope,
+    })
+}
+
+fn import_remote_moe_rankings(descriptors: &[ServedModelDescriptor]) -> bool {
+    let mut imported = false;
+    for descriptor in descriptors {
+        let Some(remote_artifact) = shared_ranking_from_descriptor(descriptor) else {
+            continue;
+        };
+        let path = crate::models::find_model_path(&descriptor.identity.model_name);
+        if !path.exists() {
+            continue;
+        }
+        let Some(local_identity) = identity_from_model_path(&descriptor.identity.model_name, &path)
+        else {
+            continue;
+        };
+        if !identities_match_exact(&local_identity, &descriptor.identity) {
+            continue;
+        }
+        let imported_artifact = moe::SharedRankingArtifact {
+            origin: moe::SharedRankingOrigin::PeerImport,
+            ..remote_artifact
+        };
+        if moe::cache_shared_ranking_if_stronger(path.as_path(), &imported_artifact)
+            .unwrap_or(false)
+        {
+            imported = true;
+        }
+    }
+    imported
 }
 
 fn parse_hf_ref_parts(input: &str) -> Option<(String, Option<String>, String)> {
@@ -3808,6 +3943,7 @@ impl Node {
     }
 
     async fn add_peer(&self, id: EndpointId, addr: EndpointAddr, ann: &PeerAnnouncement) {
+        let imported_ranking = import_remote_moe_rankings(&ann.served_model_descriptors);
         let mut state = self.state.lock().await;
         if id == self.endpoint.id() {
             return;
@@ -3893,6 +4029,9 @@ impl Node {
                     .await;
                 }
             }
+            if imported_ranking {
+                self.refresh_served_model_descriptors().await;
+            }
             return;
         }
         tracing::info!(
@@ -3915,6 +4054,9 @@ impl Node {
             String::new(),
         )
         .await;
+        if imported_ranking {
+            self.refresh_served_model_descriptors().await;
+        }
     }
 
     /// Update a peer learned transitively through gossip (not directly connected).
@@ -3928,6 +4070,7 @@ impl Node {
         addr: &EndpointAddr,
         ann: &PeerAnnouncement,
     ) {
+        let imported_ranking = import_remote_moe_rankings(&ann.served_model_descriptors);
         let mut state = self.state.lock().await;
         if id == self.endpoint.id() {
             return;
@@ -3963,6 +4106,9 @@ impl Node {
                     .await;
                 }
             }
+            if imported_ranking {
+                self.refresh_served_model_descriptors().await;
+            }
         } else {
             // New transitive peer — add with last_seen = now but no peer_change event.
             // It will get pruned after PEER_STALE_SECS*2 if never directly contacted.
@@ -3975,6 +4121,9 @@ impl Node {
                 String::new(),
             )
             .await;
+            if imported_ranking {
+                self.refresh_served_model_descriptors().await;
+            }
         }
     }
 

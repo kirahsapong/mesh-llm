@@ -7,6 +7,7 @@
 //! No cross-node traffic during inference — each node runs independently.
 
 use clap::ValueEnum;
+use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -38,6 +39,60 @@ pub enum MoeMicroLayerScope {
     First,
     #[default]
     All,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SharedRankingKind {
+    Analyze,
+    MicroAnalyze,
+}
+
+impl SharedRankingKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Analyze => "analyze",
+            Self::MicroAnalyze => "micro-analyze",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SharedRankingOrigin {
+    LocalFullAnalyze,
+    LocalMicroAnalyze,
+    PeerImport,
+    LegacyCache,
+}
+
+impl SharedRankingOrigin {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::LocalFullAnalyze => "local-full-analyze",
+            Self::LocalMicroAnalyze => "local-micro-analyze",
+            Self::PeerImport => "peer-import",
+            Self::LegacyCache => "legacy-cache",
+        }
+    }
+
+    pub fn from_label(value: &str) -> Option<Self> {
+        match value {
+            "local-full-analyze" => Some(Self::LocalFullAnalyze),
+            "local-micro-analyze" => Some(Self::LocalMicroAnalyze),
+            "peer-import" => Some(Self::PeerImport),
+            "legacy-cache" => Some(Self::LegacyCache),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SharedRankingArtifact {
+    pub kind: SharedRankingKind,
+    pub origin: SharedRankingOrigin,
+    pub ranking: Vec<u32>,
+    pub micro_prompt_count: Option<usize>,
+    pub micro_tokens: Option<u32>,
+    pub micro_layer_scope: Option<MoeMicroLayerScope>,
 }
 
 #[derive(Clone, Debug)]
@@ -440,31 +495,189 @@ fn split_cache_root() -> PathBuf {
     mesh_cache_dir().join("splits")
 }
 
-/// Path to cached ranking CSV for a model.
-/// Stored in a sibling `moe-rankings/` directory next to the source model file.
-pub fn ranking_cache_path(model_path: &Path) -> PathBuf {
-    let stem = model_path.file_stem().unwrap_or_default().to_string_lossy();
-    let dir = model_path.parent().unwrap_or(Path::new("."));
-    dir.join("moe-rankings").join(format!("{stem}.csv"))
+fn ranking_cache_root() -> PathBuf {
+    mesh_cache_dir().join("moe-rankings")
 }
 
-/// Load a cached ranking CSV. Format: one expert_id per line, sorted by gate mass descending.
-/// Also supports the full CSV format from moe-analyze: expert_id,total_mass,mass_fraction,selection_count
-pub fn load_cached_ranking(path: &Path) -> Option<Vec<u32>> {
+fn ranking_strength_key(artifact: &SharedRankingArtifact) -> (u8, u8, usize, u32) {
+    match artifact.kind {
+        SharedRankingKind::Analyze => (2, 0, 0, 0),
+        SharedRankingKind::MicroAnalyze => (
+            1,
+            match artifact
+                .micro_layer_scope
+                .unwrap_or(MoeMicroLayerScope::First)
+            {
+                MoeMicroLayerScope::All => 1,
+                MoeMicroLayerScope::First => 0,
+            },
+            artifact.micro_prompt_count.unwrap_or(0),
+            artifact.micro_tokens.unwrap_or(0),
+        ),
+    }
+}
+
+fn better_shared_ranking(
+    candidate: &SharedRankingArtifact,
+    current: &SharedRankingArtifact,
+) -> bool {
+    ranking_strength_key(candidate) > ranking_strength_key(current)
+}
+
+fn sanitize_cache_component(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    out.trim_matches('_').to_string()
+}
+
+fn ranking_cache_stem(model_path: &Path) -> String {
+    if let Some(identity) = crate::models::huggingface_identity_for_path(model_path) {
+        let repo = identity.repo_id.replace('/', "--");
+        let revision = sanitize_cache_component(&identity.revision);
+        let file = sanitize_cache_component(&identity.local_file_name);
+        return format!("hf-{repo}-{revision}-{file}");
+    }
+
+    let metadata_key = std::fs::metadata(model_path)
+        .ok()
+        .and_then(|metadata| {
+            let modified = metadata.modified().ok()?;
+            let modified = modified
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_nanos();
+            Some(format!(
+                "{}:{}:{}",
+                model_path.to_string_lossy(),
+                metadata.len(),
+                modified
+            ))
+        })
+        .unwrap_or_else(|| model_path.to_string_lossy().to_string());
+    let digest = Sha256::digest(metadata_key.as_bytes());
+    let stem = model_path
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let stem = sanitize_cache_component(&stem);
+    format!("local-{stem}-{:x}", digest)
+}
+
+/// Path to cached ranking CSV for a model.
+/// Stored under the mesh-llm cache root so local sidecar data never pollutes the model directory.
+pub fn ranking_cache_path(model_path: &Path) -> PathBuf {
+    ranking_cache_root().join(format!("{}.csv", ranking_cache_stem(model_path)))
+}
+
+pub fn micro_ranking_cache_path(
+    model_path: &Path,
+    prompt_count: usize,
+    tokens: u32,
+    layer_scope: MoeMicroLayerScope,
+) -> PathBuf {
+    let stem = ranking_cache_stem(model_path);
+    let layer_suffix = match layer_scope {
+        MoeMicroLayerScope::First => "first",
+        MoeMicroLayerScope::All => "all",
+    };
+    ranking_cache_root().join(format!(
+        "{stem}.micro-p{prompt_count}-t{tokens}-{layer_suffix}.csv"
+    ))
+}
+
+#[derive(Default)]
+struct CachedRankingMetadata {
+    ranking_origin: Option<SharedRankingOrigin>,
+    micro_prompt_count: Option<usize>,
+    micro_tokens: Option<u32>,
+    micro_layer_scope: Option<MoeMicroLayerScope>,
+}
+
+struct CachedRankingFile {
+    ranking: Vec<u32>,
+    metadata: CachedRankingMetadata,
+}
+
+fn parse_cached_ranking_metadata(line: &str, metadata: &mut CachedRankingMetadata) {
+    let Some(rest) = line.strip_prefix('#') else {
+        return;
+    };
+    let rest = rest.trim();
+    let Some((key, value)) = rest.split_once('=') else {
+        return;
+    };
+    let value = value.trim();
+    match key.trim() {
+        "ranking_origin" => metadata.ranking_origin = SharedRankingOrigin::from_label(value),
+        "micro_prompt_count" => metadata.micro_prompt_count = value.parse().ok(),
+        "micro_tokens" => metadata.micro_tokens = value.parse().ok(),
+        "micro_layer_scope" => {
+            metadata.micro_layer_scope = match value {
+                "all" => Some(MoeMicroLayerScope::All),
+                "first" => Some(MoeMicroLayerScope::First),
+                _ => None,
+            }
+        }
+        _ => {}
+    }
+}
+
+fn load_cached_ranking_file(path: &Path) -> Option<CachedRankingFile> {
     let content = std::fs::read_to_string(path).ok()?;
+    let mut metadata = CachedRankingMetadata::default();
     let ranking: Vec<u32> = content
         .lines()
-        .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with("expert"))
-        .filter_map(|l| {
-            // Support both plain "42" and CSV "42,1234.5,0.03,500"
-            l.split(',').next()?.trim().parse().ok()
+        .filter_map(|line| {
+            if line.is_empty() {
+                return None;
+            }
+            if line.starts_with('#') {
+                parse_cached_ranking_metadata(line, &mut metadata);
+                return None;
+            }
+            if line.starts_with("expert") {
+                return None;
+            }
+            line.split(',').next()?.trim().parse().ok()
         })
         .collect();
     if ranking.is_empty() {
         None
     } else {
-        Some(ranking)
+        Some(CachedRankingFile { ranking, metadata })
     }
+}
+
+pub fn load_shared_ranking_artifact(
+    path: &Path,
+    kind: SharedRankingKind,
+    fallback_origin: SharedRankingOrigin,
+    micro_prompt_count: Option<usize>,
+    micro_tokens: Option<u32>,
+    micro_layer_scope: Option<MoeMicroLayerScope>,
+) -> Option<SharedRankingArtifact> {
+    let file = load_cached_ranking_file(path)?;
+    Some(SharedRankingArtifact {
+        kind,
+        origin: file.metadata.ranking_origin.unwrap_or(fallback_origin),
+        ranking: file.ranking,
+        micro_prompt_count: file.metadata.micro_prompt_count.or(micro_prompt_count),
+        micro_tokens: file.metadata.micro_tokens.or(micro_tokens),
+        micro_layer_scope: file.metadata.micro_layer_scope.or(micro_layer_scope),
+    })
+}
+
+/// Load a cached ranking CSV. Format: one expert_id per line, sorted by gate mass descending.
+/// Also supports the full CSV format from moe-analyze: expert_id,total_mass,mass_fraction,selection_count
+pub fn load_cached_ranking(path: &Path) -> Option<Vec<u32>> {
+    load_cached_ranking_file(path).map(|file| file.ranking)
 }
 
 pub fn write_cached_ranking(path: &Path, ranking: &[u32]) -> anyhow::Result<()> {
@@ -485,8 +698,43 @@ pub fn write_cached_ranking(path: &Path, ranking: &[u32]) -> anyhow::Result<()> 
     Ok(())
 }
 
+fn write_shared_ranking_artifact(
+    path: &Path,
+    artifact: &SharedRankingArtifact,
+) -> anyhow::Result<()> {
+    if artifact.ranking.is_empty() {
+        anyhow::bail!("cannot write empty ranking to {}", path.display());
+    }
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let mut lines = vec![
+        "# mesh-llm-moe-ranking=v1".to_string(),
+        format!("# ranking_kind={}", artifact.kind.label()),
+        format!("# ranking_origin={}", artifact.origin.label()),
+    ];
+    if let Some(prompt_count) = artifact.micro_prompt_count {
+        lines.push(format!("# micro_prompt_count={prompt_count}"));
+    }
+    if let Some(tokens) = artifact.micro_tokens {
+        lines.push(format!("# micro_tokens={tokens}"));
+    }
+    if let Some(layer_scope) = artifact.micro_layer_scope {
+        let scope = match layer_scope {
+            MoeMicroLayerScope::First => "first",
+            MoeMicroLayerScope::All => "all",
+        };
+        lines.push(format!("# micro_layer_scope={scope}"));
+    }
+    lines.extend(artifact.ranking.iter().map(u32::to_string));
+    std::fs::write(path, format!("{}\n", lines.join("\n")))?;
+    Ok(())
+}
+
 /// Path to cached heuristic ranking CSV for a model.
-/// Stored next to the model-local ranking cache but with a distinct suffix.
+/// Stored under the mesh-llm cache root with a distinct suffix per heuristic.
 pub fn heuristic_ranking_cache_path(model_path: &Path) -> PathBuf {
     heuristic_ranking_cache_path_for_method(model_path, HeuristicScoreMethod::MeanL2)
 }
@@ -495,10 +743,158 @@ pub fn heuristic_ranking_cache_path_for_method(
     model_path: &Path,
     method: HeuristicScoreMethod,
 ) -> PathBuf {
-    let stem = model_path.file_stem().unwrap_or_default().to_string_lossy();
-    let dir = model_path.parent().unwrap_or(Path::new("."));
-    dir.join("moe-rankings")
-        .join(format!("{stem}.{}.csv", method.cache_suffix()))
+    let stem = ranking_cache_stem(model_path);
+    ranking_cache_root().join(format!("{stem}.{}.csv", method.cache_suffix()))
+}
+
+fn parse_micro_cache_filename(
+    model_path: &Path,
+    file_name: &str,
+) -> Option<(usize, u32, MoeMicroLayerScope)> {
+    let stem = ranking_cache_stem(model_path);
+    let prefix = format!("{stem}.micro-p");
+    let rest = file_name.strip_prefix(&prefix)?.strip_suffix(".csv")?;
+    let (prompt_count, rest) = rest.split_once("-t")?;
+    let (tokens, layer_scope) = rest.split_once('-')?;
+    let layer_scope = match layer_scope {
+        "all" => MoeMicroLayerScope::All,
+        "first" => MoeMicroLayerScope::First,
+        _ => return None,
+    };
+    Some((
+        prompt_count.parse().ok()?,
+        tokens.parse().ok()?,
+        layer_scope,
+    ))
+}
+
+pub fn best_shared_ranking_artifact(model_path: &Path) -> Option<SharedRankingArtifact> {
+    if let Some(artifact) = load_shared_ranking_artifact(
+        &ranking_cache_path(model_path),
+        SharedRankingKind::Analyze,
+        SharedRankingOrigin::LegacyCache,
+        None,
+        None,
+        None,
+    ) {
+        return Some(artifact);
+    }
+
+    let mut best: Option<SharedRankingArtifact> = None;
+    let root = ranking_cache_root();
+    let entries = std::fs::read_dir(root).ok()?;
+    for entry in entries.flatten() {
+        let file_name = match entry.file_name().into_string() {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let Some((prompt_count, tokens, layer_scope)) =
+            parse_micro_cache_filename(model_path, &file_name)
+        else {
+            continue;
+        };
+        let path = entry.path();
+        let Some(candidate) = load_shared_ranking_artifact(
+            &path,
+            SharedRankingKind::MicroAnalyze,
+            SharedRankingOrigin::LegacyCache,
+            Some(prompt_count),
+            Some(tokens),
+            Some(layer_scope),
+        ) else {
+            continue;
+        };
+        if best
+            .as_ref()
+            .map(|current| better_shared_ranking(&candidate, current))
+            .unwrap_or(true)
+        {
+            best = Some(candidate);
+        }
+    }
+    best
+}
+
+pub fn cache_shared_ranking_if_stronger(
+    model_path: &Path,
+    artifact: &SharedRankingArtifact,
+) -> anyhow::Result<bool> {
+    validate_shared_ranking_artifact(model_path, artifact)?;
+
+    if let Some(current) = best_shared_ranking_artifact(model_path) {
+        let stronger = better_shared_ranking(artifact, &current);
+        let upgrades_legacy_metadata = !stronger
+            && ranking_strength_key(artifact) == ranking_strength_key(&current)
+            && current.origin == SharedRankingOrigin::LegacyCache
+            && artifact.origin != SharedRankingOrigin::LegacyCache;
+        if !stronger && !upgrades_legacy_metadata {
+            return Ok(false);
+        }
+    }
+
+    let path = shared_ranking_cache_path(model_path, artifact);
+    write_shared_ranking_artifact(&path, artifact)?;
+    Ok(true)
+}
+
+pub fn validate_shared_ranking_artifact(
+    model_path: &Path,
+    artifact: &SharedRankingArtifact,
+) -> anyhow::Result<()> {
+    if artifact.ranking.is_empty() {
+        anyhow::bail!("cannot cache empty shared ranking");
+    }
+
+    let expected = detect_moe(model_path).ok_or_else(|| {
+        anyhow::anyhow!(
+            "cannot validate MoE ranking for non-MoE or unreadable model {}",
+            model_path.display()
+        )
+    })?;
+    let expected_len = expected.expert_count as usize;
+    if artifact.ranking.len() != expected_len {
+        anyhow::bail!(
+            "invalid ranking length for {}: expected {}, got {}",
+            model_path.display(),
+            expected_len,
+            artifact.ranking.len()
+        );
+    }
+
+    let mut seen = vec![false; expected_len];
+    for &expert_id in &artifact.ranking {
+        let index = expert_id as usize;
+        if index >= expected_len {
+            anyhow::bail!(
+                "invalid expert id {} for {} experts in {}",
+                expert_id,
+                expected_len,
+                model_path.display()
+            );
+        }
+        if seen[index] {
+            anyhow::bail!(
+                "duplicate expert id {} in ranking for {}",
+                expert_id,
+                model_path.display()
+            );
+        }
+        seen[index] = true;
+    }
+
+    Ok(())
+}
+
+pub fn shared_ranking_cache_path(model_path: &Path, artifact: &SharedRankingArtifact) -> PathBuf {
+    match artifact.kind {
+        SharedRankingKind::Analyze => ranking_cache_path(model_path),
+        SharedRankingKind::MicroAnalyze => micro_ranking_cache_path(
+            model_path,
+            artifact.micro_prompt_count.unwrap_or(1),
+            artifact.micro_tokens.unwrap_or(8),
+            artifact.micro_layer_scope.unwrap_or_default(),
+        ),
+    }
 }
 
 #[derive(Debug)]
@@ -527,7 +923,7 @@ impl HeuristicScoreMethod {
         }
     }
 
-    fn cache_suffix(self) -> &'static str {
+    pub fn cache_suffix(self) -> &'static str {
         match self {
             Self::MeanL2 => "heuristic",
             Self::MaxL2 => "heuristic-max",
@@ -1120,6 +1516,37 @@ mod tests {
 
         let loaded = load_cached_ranking(&path).unwrap();
         assert_eq!(loaded, ranking);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_shared_ranking_metadata_roundtrip() {
+        let dir = std::env::temp_dir().join("moe-test-shared-ranking");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("shared.csv");
+
+        let artifact = SharedRankingArtifact {
+            kind: SharedRankingKind::MicroAnalyze,
+            origin: SharedRankingOrigin::PeerImport,
+            ranking: vec![3, 1, 2, 0],
+            micro_prompt_count: Some(2),
+            micro_tokens: Some(16),
+            micro_layer_scope: Some(MoeMicroLayerScope::All),
+        };
+        write_shared_ranking_artifact(&path, &artifact).unwrap();
+
+        let loaded = load_shared_ranking_artifact(
+            &path,
+            SharedRankingKind::MicroAnalyze,
+            SharedRankingOrigin::LegacyCache,
+            Some(1),
+            Some(8),
+            Some(MoeMicroLayerScope::First),
+        )
+        .unwrap();
+        assert_eq!(loaded, artifact);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

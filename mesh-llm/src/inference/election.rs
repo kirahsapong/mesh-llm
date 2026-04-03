@@ -200,19 +200,20 @@ pub fn build_moe_targets(
 struct ResolvedMoeConfig {
     config: crate::models::catalog::MoeConfig,
     ranking_source: String,
+    ranking_origin: String,
     grouping_strategy: moe::MoeGroupingStrategy,
     overlap: usize,
     replicate: u32,
 }
 
-/// Look up MoE config for a model. Two tiers:
-/// 1. Catalog (has pre-computed ranking) — instant, optimal
-/// 2. GGUF header detection (no ranking) — uses conservative defaults
+/// Look up base MoE config for a model.
+/// 1. Catalog provides MoE shape hints when available.
+/// 2. GGUF header detection fills in the rest with conservative defaults.
 fn lookup_moe_config(
     model_name: &str,
     model_path: &Path,
 ) -> Option<crate::models::catalog::MoeConfig> {
-    // Tier 1: catalog lookup (has ranking)
+    // Tier 1: catalog lookup (shape hints only; runtime ranking is resolved later)
     let q = model_name.to_lowercase();
     if let Some(cfg) = crate::models::catalog::MODEL_CATALOG
         .iter()
@@ -260,14 +261,6 @@ fn lookup_moe_config(
     })
 }
 
-fn bundled_moe_config(model_name: &str) -> Option<crate::models::catalog::MoeConfig> {
-    let q = model_name.to_lowercase();
-    crate::models::catalog::MODEL_CATALOG
-        .iter()
-        .find(|m| m.name.to_lowercase() == q || m.file.to_lowercase().contains(&q))
-        .and_then(|m| m.moe.clone())
-}
-
 fn resolve_runtime_moe_config(
     model_name: &str,
     model_path: &Path,
@@ -280,55 +273,62 @@ fn resolve_runtime_moe_config(
     };
 
     let started = std::time::Instant::now();
-    let (ranking, ranking_source) = match options.ranking_strategy {
+    let (ranking, ranking_source, ranking_origin) = match options.ranking_strategy {
         moe::MoeRankingStrategy::Auto => {
-            if let Some(cfg) = bundled_moe_config(model_name) {
-                if !cfg.ranking.is_empty() {
-                    (cfg.ranking, "bundled-catalog-ranking".to_string())
-                } else {
-                    let cached = moe::ranking_cache_path(model_path);
-                    if let Some(ranking) = moe::load_cached_ranking(&cached) {
-                        (ranking, cached.display().to_string())
-                    } else {
+            if let Some(artifact) = moe::best_shared_ranking_artifact(model_path) {
+                let cached = moe::shared_ranking_cache_path(model_path, &artifact);
+                eprintln!(
+                    "🧩 [{model_name}] Using cached MoE ranking mode={} origin={} cache={}",
+                    artifact.kind.label(),
+                    artifact.origin.label(),
+                    cached.display()
+                );
+                (
+                    artifact.ranking,
+                    artifact.kind.label().to_string(),
+                    artifact.origin.label().to_string(),
+                )
+            } else {
+                match ensure_micro_analyze_ranking(bin_dir, model_name, model_path, options) {
+                    Ok(artifact) => (
+                        artifact.ranking,
+                        artifact.kind.label().to_string(),
+                        artifact.origin.label().to_string(),
+                    ),
+                    Err(err) => {
+                        eprintln!(
+                            "⚠ [{model_name}] micro-analyze failed ({err}); falling back to sequential expert order"
+                        );
                         (
                             (0..base.n_expert).collect(),
                             "sequential-fallback".to_string(),
+                            "fallback".to_string(),
                         )
                     }
-                }
-            } else {
-                let cached = moe::ranking_cache_path(model_path);
-                if let Some(ranking) = moe::load_cached_ranking(&cached) {
-                    (ranking, cached.display().to_string())
-                } else {
-                    (
-                        (0..base.n_expert).collect(),
-                        "sequential-fallback".to_string(),
-                    )
                 }
             }
         }
         moe::MoeRankingStrategy::Analyze => {
             let cached = moe::ranking_cache_path(model_path);
-            let ranking = ensure_full_analyze_ranking(bin_dir, model_path, &cached)?;
-            (ranking, cached.display().to_string())
+            let artifact = ensure_full_analyze_ranking(bin_dir, model_name, model_path, &cached)?;
+            (
+                artifact.ranking,
+                artifact.kind.label().to_string(),
+                artifact.origin.label().to_string(),
+            )
         }
         moe::MoeRankingStrategy::MicroAnalyze => {
-            let ranking = run_micro_analyze_ranking(bin_dir, model_path, options)?;
-            let source = format!(
-                "micro-analyze:p{}:t{}:{}",
-                options.micro_prompt_count,
-                options.micro_tokens,
-                match options.micro_layer_scope {
-                    moe::MoeMicroLayerScope::All => "all-layers",
-                    moe::MoeMicroLayerScope::First => "first-layer",
-                }
-            );
-            (ranking, source)
+            let artifact = ensure_micro_analyze_ranking(bin_dir, model_name, model_path, options)?;
+            (
+                artifact.ranking,
+                artifact.kind.label().to_string(),
+                artifact.origin.label().to_string(),
+            )
         }
         moe::MoeRankingStrategy::Sequential => (
             (0..base.n_expert).collect(),
             "sequential-fallback".to_string(),
+            "fallback".to_string(),
         ),
         moe::MoeRankingStrategy::HeuristicMean => resolve_heuristic_runtime_ranking(
             model_path,
@@ -355,7 +355,7 @@ fn resolve_runtime_moe_config(
     eprintln!(
         "🧩 [{}] MoE ranking={} grouping={} resolved in {:.1}s",
         model_name,
-        ranking_source,
+        format!("{ranking_source} origin={ranking_origin}"),
         match options.grouping_strategy {
             moe::MoeGroupingStrategy::SharedCore => "shared-core",
             moe::MoeGroupingStrategy::SnakeDraft => "snake-draft",
@@ -366,6 +366,7 @@ fn resolve_runtime_moe_config(
     Ok(Some(ResolvedMoeConfig {
         config: crate::models::catalog::MoeConfig { ranking, ..base },
         ranking_source,
+        ranking_origin,
         grouping_strategy: options.grouping_strategy,
         overlap: options.overlap.max(1),
         replicate: options.replicate.unwrap_or(base.min_experts_per_node),
@@ -376,14 +377,22 @@ fn resolve_heuristic_runtime_ranking(
     model_path: &Path,
     expert_count: u32,
     method: moe::HeuristicScoreMethod,
-) -> anyhow::Result<(Vec<u32>, String)> {
+) -> anyhow::Result<(Vec<u32>, String, String)> {
     let cached = moe::heuristic_ranking_cache_path_for_method(model_path, method);
     if let Some(ranking) = moe::load_cached_ranking(&cached) {
-        return Ok((ranking, cached.display().to_string()));
+        return Ok((
+            ranking,
+            format!("heuristic-{}", method.cache_suffix()),
+            "local-heuristic-cache".to_string(),
+        ));
     }
     let ranking = moe::compute_heuristic_ranking_with_method(model_path, expert_count, method)?;
     moe::write_cached_ranking(&cached, &ranking)?;
-    Ok((ranking, cached.display().to_string()))
+    Ok((
+        ranking,
+        format!("heuristic-{}", method.cache_suffix()),
+        "local-heuristic".to_string(),
+    ))
 }
 
 fn resolve_analyze_binary(bin_dir: &Path) -> anyhow::Result<std::path::PathBuf> {
@@ -406,17 +415,34 @@ fn resolve_analyze_binary(bin_dir: &Path) -> anyhow::Result<std::path::PathBuf> 
 
 fn ensure_full_analyze_ranking(
     bin_dir: &Path,
+    model_name: &str,
     model_path: &Path,
     cached_path: &Path,
-) -> anyhow::Result<Vec<u32>> {
-    if let Some(ranking) = moe::load_cached_ranking(cached_path) {
-        return Ok(ranking);
+) -> anyhow::Result<moe::SharedRankingArtifact> {
+    if let Some(artifact) = moe::load_shared_ranking_artifact(
+        cached_path,
+        moe::SharedRankingKind::Analyze,
+        moe::SharedRankingOrigin::LegacyCache,
+        None,
+        None,
+        None,
+    ) {
+        eprintln!(
+            "🧩 [{model_name}] Using cached MoE ranking mode=full-analyze origin={} cache={}",
+            artifact.origin.label(),
+            cached_path.display()
+        );
+        return Ok(artifact);
     }
     if let Some(parent) = cached_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let analyze_bin = resolve_analyze_binary(bin_dir)?;
     let started = std::time::Instant::now();
+    eprintln!(
+        "🧩 [{model_name}] MoE analysis mode=full-analyze cache={} (progress from llama-moe-analyze follows)",
+        cached_path.display()
+    );
     let status = Command::new(&analyze_bin)
         .args([
             "-m",
@@ -433,17 +459,73 @@ fn ensure_full_analyze_ranking(
         ])
         .status()?;
     anyhow::ensure!(status.success(), "llama-moe-analyze exited with {status}");
-    eprintln!(
-        "  Full moe-analyze cached at {} in {:.1}s",
-        cached_path.display(),
-        started.elapsed().as_secs_f64()
-    );
-    moe::load_cached_ranking(cached_path).ok_or_else(|| {
+    let ranking = moe::load_cached_ranking(cached_path).ok_or_else(|| {
         anyhow::anyhow!(
             "No ranking produced by full analyze at {}",
             cached_path.display()
         )
-    })
+    })?;
+    let artifact = moe::SharedRankingArtifact {
+        kind: moe::SharedRankingKind::Analyze,
+        origin: moe::SharedRankingOrigin::LocalFullAnalyze,
+        ranking,
+        micro_prompt_count: None,
+        micro_tokens: None,
+        micro_layer_scope: None,
+    };
+    moe::cache_shared_ranking_if_stronger(model_path, &artifact)?;
+    eprintln!(
+        "  Full moe-analyze cached at {} in {:.1}s (origin={})",
+        cached_path.display(),
+        started.elapsed().as_secs_f64(),
+        artifact.origin.label()
+    );
+    Ok(artifact)
+}
+
+fn ensure_micro_analyze_ranking(
+    bin_dir: &Path,
+    model_name: &str,
+    model_path: &Path,
+    options: &moe::MoeRuntimeOptions,
+) -> anyhow::Result<moe::SharedRankingArtifact> {
+    let cached_path = moe::micro_ranking_cache_path(
+        model_path,
+        options.micro_prompt_count,
+        options.micro_tokens,
+        options.micro_layer_scope,
+    );
+    if let Some(artifact) = moe::load_shared_ranking_artifact(
+        &cached_path,
+        moe::SharedRankingKind::MicroAnalyze,
+        moe::SharedRankingOrigin::LegacyCache,
+        Some(options.micro_prompt_count),
+        Some(options.micro_tokens),
+        Some(options.micro_layer_scope),
+    ) {
+        eprintln!(
+            "🧩 [{model_name}] Using cached MoE ranking mode=micro-analyze origin={} cache={}",
+            artifact.origin.label(),
+            cached_path.display()
+        );
+        return Ok(artifact);
+    }
+    let ranking = run_micro_analyze_ranking(bin_dir, model_name, model_path, options)?;
+    let artifact = moe::SharedRankingArtifact {
+        kind: moe::SharedRankingKind::MicroAnalyze,
+        origin: moe::SharedRankingOrigin::LocalMicroAnalyze,
+        ranking,
+        micro_prompt_count: Some(options.micro_prompt_count),
+        micro_tokens: Some(options.micro_tokens),
+        micro_layer_scope: Some(options.micro_layer_scope),
+    };
+    moe::cache_shared_ranking_if_stronger(model_path, &artifact)?;
+    eprintln!(
+        "  Micro moe-analyze cached at {} (origin={})",
+        cached_path.display(),
+        artifact.origin.label()
+    );
+    Ok(artifact)
 }
 
 #[derive(Clone, Copy)]
@@ -454,6 +536,7 @@ struct AnalyzeMassRow {
 
 fn run_micro_analyze_ranking(
     bin_dir: &Path,
+    model_name: &str,
     model_path: &Path,
     options: &moe::MoeRuntimeOptions,
 ) -> anyhow::Result<Vec<u32>> {
@@ -472,9 +555,23 @@ fn run_micro_analyze_ranking(
     std::fs::create_dir_all(&tmp_dir)?;
     let started = std::time::Instant::now();
     let mut mass_by_expert: HashMap<u32, f64> = HashMap::new();
+    eprintln!(
+        "🧩 [{model_name}] MoE analysis mode=micro-analyze prompts={} tokens={} layers={} cache=pending",
+        prompt_count,
+        options.micro_tokens,
+        match options.micro_layer_scope {
+            moe::MoeMicroLayerScope::All => "all",
+            moe::MoeMicroLayerScope::First => "first",
+        }
+    );
 
     for (idx, prompt) in prompts.iter().take(prompt_count).enumerate() {
         let output_path = tmp_dir.join(format!("prompt-{idx}.csv"));
+        eprintln!(
+            "  MoE analysis progress {}/{} (mode=micro-analyze)",
+            idx + 1,
+            prompt_count
+        );
         let mut command = Command::new(&analyze_bin);
         command.args([
             "-m",
@@ -594,7 +691,7 @@ pub async fn election_loop(
     let my_vram = node.vram_bytes();
     let model_fits_locally = my_vram >= (model_bytes as f64 * 1.1) as u64;
 
-    // Check if this is a MoE model with pre-computed expert routing
+    // Check if this is a MoE model with enough metadata to plan expert routing.
     let moe_config = lookup_moe_config(&model_name, &model);
     if moe_config.is_some() {
         eprintln!(
@@ -1147,12 +1244,13 @@ async fn moe_election_loop(
         } else {
             // Multi-node MoE: split and load our shard
             eprintln!(
-                "🧩 [{}] MoE split mode — {} nodes, I am shard {}/{} ({}, {})",
+                "🧩 [{}] MoE split mode — {} nodes, I am shard {}/{} (ranking={} origin={}, {})",
                 model_name,
                 n_nodes,
                 my_shard_index,
                 n_nodes,
                 moe_cfg.ranking_source,
+                moe_cfg.ranking_origin,
                 match moe_cfg.grouping_strategy {
                     moe::MoeGroupingStrategy::SharedCore => "shared-core",
                     moe::MoeGroupingStrategy::SnakeDraft => "snake-draft",

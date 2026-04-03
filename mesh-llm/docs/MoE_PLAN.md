@@ -13,8 +13,8 @@ All core phases are complete and integrated into mesh-llm.
 - Auto-detected in `election.rs` at model load time.
 
 ### Ranking
-- **Catalog models**: pre-computed expert gate mass rankings baked into `download.rs` (e.g. `QWEN3_30B_A3B_RANKING`).
-- **Cached rankings**: `moe::load_cached_ranking()` loads from a sibling `moe-rankings/` directory next to the source model file.
+- **Cached rankings**: `moe::load_cached_ranking()` loads from the mesh-llm cache under `~/.cache/mesh-llm/moe-rankings/`.
+- **Dynamic analysis**: runtime can materialize cached rankings via `micro-analyze` or full `moe-analyze`.
 - **Fallback**: no ranking → conservative 50% shared core with sequential expert IDs.
 - **Tool**: `llama-moe-analyze` (in `llama.cpp/tools/moe-analyze/`) runs inference on sample prompts and exports per-expert gate mass CSV.
 
@@ -38,7 +38,7 @@ All core phases are complete and integrated into mesh-llm.
 ### Tested
 - OLMoE-1B-7B: 2 nodes over WAN (225ms RTT Sydney↔Sydney), both shards coherent.
 - Qwen3-30B-A3B: local quality validation, 87/128 experts per node = excellent.
-- GLM-4.7-Flash-Q4_K_M: MoE auto-detected (64 experts, top-4), fits locally → solo mode, no split. No pre-baked ranking in catalog yet — would use 50% fallback if split.
+- GLM-4.7-Flash-Q4_K_M: MoE auto-detected (64 experts, top-4), fits locally → solo mode, no split. If split, mesh-llm now prefers cached or freshly computed analysis over the sequential fallback.
 
 ## What's NOT Implemented
 
@@ -62,7 +62,7 @@ Planned direction:
   - capabilities (`vision`, `reasoning`, `tool_use`, `moe`)
   - optional `topology.moe`
 - **Initial MoE topology sources**:
-  1. precomputed MoE data already baked into this repo
+  1. cached `moe-analyze` or `micro-analyze` results
   2. Hugging Face metadata such as `num_experts` and `num_experts_per_tok`
   3. GGUF header fallback when no stronger source exists
 - **What goes into `ModelMoeInfo` first**:

@@ -76,7 +76,6 @@ struct ResolvedBenchmarkModel {
     architecture: String,
     info: moe::GgufMoeInfo,
     min_experts: u32,
-    bundled: Option<catalog::MoeConfig>,
 }
 
 #[derive(Clone, Debug)]
@@ -603,7 +602,6 @@ async fn resolve_benchmark_model(
         architecture,
         info,
         min_experts,
-        bundled,
     })
 }
 
@@ -739,12 +737,6 @@ fn resolve_variant_ranking(
                 return Ok(ranking);
             }
 
-            if let Some(cfg) = &model.bundled {
-                if !cfg.ranking.is_empty() {
-                    return Ok(cfg.ranking.clone());
-                }
-            }
-
             bail!(
                 "No moe-analyze ranking found for {}. Provide --analyze-ranking or cache a ranking at {}",
                 model.name,
@@ -786,8 +778,6 @@ fn variant_source_label(
             let cached_path = moe::ranking_cache_path(&model.path);
             if cached_path.exists() {
                 cached_path.display().to_string()
-            } else if model.bundled.is_some() {
-                "bundled-catalog-ranking".to_string()
             } else {
                 "missing".to_string()
             }

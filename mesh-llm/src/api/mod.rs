@@ -519,6 +519,17 @@ impl MeshApi {
                             .and_then(|m| m.moe.as_ref())
                             .map(|m| m.n_expert_used)
                     });
+                let ranking_source = topology_moe
+                    .and_then(|moe| moe.ranking_source.as_ref())
+                    .cloned();
+                let ranking_origin = topology_moe
+                    .and_then(|moe| moe.ranking_origin.as_ref())
+                    .cloned();
+                let ranking_prompt_count = topology_moe.and_then(|moe| moe.ranking_prompt_count);
+                let ranking_tokens = topology_moe.and_then(|moe| moe.ranking_tokens);
+                let ranking_layer_scope = topology_moe
+                    .and_then(|moe| moe.ranking_layer_scope.as_ref())
+                    .cloned();
                 let draft_model = catalog_entry.and_then(|m| m.draft.clone());
                 let source_page_url =
                     identity
@@ -590,6 +601,11 @@ impl MeshApi {
                     moe,
                     expert_count,
                     used_expert_count,
+                    ranking_source,
+                    ranking_origin,
+                    ranking_prompt_count,
+                    ranking_tokens,
+                    ranking_layer_scope,
                     draft_model,
                     request_count,
                     last_active_secs_ago,

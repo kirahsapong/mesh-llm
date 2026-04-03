@@ -298,6 +298,16 @@ async fn resolve_model(input: &std::path::Path) -> Result<PathBuf> {
     models::resolve_model_spec(input).await
 }
 
+fn resolve_moe_ranking_strategy(cli: &Cli) -> moe::MoeRankingStrategy {
+    if cli.moe_full_analyze {
+        moe::MoeRankingStrategy::Analyze
+    } else if cli.moe_micro_analyze {
+        moe::MoeRankingStrategy::MicroAnalyze
+    } else {
+        cli.moe_ranking.unwrap_or_default()
+    }
+}
+
 /// Look up the model filename in the catalog and check if its draft model exists on disk.
 /// If not on disk, downloads it (drafts are <1GB).
 pub async fn ensure_draft(model: &std::path::Path) -> Option<PathBuf> {
@@ -1189,7 +1199,7 @@ async fn run_auto(
     let primary_process_model_name = model_name.clone();
     let primary_model_name_for_advertise = model_name.clone();
     let moe_runtime_options = moe::MoeRuntimeOptions {
-        ranking_strategy: cli.moe_ranking.unwrap_or_default(),
+        ranking_strategy: resolve_moe_ranking_strategy(&cli),
         grouping_strategy: cli.moe_grouping.unwrap_or_default(),
         overlap: cli.moe_overlap.unwrap_or(1),
         replicate: cli.moe_replicate,
@@ -1311,7 +1321,7 @@ async fn run_auto(
             let api_port_extra = api_port;
             let extra_llama_flavor = cli.llama_flavor;
             let extra_moe_runtime_options = moe::MoeRuntimeOptions {
-                ranking_strategy: cli.moe_ranking.unwrap_or_default(),
+                ranking_strategy: resolve_moe_ranking_strategy(&cli),
                 grouping_strategy: cli.moe_grouping.unwrap_or_default(),
                 overlap: cli.moe_overlap.unwrap_or(1),
                 replicate: cli.moe_replicate,

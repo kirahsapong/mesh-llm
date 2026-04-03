@@ -102,10 +102,21 @@ pub(crate) struct Cli {
     #[arg(long, hide = true)]
     pub(crate) split: bool,
 
-    /// MoE ranking strategy for split MoE models. `auto` keeps current behavior; `micro-analyze`
-    /// runs a short local `llama-moe-analyze`; `analyze` runs the full analysis before splitting.
+    /// MoE ranking strategy for split MoE models. `auto` uses cached full analyze, then cached
+    /// micro-analyze, then runs a short local `llama-moe-analyze`; `analyze` runs the full
+    /// analysis before splitting.
     #[arg(long, value_enum)]
     pub(crate) moe_ranking: Option<moe::MoeRankingStrategy>,
+
+    /// Convenience override for `--moe-ranking micro-analyze`. Runs a short MoE analysis, caches
+    /// the result, and uses that ranking for this startup.
+    #[arg(long, conflicts_with_all = ["moe_full_analyze", "moe_ranking"])]
+    pub(crate) moe_micro_analyze: bool,
+
+    /// Convenience override for `--moe-ranking analyze`. Runs the full MoE analysis, caches the
+    /// result, and uses that ranking for this startup.
+    #[arg(long, conflicts_with_all = ["moe_micro_analyze", "moe_ranking"])]
+    pub(crate) moe_full_analyze: bool,
 
     /// MoE grouping strategy for split MoE models. `shared-core` preserves the current
     /// replicated-hot-core split; `snake-draft` balances hot and cold experts across nodes.
