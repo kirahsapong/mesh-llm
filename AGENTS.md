@@ -191,6 +191,16 @@ pkill -f mesh-llm; pkill -f rpc-server; pkill -f llama-server
 12. Test inference through every model in `/v1/models`.
 13. Test `/v1/` passthrough on port 3131.
 
+### Debugging llama-server startup
+
+If llama-server fails to start (stuck at "⏳ Starting llama-server..."), check its log file. Rust's `std::env::temp_dir()` on macOS points to the per-user temp dir, **not** `/tmp`:
+
+```bash
+cat "$(python3 -c 'import tempfile; print(tempfile.gettempdir())')/mesh-llm-llama-server.log"
+```
+
+Typical path: `/var/folders/XX/.../T/mesh-llm-llama-server.log`. rpc-server logs are in the same directory as `mesh-llm-rpc-{port}.log`.
+
 ### Common failures
 - **nohup over SSH doesn't stick** — use `bash -c "nohup ... & disown"`, verify process survives disconnect.
 - **Duplicate processes** — always kill-verify-start.
