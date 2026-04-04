@@ -34,6 +34,8 @@ pub(crate) use self::support::parse_optional_json;
 use self::support::{format_args_for_log, format_slice_for_log, format_tool_names_for_log};
 #[cfg(all(test, unix))]
 use self::transport::unix_socket_path;
+#[cfg(all(test, windows))]
+use self::transport::windows_pipe_name;
 use self::transport::{connect_side_stream, make_instance_id, LocalStream};
 #[cfg(test)]
 use mesh_llm_plugin::MeshVisibility;
