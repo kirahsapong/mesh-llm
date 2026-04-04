@@ -1819,6 +1819,9 @@ async fn moe_election_loop(
         last_plan_change_at = tokio::time::Instant::now();
 
         if matches!(role, MoePlacementRole::Standby) {
+            node.set_model_runtime_context_length(&model_name, None)
+                .await;
+            node.regossip().await;
             eprintln!(
                 "🧩 [{}] Standing by outside active MoE placement (leader={} active={} fallback={})",
                 model_name,
@@ -1909,6 +1912,9 @@ async fn moe_election_loop(
             }
         } else if plan.active_ids.len() == 1 {
             if model_fits {
+                node.set_model_runtime_context_length(&model_name, None)
+                    .await;
+                node.regossip().await;
                 eprintln!(
                     "🧩 [{}] MoE model — serving entirely ({:.1}GB fits in {:.1}GB VRAM)",
                     model_name,
@@ -1984,6 +1990,9 @@ async fn moe_election_loop(
                     }
                 }
             } else {
+                node.set_model_runtime_context_length(&model_name, None)
+                    .await;
+                node.regossip().await;
                 eprintln!("⚠️  [{}] MoE model too large to serve entirely ({:.1}GB model, {:.1}GB VRAM) — waiting for peers",
                     model_name, model_bytes as f64 / 1e9, my_vram as f64 / 1e9);
                 on_change(false, false);
@@ -2018,6 +2027,11 @@ async fn moe_election_loop(
                 my_assignment.n_unique
             );
 
+            // Advertise a non-ready local runtime before split generation / load so
+            // peer liveness stays conservative during MoE convergence.
+            node.set_model_runtime_starting(&model_name).await;
+            node.regossip().await;
+
             let shard_path = moe::split_path(&model, plan.active_ids.len(), my_shard_index);
 
             if !shard_path.exists() {
@@ -2029,6 +2043,9 @@ async fn moe_election_loop(
                     }
                     Err(e) => {
                         eprintln!("  ❌ moe-split failed: {e}");
+                        node.set_model_runtime_context_length(&model_name, None)
+                            .await;
+                        node.regossip().await;
                         if peer_rx.changed().await.is_err() {
                             break;
                         }
@@ -2124,6 +2141,9 @@ async fn moe_election_loop(
                         "  ⚠️  [{}] Refusing to enter MoE split mode on this node until the shard validates",
                         model_name
                     );
+                    node.set_model_runtime_context_length(&model_name, None)
+                        .await;
+                    node.regossip().await;
                 }
             }
         }

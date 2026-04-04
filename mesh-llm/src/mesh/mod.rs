@@ -569,9 +569,20 @@ fn descriptors_share_exact_moe_identity(
 
 fn heartbeat_failure_policy_for_peer(
     local_descriptors: &[ServedModelDescriptor],
+    local_runtime: &[ModelRuntimeDescriptor],
     peer: &PeerInfo,
 ) -> HeartbeatFailurePolicy {
     if descriptors_share_exact_moe_identity(local_descriptors, &peer.served_model_descriptors) {
+        if exact_moe_starting_during_convergence(local_descriptors, local_runtime, peer) {
+            return HeartbeatFailurePolicy {
+                allow_recent_inbound_grace: true,
+                // Split convergence can spend minutes in split generation + shard
+                // load. During that window, prefer serving continuity over fast
+                // heartbeat-only fail-down; request-path failures still remove
+                // dead shard peers immediately.
+                failure_threshold: 4,
+            };
+        }
         HeartbeatFailurePolicy {
             allow_recent_inbound_grace: false,
             // Shared MoE peers should fail down faster than generic peers, but a
@@ -590,6 +601,51 @@ fn heartbeat_failure_policy_for_peer(
 }
 
 const MOE_RECOVERY_PROBATION_SECS: u64 = 30;
+
+fn runtime_model_is_starting(runtimes: &[ModelRuntimeDescriptor], model_name: &str) -> bool {
+    runtimes
+        .iter()
+        .any(|runtime| runtime.model_name == model_name && !runtime.ready)
+}
+
+fn exact_moe_starting_during_convergence(
+    local_descriptors: &[ServedModelDescriptor],
+    local_runtime: &[ModelRuntimeDescriptor],
+    peer: &PeerInfo,
+) -> bool {
+    local_descriptors.iter().any(|local_descriptor| {
+        let local_moe = local_descriptor
+            .topology
+            .as_ref()
+            .and_then(|topology| topology.moe.as_ref())
+            .is_some();
+        if !local_moe {
+            return false;
+        }
+
+        peer.served_model_descriptors
+            .iter()
+            .any(|remote_descriptor| {
+                let remote_moe = remote_descriptor
+                    .topology
+                    .as_ref()
+                    .and_then(|topology| topology.moe.as_ref())
+                    .is_some();
+                if !remote_moe
+                    || !identities_match_exact(
+                        &local_descriptor.identity,
+                        &remote_descriptor.identity,
+                    )
+                {
+                    return false;
+                }
+
+                let model_name = &local_descriptor.identity.model_name;
+                runtime_model_is_starting(local_runtime, model_name)
+                    || runtime_model_is_starting(&peer.served_model_runtime, model_name)
+            })
+    })
+}
 
 fn moe_recovery_ready_at(
     recovered_at: Option<std::time::Instant>,
@@ -1894,6 +1950,32 @@ impl Node {
         }
     }
 
+    pub async fn set_model_runtime_starting(&self, model_name: &str) {
+        let identity_hash = self
+            .served_model_descriptors
+            .lock()
+            .await
+            .iter()
+            .find(|descriptor| descriptor.identity.model_name == model_name)
+            .and_then(|descriptor| descriptor.identity.identity_hash.clone());
+        let mut runtimes = self.model_runtime_descriptors.lock().await;
+        if let Some(runtime) = runtimes
+            .iter_mut()
+            .find(|runtime| runtime.model_name == model_name)
+        {
+            runtime.identity_hash = identity_hash.or_else(|| runtime.identity_hash.clone());
+            runtime.context_length = None;
+            runtime.ready = false;
+        } else {
+            runtimes.push(ModelRuntimeDescriptor {
+                model_name: model_name.to_string(),
+                identity_hash,
+                context_length: None,
+                ready: false,
+            });
+        }
+    }
+
     pub async fn local_model_context_length(&self, model_name: &str) -> Option<u32> {
         self.model_runtime_descriptors
             .lock()
@@ -2387,10 +2469,15 @@ impl Node {
                             drop(state);
                             let local_descriptors =
                                 node.served_model_descriptors.lock().await.clone();
+                            let local_runtime = node.model_runtime_descriptors.lock().await.clone();
                             let policy = peer
                                 .as_ref()
                                 .map(|peer| {
-                                    heartbeat_failure_policy_for_peer(&local_descriptors, peer)
+                                    heartbeat_failure_policy_for_peer(
+                                        &local_descriptors,
+                                        &local_runtime,
+                                        peer,
+                                    )
                                 })
                                 .unwrap_or(HeartbeatFailurePolicy {
                                     allow_recent_inbound_grace: true,
@@ -5422,8 +5509,9 @@ mod tests {
             "Qwen3-Coder-Next-Q4_K_M",
             "same-model",
         )];
+        let local_runtime = vec![];
 
-        let policy = heartbeat_failure_policy_for_peer(&local_descriptors, &peer);
+        let policy = heartbeat_failure_policy_for_peer(&local_descriptors, &local_runtime, &peer);
 
         assert_eq!(
             policy,
@@ -5445,14 +5533,44 @@ mod tests {
             "Qwen3-Coder-Next-Q4_K_M",
             "local-model",
         )];
+        let local_runtime = vec![];
 
-        let policy = heartbeat_failure_policy_for_peer(&local_descriptors, &peer);
+        let policy = heartbeat_failure_policy_for_peer(&local_descriptors, &local_runtime, &peer);
 
         assert_eq!(
             policy,
             HeartbeatFailurePolicy {
                 allow_recent_inbound_grace: true,
                 failure_threshold: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn shared_exact_moe_startup_relaxes_heartbeat_during_convergence() {
+        let mut peer = make_test_peer_info(make_test_endpoint_id(11));
+        peer.served_model_descriptors = vec![make_test_moe_descriptor(
+            "Qwen3-Coder-Next-Q4_K_M",
+            "same-model",
+        )];
+        let local_descriptors = vec![make_test_moe_descriptor(
+            "Qwen3-Coder-Next-Q4_K_M",
+            "same-model",
+        )];
+        let local_runtime = vec![ModelRuntimeDescriptor {
+            model_name: "Qwen3-Coder-Next-Q4_K_M".to_string(),
+            identity_hash: Some("same-model".to_string()),
+            context_length: None,
+            ready: false,
+        }];
+
+        let policy = heartbeat_failure_policy_for_peer(&local_descriptors, &local_runtime, &peer);
+
+        assert_eq!(
+            policy,
+            HeartbeatFailurePolicy {
+                allow_recent_inbound_grace: true,
+                failure_threshold: 4,
             }
         );
     }
