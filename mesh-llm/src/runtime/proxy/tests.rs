@@ -1438,3 +1438,82 @@ async fn test_api_proxy_does_not_retry_after_successful_stream_starts() {
         .unwrap();
     unused_handle.abort();
 }
+
+#[tokio::test]
+async fn test_api_proxy_passes_through_native_base64_image() {
+    // A client that already has a base64-encoded image (data URI) and sends it
+    // directly to /v1/chat/completions should have it forwarded unchanged.
+    let (upstream_port, upstream_rx, upstream_handle) =
+        spawn_capturing_upstream(r#"{"ok":true}"#).await;
+    let (proxy_addr, proxy_handle) =
+        spawn_api_proxy_test_harness(local_targets(&[("test", upstream_port)])).await;
+
+    let body = json!({
+        "model": "test",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "describe this image"},
+                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,/9j/4AAQSkZJRgAB"}}
+            ]
+        }],
+    })
+    .to_string();
+    let request = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    );
+
+    let response = send_request_and_read_response(proxy_addr, vec![request.into_bytes()]).await;
+    let raw = String::from_utf8(upstream_rx.await.unwrap()).unwrap();
+
+    assert!(response.starts_with("HTTP/1.1 200 OK"));
+    assert!(raw.contains(r#""type":"image_url""#));
+    assert!(raw.contains("data:image/jpeg;base64,/9j/4AAQSkZJRgAB"));
+
+    proxy_handle.abort();
+    let _ = upstream_handle.await;
+}
+
+#[tokio::test]
+async fn test_api_proxy_passes_through_native_base64_audio() {
+    // A client that already has base64-encoded audio and sends it in the
+    // input_audio format directly to /v1/chat/completions should have it
+    // forwarded unchanged.
+    let (upstream_port, upstream_rx, upstream_handle) =
+        spawn_capturing_upstream(r#"{"ok":true}"#).await;
+    let (proxy_addr, proxy_handle) =
+        spawn_api_proxy_test_harness(local_targets(&[("test", upstream_port)])).await;
+
+    let body = json!({
+        "model": "test",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "transcribe this"},
+                {"type": "input_audio", "input_audio": {
+                    "data": "UklGRg==",
+                    "format": "wav"
+                }}
+            ]
+        }],
+    })
+    .to_string();
+    let request = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    );
+
+    let response = send_request_and_read_response(proxy_addr, vec![request.into_bytes()]).await;
+    let raw = String::from_utf8(upstream_rx.await.unwrap()).unwrap();
+
+    assert!(response.starts_with("HTTP/1.1 200 OK"));
+    assert!(raw.contains(r#""type":"input_audio""#));
+    assert!(raw.contains(r#""data":"UklGRg==""#));
+    assert!(raw.contains(r#""format":"wav""#));
+
+    proxy_handle.abort();
+    let _ = upstream_handle.await;
+}
