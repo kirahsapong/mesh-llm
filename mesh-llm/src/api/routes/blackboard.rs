@@ -153,7 +153,7 @@ async fn handle_post(stream: &mut TcpStream, state: &MeshApi, body: &str) -> any
             } else {
                 let request = crate::blackboard::PostRequest {
                     text,
-                    from: node.peer_name().await,
+                    from: node.display_name().await,
                     peer_id: node.id().fmt_short().to_string(),
                 };
                 match plugin_manager

@@ -1002,6 +1002,7 @@ async fn handle_request(mut stream: TcpStream, state: &MeshApi) -> anyhow::Resul
                 path_only,
                 body,
                 req.as_ref(),
+                &request.raw,
             )
             .await?
             {

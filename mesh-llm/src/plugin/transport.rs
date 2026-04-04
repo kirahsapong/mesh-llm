@@ -172,7 +172,7 @@ impl LocalListener {
 }
 
 impl LocalStream {
-    async fn write_all(&mut self, bytes: &[u8]) -> Result<()> {
+    pub(crate) async fn write_all(&mut self, bytes: &[u8]) -> Result<()> {
         match self {
             #[cfg(unix)]
             LocalStream::Unix(stream) => stream.write_all(bytes).await?,
@@ -180,6 +180,26 @@ impl LocalStream {
             LocalStream::PipeServer(stream) => stream.write_all(bytes).await?,
         }
         Ok(())
+    }
+
+    pub(crate) async fn shutdown(&mut self) -> Result<()> {
+        match self {
+            #[cfg(unix)]
+            LocalStream::Unix(stream) => stream.shutdown().await?,
+            #[cfg(windows)]
+            LocalStream::PipeServer(stream) => stream.shutdown().await?,
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn read(&mut self, bytes: &mut [u8]) -> Result<usize> {
+        let read = match self {
+            #[cfg(unix)]
+            LocalStream::Unix(stream) => stream.read(bytes).await?,
+            #[cfg(windows)]
+            LocalStream::PipeServer(stream) => stream.read(bytes).await?,
+        };
+        Ok(read)
     }
 
     async fn read_exact(&mut self, bytes: &mut [u8]) -> Result<()> {

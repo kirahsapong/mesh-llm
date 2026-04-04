@@ -15,6 +15,7 @@ pub(super) async fn handle(
     path: &str,
     path_only: &str,
     body: &str,
+    raw_request: &[u8],
 ) -> anyhow::Result<()> {
     match (method, path_only) {
         ("GET", "/api/plugins") => handle_list(stream, state).await,
@@ -36,7 +37,7 @@ pub(super) async fn handle(
             if p.starts_with("/api/plugins/")
                 && matches!(m, "GET" | "POST" | "PUT" | "PATCH" | "DELETE") =>
         {
-            handle_stapled_http(stream, state, method, path, path_only, body).await
+            handle_stapled_http(stream, state, method, path, path_only, body, raw_request).await
         }
         _ => Ok(()),
     }
@@ -189,6 +190,7 @@ async fn handle_stapled_http(
     path: &str,
     path_only: &str,
     body: &str,
+    raw_request: &[u8],
 ) -> anyhow::Result<()> {
     let Some((plugin_name, route_path)) = parse_stapled_http_path(path_only) else {
         respond_error(stream, 404, "Not found").await?;
@@ -216,6 +218,27 @@ async fn handle_stapled_http(
         respond_error(stream, 404, "No matching plugin HTTP binding").await?;
         return Ok(());
     };
+
+    let request_streamed = matches!(
+        crate::plugin::proto::HttpBodyMode::try_from(binding.request_body_mode)
+            .unwrap_or(crate::plugin::proto::HttpBodyMode::Unspecified),
+        crate::plugin::proto::HttpBodyMode::Streamed
+    );
+    let response_streamed = matches!(
+        crate::plugin::proto::HttpBodyMode::try_from(binding.response_body_mode)
+            .unwrap_or(crate::plugin::proto::HttpBodyMode::Unspecified),
+        crate::plugin::proto::HttpBodyMode::Streamed
+    );
+    if request_streamed || response_streamed {
+        return handle_streamed_http_binding(
+            stream,
+            &plugin_manager,
+            plugin_name,
+            binding,
+            raw_request,
+        )
+        .await;
+    }
 
     let Some(operation_name) = binding.operation_name.as_deref() else {
         respond_error(
@@ -266,6 +289,48 @@ async fn handle_stapled_http(
     Ok(())
 }
 
+async fn handle_streamed_http_binding(
+    client_stream: &mut TcpStream,
+    plugin_manager: &crate::plugin::PluginManager,
+    plugin_name: &str,
+    binding: &crate::plugin::proto::HttpBindingManifest,
+    raw_request: &[u8],
+) -> anyhow::Result<()> {
+    let stream_id = format!("http-{}-{}", std::process::id(), rand::random::<u64>());
+    let request = crate::plugin::proto::OpenStreamRequest {
+        stream_id,
+        purpose: crate::plugin::proto::StreamPurpose::Generic as i32,
+        mode: crate::plugin::proto::StreamMode::Http1 as i32,
+        bidirectional: true,
+        content_type: Some("application/http".into()),
+        correlation_id: None,
+        metadata_json: Some(
+            serde_json::json!({
+                "binding_id": binding.binding_id,
+                "method": method_name(binding.method),
+                "path": binding.path,
+            })
+            .to_string(),
+        ),
+        expected_bytes: Some(raw_request.len() as u64),
+        idle_timeout_ms: Some(30_000),
+    };
+    let mut plugin_stream = plugin_manager.connect_stream(plugin_name, request).await?;
+    let forwarded_request = rewrite_http_request_path(raw_request, &binding.path)?;
+    plugin_stream.write_all(&forwarded_request).await?;
+    plugin_stream.shutdown().await?;
+
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        let read = plugin_stream.read(&mut buf).await?;
+        if read == 0 {
+            break;
+        }
+        client_stream.write_all(&buf[..read]).await?;
+    }
+    Ok(())
+}
+
 fn parse_stapled_http_path(path_only: &str) -> Option<(&str, &str)> {
     let rest = path_only.strip_prefix("/api/plugins/")?;
     let (plugin_name, remainder) = rest.split_once("/http")?;
@@ -291,6 +356,60 @@ fn build_http_arguments(path: &str, body: &str) -> Result<Map<String, Value>, St
     };
     args.extend(body_map);
     Ok(args)
+}
+
+fn rewrite_http_request_path(raw_request: &[u8], path: &str) -> anyhow::Result<Vec<u8>> {
+    let header_end = raw_request
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|idx| idx + 4)
+        .ok_or_else(|| anyhow::anyhow!("HTTP request is missing a header terminator"))?;
+    let mut headers_buf = [httparse::EMPTY_HEADER; 64];
+    let mut req = httparse::Request::new(&mut headers_buf);
+    req.parse(raw_request)
+        .map_err(|err| anyhow::anyhow!("HTTP parse error while rewriting request path: {err}"))?;
+
+    let method = req.method.unwrap_or("GET");
+    let version = req.version.unwrap_or(1);
+    let mut rebuilt = format!(
+        "{method} {} HTTP/1.{version}\r\n",
+        normalized_http_path(path)
+    );
+
+    for header in req.headers.iter() {
+        let name = header.name;
+        if name.eq_ignore_ascii_case("connection") {
+            continue;
+        }
+        let value = std::str::from_utf8(header.value).unwrap_or("");
+        rebuilt.push_str(&format!("{name}: {value}\r\n"));
+    }
+    rebuilt.push_str("Connection: close\r\n\r\n");
+
+    let mut forwarded = rebuilt.into_bytes();
+    forwarded.extend_from_slice(&raw_request[header_end..]);
+    Ok(forwarded)
+}
+
+fn normalized_http_path(path: &str) -> &str {
+    if path.is_empty() {
+        "/"
+    } else {
+        path
+    }
+}
+
+fn method_name(value: i32) -> &'static str {
+    match crate::plugin::proto::HttpMethod::try_from(value)
+        .unwrap_or(crate::plugin::proto::HttpMethod::Unspecified)
+    {
+        crate::plugin::proto::HttpMethod::Get => "GET",
+        crate::plugin::proto::HttpMethod::Post => "POST",
+        crate::plugin::proto::HttpMethod::Put => "PUT",
+        crate::plugin::proto::HttpMethod::Patch => "PATCH",
+        crate::plugin::proto::HttpMethod::Delete => "DELETE",
+        crate::plugin::proto::HttpMethod::Unspecified => "UNSPECIFIED",
+    }
 }
 
 fn query_arguments(path: &str) -> Map<String, Value> {
@@ -331,5 +450,16 @@ mod tests {
         .unwrap();
         assert_eq!(args.get("limit"), Some(&Value::Number(10.into())));
         assert_eq!(args.get("from"), Some(&Value::String("bob".into())));
+    }
+
+    #[test]
+    fn rewrite_http_request_path_updates_request_line_only() {
+        let raw = b"POST /api/plugins/demo/http/feed?x=1 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 7\r\nConnection: keep-alive\r\n\r\n{\"a\":1}";
+        let rewritten = rewrite_http_request_path(raw, "/feed").unwrap();
+        let text = String::from_utf8(rewritten).unwrap();
+        assert!(text.starts_with("POST /feed HTTP/1.1\r\n"));
+        assert!(text.contains("Host: localhost\r\n"));
+        assert!(text.contains("Connection: close\r\n"));
+        assert!(text.ends_with("\r\n\r\n{\"a\":1}"));
     }
 }

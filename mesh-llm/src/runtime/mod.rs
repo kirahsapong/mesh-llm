@@ -710,7 +710,7 @@ fn plugin_host_mode(cli: &Cli) -> plugin::PluginHostMode {
     }
 }
 
-fn blackboard_display_name(cli: &Cli, node: &mesh::Node) -> String {
+fn node_display_name(cli: &Cli, node: &mesh::Node) -> String {
     cli.name
         .clone()
         .or_else(|| std::env::var("USER").ok())
@@ -777,8 +777,7 @@ pub(crate) async fn run_plugin_mcp(cli: &Cli) -> Result<()> {
     )
     .await?;
     node.start_accepting();
-    node.set_blackboard_name(blackboard_display_name(cli, &node))
-        .await;
+    node.set_display_name(node_display_name(cli, &node)).await;
     node.start_heartbeat();
     join_mesh_for_mcp(cli, &node).await?;
 
@@ -836,8 +835,7 @@ async fn run_auto(
     .await?;
     node.start_accepting();
     let token = node.invite_token();
-    node.set_blackboard_name(blackboard_display_name(&cli, &node))
-        .await;
+    node.set_display_name(node_display_name(&cli, &node)).await;
     let (plugin_mesh_tx, plugin_mesh_rx) = tokio::sync::mpsc::channel(256);
     let plugin_manager =
         plugin::PluginManager::start(&resolved_plugins, plugin_host_mode(&cli), plugin_mesh_tx)
@@ -1670,8 +1668,7 @@ async fn run_passive(
 ) -> Result<Option<String>> {
     let local_port = cli.port;
     let affinity_router = affinity::AffinityRouter::new();
-    node.set_blackboard_name(blackboard_display_name(cli, &node))
-        .await;
+    node.set_display_name(node_display_name(cli, &node)).await;
 
     // Nostr publishing (if --publish, for standby GPU nodes advertising capacity)
     if cli.publish && !is_client {

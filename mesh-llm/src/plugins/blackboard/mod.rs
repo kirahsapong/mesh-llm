@@ -483,6 +483,23 @@ fn build_blackboard_plugin(name: String) -> SimplePlugin {
                 .await
         })
     })
+    .on_mesh_event(move |event, context| {
+        Box::pin(async move {
+            if event.kind() == mesh_llm_plugin::proto::mesh_event::Kind::PeerUp {
+                if let Some(peer) = event.peer {
+                    context
+                        .send_json_channel(
+                            BLACKBOARD_CHANNEL,
+                            peer.peer_id,
+                            "blackboard",
+                            &BlackboardMessage::SyncRequest,
+                        )
+                        .await?;
+                }
+            }
+            Ok(())
+        })
+    })
     .on_channel_message(move |message, context| {
         let store = channel_store.clone();
         let sync_store = sync_store.clone();

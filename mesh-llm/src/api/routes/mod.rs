@@ -16,6 +16,7 @@ pub(super) async fn dispatch_request(
     path_only: &str,
     body: &str,
     req: &str,
+    raw_request: &[u8],
 ) -> anyhow::Result<bool> {
     match (method, path_only) {
         ("GET", "/api/discover") => {
@@ -37,38 +38,38 @@ pub(super) async fn dispatch_request(
             Ok(true)
         }
         ("GET", "/api/plugins") => {
-            plugins::handle(stream, state, method, path, path_only, body).await?;
+            plugins::handle(stream, state, method, path, path_only, body, raw_request).await?;
             Ok(true)
         }
         ("GET", "/api/plugins/endpoints") => {
-            plugins::handle(stream, state, method, path, path_only, body).await?;
+            plugins::handle(stream, state, method, path, path_only, body, raw_request).await?;
             Ok(true)
         }
         ("GET", "/api/plugins/providers") => {
-            plugins::handle(stream, state, method, path, path_only, body).await?;
+            plugins::handle(stream, state, method, path, path_only, body, raw_request).await?;
             Ok(true)
         }
         ("GET", p) if p.starts_with("/api/plugins/providers/") => {
-            plugins::handle(stream, state, method, path, path_only, body).await?;
+            plugins::handle(stream, state, method, path, path_only, body, raw_request).await?;
             Ok(true)
         }
         ("GET", p) if p.starts_with("/api/plugins/") && p.ends_with("/manifest") => {
-            plugins::handle(stream, state, method, path, path_only, body).await?;
+            plugins::handle(stream, state, method, path, path_only, body, raw_request).await?;
             Ok(true)
         }
         ("GET", p) if p.starts_with("/api/plugins/") && p.ends_with("/tools") => {
-            plugins::handle(stream, state, method, path, path_only, body).await?;
+            plugins::handle(stream, state, method, path, path_only, body, raw_request).await?;
             Ok(true)
         }
         ("POST", p) if p.starts_with("/api/plugins/") && p.contains("/tools/") => {
-            plugins::handle(stream, state, method, path, path_only, body).await?;
+            plugins::handle(stream, state, method, path, path_only, body, raw_request).await?;
             Ok(true)
         }
         (m, p)
             if p.starts_with("/api/plugins/")
                 && matches!(m, "GET" | "POST" | "PUT" | "PATCH" | "DELETE") =>
         {
-            plugins::handle(stream, state, method, path, path_only, body).await?;
+            plugins::handle(stream, state, method, path, path_only, body, raw_request).await?;
             Ok(true)
         }
         ("GET", "/api/blackboard/feed")
