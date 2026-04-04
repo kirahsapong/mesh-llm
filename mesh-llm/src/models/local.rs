@@ -724,6 +724,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp);
     }
 
+    #[test]
+    fn mmproj_path_ignores_unrelated_mmproj_in_flat_dir() {
+        // Reproduces the bug: a flat directory like ~/.models/ contains models
+        // from different families. An unrelated mmproj should not be picked up.
+        let temp = std::env::temp_dir().join(format!(
+            "mesh-llm-mmproj-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp).unwrap();
+        let model = temp.join("Hermes-2-Pro-Mistral-7B-Q4_K_M.gguf");
+        let unrelated_mmproj = temp.join("Qwen3.5-0.8B-mmproj-BF16.gguf");
+        std::fs::write(&model, b"model").unwrap();
+        std::fs::write(&unrelated_mmproj, b"mmproj").unwrap();
+
+        assert!(find_mmproj_path("Hermes-2-Pro-Mistral-7B-Q4_K_M", &model).is_none());
+
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
     fn restore_env(key: &str, value: Option<std::ffi::OsString>) {
         if let Some(value) = value {
             std::env::set_var(key, value);
