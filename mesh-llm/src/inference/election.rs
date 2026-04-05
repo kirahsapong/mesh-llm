@@ -319,6 +319,7 @@ pub async fn election_loop(
     bin_dir: std::path::PathBuf,
     model: std::path::PathBuf,
     model_name: String,
+    explicit_mmproj: Option<std::path::PathBuf>,
     draft: Option<std::path::PathBuf>,
     draft_max: u16,
     force_split: bool,
@@ -588,6 +589,7 @@ pub async fn election_loop(
                 &model,
                 &model_name,
                 peers_for_launch,
+                explicit_mmproj.as_deref(),
                 draft.as_deref(),
                 draft_max,
                 force_split,
@@ -1126,6 +1128,7 @@ async fn start_llama(
     model: &Path,
     model_name: &str,
     model_peers: &[mesh::PeerInfo],
+    explicit_mmproj: Option<&Path>,
     draft: Option<&Path>,
     draft_max: u16,
     force_split: bool,
@@ -1283,7 +1286,8 @@ async fn start_llama(
     };
 
     // Look up mmproj for vision models
-    let mmproj_path = crate::models::find_mmproj_path(model_name, model);
+    let mmproj_path =
+        crate::models::resolve_mmproj_path(model_name, model, explicit_mmproj.as_deref());
 
     // In split mode (pipeline parallel), pass total group VRAM so context size
     // accounts for the host only holding its share of layers. KV cache is also
