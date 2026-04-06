@@ -12,7 +12,7 @@ use self::local::{
 use self::proxy::{api_proxy, bootstrap_proxy};
 use crate::api;
 use crate::cli::{Cli, Command, RuntimeSurface};
-use crate::inference::{election, launch};
+use crate::inference::{election, launch, moe};
 use crate::mesh;
 use crate::mesh::NodeRole;
 use crate::models;
@@ -338,63 +338,7 @@ pub(crate) async fn run() -> Result<()> {
 
 /// Resolve a model path: local file, catalog name, or HuggingFace URL.
 async fn resolve_model(input: &std::path::Path) -> Result<PathBuf> {
-    let s = input.to_string_lossy();
-
-    // Already a local file
-    if input.exists() {
-        return Ok(input.to_path_buf());
-    }
-
-    // Check managed model directories for just a filename
-    if !s.contains('/') {
-        let installed_name = s.strip_suffix(".gguf").unwrap_or(&s);
-        let installed_path = models::find_model_path(installed_name);
-        if installed_path.exists() {
-            return Ok(installed_path);
-        }
-        // Try catalog match
-        if let Some(entry) = catalog::find_model(&s) {
-            return catalog::download_model(entry).await;
-        }
-        anyhow::bail!(
-            "Model not found: {}\nNot a local file, not in the Hugging Face cache, not in catalog.\n\
-             Use a path, a catalog name (run `mesh-llm download` to list), or a HuggingFace URL.",
-            s
-        );
-    }
-
-    // HuggingFace URL (auto-detects split GGUFs like -00001-of-00004.gguf)
-    if s.starts_with("https://huggingface.co/") || s.starts_with("http://huggingface.co/") {
-        let filename = s
-            .rsplit('/')
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("Can't extract filename from URL: {}", s))?;
-        return catalog::download_hf_split_gguf(&s, filename).await;
-    }
-
-    // HF shorthand: org/repo/file.gguf
-    if s.contains('/') && s.ends_with(".gguf") {
-        if s.contains("/resolve/") {
-            let filename = s.rsplit('/').next().unwrap();
-            return catalog::download_hf_split_gguf(&s, filename).await;
-        }
-        let parts: Vec<&str> = s.splitn(3, '/').collect();
-        if parts.len() != 3 {
-            anyhow::bail!("Can't parse HF shorthand: {}. Use org/repo/file.gguf", s);
-        }
-        let (repo_tail, revision) = match parts[1].split_once('@') {
-            Some((repo, revision)) => (repo, Some(revision)),
-            None => (parts[1], None),
-        };
-        return catalog::download_hf_repo_file(
-            &format!("{}/{}", parts[0], repo_tail),
-            revision,
-            parts[2],
-        )
-        .await;
-    }
-
-    anyhow::bail!("Model not found: {}", s);
+    models::resolve_model_spec(input).await
 }
 
 fn cli_has_explicit_models(cli: &Cli) -> bool {
@@ -1383,6 +1327,7 @@ async fn run_auto(
     let console_state_for_primary_process = console_state.clone();
     let primary_process_model_name = model_name.clone();
     let primary_model_name_for_advertise = model_name.clone();
+    let moe_runtime_options = moe::MoeRuntimeOptions::default();
     let primary_mmproj = primary_startup_model
         .as_ref()
         .and_then(|model| model.mmproj_path.clone());
@@ -1394,7 +1339,7 @@ async fn run_auto(
         election::election_loop(
             node2, tunnel_mgr2, api_port, rpc_port, bin_dir2, model2, model_name_for_election,
             primary_mmproj,
-            draft2, draft_max, force_split, llama_flavor, primary_ctx_size, primary_target_tx,
+            draft2, draft_max, force_split, llama_flavor, primary_ctx_size, moe_runtime_options, primary_target_tx,
             primary_stop_rx,
             move |is_host, llama_ready| {
                 let advertise_node = node_for_cb.clone();
@@ -1517,6 +1462,7 @@ async fn run_auto(
             let extra_model_name = extra_name.clone();
             let api_port_extra = api_port;
             let extra_llama_flavor = cli.llama_flavor;
+            let extra_moe_runtime_options = moe::MoeRuntimeOptions::default();
             let extra_console_state = console_state.clone();
             let extra_model_name_for_status = extra_model_name.clone();
             let extra_model_name_for_process = extra_model_name.clone();
@@ -1531,7 +1477,7 @@ async fn run_auto(
                 election::election_loop(
                     extra_node, extra_tunnel, api_port_extra, 0, extra_bin, extra_path, extra_model_name.clone(),
                     extra_mmproj,
-                    None, 8, false, extra_llama_flavor, extra_ctx_size, extra_target_tx,
+                    None, 8, false, extra_llama_flavor, extra_ctx_size, extra_moe_runtime_options, extra_target_tx,
                     extra_stop_rx,
                     move |is_host, llama_ready| {
                         let advertise_node = extra_node_for_advertise.clone();

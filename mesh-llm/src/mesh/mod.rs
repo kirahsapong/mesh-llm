@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use tokio::sync::{watch, Mutex};
 
+use crate::inference::moe;
 use crate::protocol::*;
 
 /// Demand signal for a model — tracks interest via API requests and --model declarations.
@@ -387,7 +388,26 @@ fn descriptor_from_identity(
     identity.model_name = model_name.to_string();
     let path = crate::models::find_model_path(model_name);
     let catalog = crate::models::find_catalog_model_exact(model_name);
-    let topology = crate::models::infer_local_model_topology(&path, catalog);
+    let mut topology = crate::models::infer_local_model_topology(&path, catalog);
+    if topology.is_none() {
+        if let Some(info) = moe::detect_moe(&path) {
+            topology = Some(crate::models::ModelTopology {
+                moe: Some(crate::models::ModelMoeInfo {
+                    expert_count: info.expert_count,
+                    used_expert_count: info.expert_used_count,
+                    min_experts_per_node: None,
+                    source: Some("gguf_header".to_string()),
+                    ranking_source: None,
+                    ranking_origin: None,
+                    ranking: Vec::new(),
+                    ranking_prompt_count: None,
+                    ranking_tokens: None,
+                    ranking_layer_scope: None,
+                }),
+            });
+        }
+    }
+    enrich_topology_with_local_shared_ranking(path.as_path(), &mut topology);
     let mut capabilities =
         crate::models::capabilities::infer_local_model_capabilities(model_name, &path, catalog);
     capabilities.moe = capabilities.moe
@@ -400,6 +420,306 @@ fn descriptor_from_identity(
         capabilities,
         topology,
     }
+}
+
+fn enrich_topology_with_local_shared_ranking(
+    path: &std::path::Path,
+    topology: &mut Option<crate::models::ModelTopology>,
+) {
+    let Some(moe_info) = topology.as_mut().and_then(|value| value.moe.as_mut()) else {
+        return;
+    };
+    let Some(artifact) = moe::best_shared_ranking_artifact(path) else {
+        return;
+    };
+    moe_info.ranking_source = Some(artifact.kind.label().to_string());
+    moe_info.ranking_origin = Some(artifact.origin.label().to_string());
+    moe_info.ranking = artifact.ranking;
+    moe_info.ranking_prompt_count = artifact.micro_prompt_count.map(|value| value as u32);
+    moe_info.ranking_tokens = artifact.micro_tokens;
+    moe_info.ranking_layer_scope = artifact.micro_layer_scope.map(|scope| match scope {
+        moe::MoeMicroLayerScope::All => "all".to_string(),
+        moe::MoeMicroLayerScope::First => "first".to_string(),
+    });
+}
+
+fn identities_match_exact(local: &ServedModelIdentity, remote: &ServedModelIdentity) -> bool {
+    if let (Some(local_hash), Some(remote_hash)) =
+        (local.identity_hash.as_ref(), remote.identity_hash.as_ref())
+    {
+        return local_hash == remote_hash;
+    }
+    if let (Some(local_ref), Some(remote_ref)) =
+        (local.canonical_ref.as_ref(), remote.canonical_ref.as_ref())
+    {
+        return local_ref == remote_ref;
+    }
+    matches!(
+        (
+            local.repository.as_ref(),
+            local.revision.as_ref(),
+            local.artifact.as_ref(),
+            remote.repository.as_ref(),
+            remote.revision.as_ref(),
+            remote.artifact.as_ref(),
+        ),
+        (
+            Some(local_repo),
+            Some(local_revision),
+            Some(local_artifact),
+            Some(remote_repo),
+            Some(remote_revision),
+            Some(remote_artifact),
+        ) if local_repo == remote_repo
+            && local_revision == remote_revision
+            && local_artifact == remote_artifact
+    )
+}
+
+fn shared_ranking_from_descriptor(
+    descriptor: &ServedModelDescriptor,
+) -> Option<moe::SharedRankingArtifact> {
+    let moe_info = descriptor.topology.as_ref()?.moe.as_ref()?;
+    if moe_info.ranking.is_empty() {
+        return None;
+    }
+    let kind = match moe_info.ranking_source.as_deref()? {
+        "analyze" => moe::SharedRankingKind::Analyze,
+        "micro-analyze" => moe::SharedRankingKind::MicroAnalyze,
+        _ => return None,
+    };
+    let micro_layer_scope = match moe_info.ranking_layer_scope.as_deref() {
+        Some("all") => Some(moe::MoeMicroLayerScope::All),
+        Some("first") => Some(moe::MoeMicroLayerScope::First),
+        _ => None,
+    };
+    Some(moe::SharedRankingArtifact {
+        kind,
+        origin: moe_info
+            .ranking_origin
+            .as_deref()
+            .and_then(moe::SharedRankingOrigin::from_label)
+            .unwrap_or(moe::SharedRankingOrigin::LegacyCache),
+        ranking: moe_info.ranking.clone(),
+        micro_prompt_count: moe_info.ranking_prompt_count.map(|value| value as usize),
+        micro_tokens: moe_info.ranking_tokens,
+        micro_layer_scope,
+    })
+}
+
+fn import_remote_moe_rankings(descriptors: &[ServedModelDescriptor]) -> bool {
+    let mut imported = false;
+    for descriptor in descriptors {
+        let Some(remote_artifact) = shared_ranking_from_descriptor(descriptor) else {
+            continue;
+        };
+        let path = crate::models::find_model_path(&descriptor.identity.model_name);
+        if !path.exists() {
+            continue;
+        }
+        let Some(local_identity) = identity_from_model_path(&descriptor.identity.model_name, &path)
+        else {
+            continue;
+        };
+        if !identities_match_exact(&local_identity, &descriptor.identity) {
+            continue;
+        }
+        let imported_artifact = moe::SharedRankingArtifact {
+            origin: moe::SharedRankingOrigin::PeerImport,
+            ..remote_artifact
+        };
+        if moe::cache_shared_ranking_if_stronger(path.as_path(), &imported_artifact)
+            .unwrap_or(false)
+        {
+            imported = true;
+        }
+    }
+    imported
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HeartbeatFailurePolicy {
+    allow_recent_inbound_grace: bool,
+    failure_threshold: u32,
+}
+
+fn descriptors_share_exact_moe_identity(
+    local: &[ServedModelDescriptor],
+    remote: &[ServedModelDescriptor],
+) -> bool {
+    local.iter().any(|local_descriptor| {
+        local_descriptor
+            .topology
+            .as_ref()
+            .and_then(|topology| topology.moe.as_ref())
+            .is_some()
+            && remote.iter().any(|remote_descriptor| {
+                remote_descriptor
+                    .topology
+                    .as_ref()
+                    .and_then(|topology| topology.moe.as_ref())
+                    .is_some()
+                    && identities_match_exact(
+                        &local_descriptor.identity,
+                        &remote_descriptor.identity,
+                    )
+            })
+    })
+}
+
+fn heartbeat_failure_policy_for_peer(
+    local_descriptors: &[ServedModelDescriptor],
+    local_runtime: &[ModelRuntimeDescriptor],
+    peer: &PeerInfo,
+) -> HeartbeatFailurePolicy {
+    if descriptors_share_exact_moe_identity(local_descriptors, &peer.served_model_descriptors) {
+        if exact_moe_starting_during_convergence(local_descriptors, local_runtime, peer) {
+            return HeartbeatFailurePolicy {
+                allow_recent_inbound_grace: true,
+                // Split convergence can spend minutes in split generation + shard
+                // load. During that window, prefer serving continuity over fast
+                // heartbeat-only fail-down; request-path failures still remove
+                // dead shard peers immediately.
+                failure_threshold: 4,
+            };
+        }
+        HeartbeatFailurePolicy {
+            allow_recent_inbound_grace: false,
+            // Shared MoE peers should fail down faster than generic peers, but a
+            // single heartbeat miss is too aggressive on relay-heavy or flaky
+            // links. Request-path shard failures still trigger immediate
+            // fail-down; heartbeat-only loss needs a second miss to avoid
+            // tearing down a healthy split on one transient blip.
+            failure_threshold: 2,
+        }
+    } else {
+        HeartbeatFailurePolicy {
+            allow_recent_inbound_grace: true,
+            failure_threshold: 2,
+        }
+    }
+}
+
+const MOE_RECOVERY_PROBATION_SECS: u64 = 30;
+
+fn runtime_model_is_starting(runtimes: &[ModelRuntimeDescriptor], model_name: &str) -> bool {
+    runtimes
+        .iter()
+        .any(|runtime| runtime.model_name == model_name && !runtime.ready)
+}
+
+fn exact_moe_starting_during_convergence(
+    local_descriptors: &[ServedModelDescriptor],
+    local_runtime: &[ModelRuntimeDescriptor],
+    peer: &PeerInfo,
+) -> bool {
+    local_descriptors.iter().any(|local_descriptor| {
+        let local_moe = local_descriptor
+            .topology
+            .as_ref()
+            .and_then(|topology| topology.moe.as_ref())
+            .is_some();
+        if !local_moe {
+            return false;
+        }
+
+        peer.served_model_descriptors
+            .iter()
+            .any(|remote_descriptor| {
+                let remote_moe = remote_descriptor
+                    .topology
+                    .as_ref()
+                    .and_then(|topology| topology.moe.as_ref())
+                    .is_some();
+                if !remote_moe
+                    || !identities_match_exact(
+                        &local_descriptor.identity,
+                        &remote_descriptor.identity,
+                    )
+                {
+                    return false;
+                }
+
+                let model_name = &local_descriptor.identity.model_name;
+                runtime_model_is_starting(local_runtime, model_name)
+                    || runtime_model_is_starting(&peer.served_model_runtime, model_name)
+            })
+    })
+}
+
+fn moe_recovery_ready_at(
+    recovered_at: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    recovered_at
+        .map(|recovered_at| {
+            now.duration_since(recovered_at).as_secs() >= MOE_RECOVERY_PROBATION_SECS
+        })
+        .unwrap_or(true)
+}
+
+pub(crate) fn descriptors_share_exact_moe_identity_for_model(
+    local: &[ServedModelDescriptor],
+    remote: &[ServedModelDescriptor],
+    model_name: &str,
+) -> Option<bool> {
+    let local_moe: Vec<&ServedModelDescriptor> = local
+        .iter()
+        .filter(|descriptor| {
+            descriptor.identity.model_name == model_name
+                && descriptor
+                    .topology
+                    .as_ref()
+                    .and_then(|topology| topology.moe.as_ref())
+                    .is_some()
+        })
+        .collect();
+    let remote_moe: Vec<&ServedModelDescriptor> = remote
+        .iter()
+        .filter(|descriptor| {
+            descriptor.identity.model_name == model_name
+                && descriptor
+                    .topology
+                    .as_ref()
+                    .and_then(|topology| topology.moe.as_ref())
+                    .is_some()
+        })
+        .collect();
+    if local_moe.is_empty() || remote_moe.is_empty() {
+        return None;
+    }
+    Some(local_moe.iter().any(|local_descriptor| {
+        remote_moe.iter().any(|remote_descriptor| {
+            identities_match_exact(&local_descriptor.identity, &remote_descriptor.identity)
+        })
+    }))
+}
+
+pub(crate) fn peer_is_eligible_for_active_moe(
+    local_descriptors: &[ServedModelDescriptor],
+    peer: &PeerInfo,
+    model_name: &str,
+) -> bool {
+    let declares_model = peer.is_assigned_model(model_name)
+        || peer
+            .requested_models
+            .iter()
+            .any(|requested| requested == model_name);
+    if !declares_model || matches!(peer.role, NodeRole::Client) {
+        return false;
+    }
+
+    let identity_matches = descriptors_share_exact_moe_identity_for_model(
+        local_descriptors,
+        &peer.served_model_descriptors,
+        model_name,
+    )
+    .unwrap_or(true);
+    if !identity_matches {
+        return false;
+    }
+
+    moe_recovery_ready_at(peer.moe_recovered_at, std::time::Instant::now())
 }
 
 fn parse_hf_ref_parts(input: &str) -> Option<(String, Option<String>, String)> {
@@ -764,6 +1084,9 @@ pub struct PeerInfo {
     /// Last time we directly communicated with this peer (gossip, heartbeat, tunnel).
     /// Peers not seen in PEER_STALE_SECS are pruned from gossip and eventually removed.
     pub last_seen: std::time::Instant,
+    /// When this peer returned after being considered dead. MoE scale-up should
+    /// wait briefly before treating the peer as eligible again.
+    pub moe_recovered_at: Option<std::time::Instant>,
     /// mesh-llm version (e.g. "0.23.0")
     pub version: Option<String>,
     /// GPU name/model (e.g. "NVIDIA A100", "Apple M4 Max")
@@ -803,6 +1126,7 @@ impl PeerInfo {
             available_models: ann.available_models.clone(),
             requested_models: ann.requested_models.clone(),
             last_seen: std::time::Instant::now(),
+            moe_recovered_at: None,
             version: ann.version.clone(),
             gpu_name: ann.gpu_name.clone(),
             hostname: ann.hostname.clone(),
@@ -835,6 +1159,10 @@ impl PeerInfo {
         } else {
             self.is_assigned_model(model)
         }
+    }
+
+    pub fn moe_recovery_ready(&self) -> bool {
+        moe_recovery_ready_at(self.moe_recovered_at, std::time::Instant::now())
     }
 
     pub fn advertised_context_length(&self, model: &str) -> Option<u32> {
@@ -1421,6 +1749,16 @@ impl Node {
         })
     }
 
+    #[cfg(test)]
+    pub async fn insert_test_peer(&self, peer: PeerInfo) {
+        self.state.lock().await.peers.insert(peer.id, peer);
+    }
+
+    #[cfg(test)]
+    pub async fn has_test_peer(&self, id: EndpointId) -> bool {
+        self.state.lock().await.peers.contains_key(&id)
+    }
+
     pub fn invite_token(&self) -> String {
         let mut addr = self.endpoint.addr();
         // Inject STUN-discovered public address if relay STUN didn't provide one.
@@ -1610,6 +1948,32 @@ impl Node {
         }
     }
 
+    pub async fn set_model_runtime_starting(&self, model_name: &str) {
+        let identity_hash = self
+            .served_model_descriptors
+            .lock()
+            .await
+            .iter()
+            .find(|descriptor| descriptor.identity.model_name == model_name)
+            .and_then(|descriptor| descriptor.identity.identity_hash.clone());
+        let mut runtimes = self.model_runtime_descriptors.lock().await;
+        if let Some(runtime) = runtimes
+            .iter_mut()
+            .find(|runtime| runtime.model_name == model_name)
+        {
+            runtime.identity_hash = identity_hash.or_else(|| runtime.identity_hash.clone());
+            runtime.context_length = None;
+            runtime.ready = false;
+        } else {
+            runtimes.push(ModelRuntimeDescriptor {
+                model_name: model_name.to_string(),
+                identity_hash,
+                context_length: None,
+                ready: false,
+            });
+        }
+    }
+
     pub async fn local_model_context_length(&self, model_name: &str) -> Option<u32> {
         self.model_runtime_descriptors
             .lock()
@@ -1630,6 +1994,10 @@ impl Node {
             .peers
             .get(&peer_id)
             .and_then(|peer| peer.advertised_context_length(model_name))
+    }
+
+    pub async fn served_model_descriptors(&self) -> Vec<ServedModelDescriptor> {
+        self.served_model_descriptors.lock().await.clone()
     }
 
     pub async fn serving_models(&self) -> Vec<String> {
@@ -2097,17 +2465,35 @@ impl Node {
                         }
                         fail_counts.remove(&peer_id);
                     } else {
+                        let (recently_seen, failure_policy) = {
+                            let state = node.state.lock().await;
+                            let peer = state.peers.get(&peer_id).cloned();
+                            drop(state);
+                            let local_descriptors =
+                                node.served_model_descriptors.lock().await.clone();
+                            let local_runtime = node.model_runtime_descriptors.lock().await.clone();
+                            let policy = peer
+                                .as_ref()
+                                .map(|peer| {
+                                    heartbeat_failure_policy_for_peer(
+                                        &local_descriptors,
+                                        &local_runtime,
+                                        peer,
+                                    )
+                                })
+                                .unwrap_or(HeartbeatFailurePolicy {
+                                    allow_recent_inbound_grace: true,
+                                    failure_threshold: 2,
+                                });
+                            let recently_seen = peer
+                                .as_ref()
+                                .map(|peer| peer.last_seen.elapsed().as_secs() < PEER_STALE_SECS)
+                                .unwrap_or(false);
+                            (recently_seen, policy)
+                        };
                         // Check if peer has contacted US recently (inbound gossip).
                         // If so, peer is alive — we just can't reach them outbound (NAT).
-                        let recently_seen = {
-                            let state = node.state.lock().await;
-                            state
-                                .peers
-                                .get(&peer_id)
-                                .map(|p| p.last_seen.elapsed().as_secs() < PEER_STALE_SECS)
-                                .unwrap_or(false)
-                        };
-                        if recently_seen {
+                        if recently_seen && failure_policy.allow_recent_inbound_grace {
                             // Peer is alive via inbound, don't count as failure
                             if fail_counts.contains_key(&peer_id) {
                                 eprintln!("💚 Heartbeat: {} outbound failed but seen recently (inbound alive)", peer_id.fmt_short());
@@ -2116,19 +2502,25 @@ impl Node {
                         } else {
                             let count = fail_counts.entry(peer_id).or_default();
                             *count += 1;
-                            if *count >= 2 {
-                                // Only add to dead_peers on confirmed death (2 strikes),
-                                // not on first timeout — a single timeout shouldn't block
-                                // incoming gossip from an otherwise-alive peer.
+                            if *count >= failure_policy.failure_threshold {
+                                // Generic peers require 2 misses so a single timeout doesn't
+                                // evict an otherwise-alive inbound-only peer. Shared MoE peers
+                                // are stricter: one missed heartbeat should trigger re-election.
                                 node.state.lock().await.dead_peers.insert(peer_id);
-                                eprintln!("💔 Heartbeat: {} unreachable ({} failures), removing + broadcasting death", peer_id.fmt_short(), count);
+                                eprintln!(
+                                    "💔 Heartbeat: {} unreachable ({} failure{}), removing + broadcasting death",
+                                    peer_id.fmt_short(),
+                                    count,
+                                    if *count == 1 { "" } else { "s" }
+                                );
                                 fail_counts.remove(&peer_id);
                                 node.handle_peer_death(peer_id).await;
                             } else {
                                 eprintln!(
-                                    "💛 Heartbeat: {} unreachable ({}/2), will retry",
+                                    "💛 Heartbeat: {} unreachable ({}/{}), will retry",
                                     peer_id.fmt_short(),
-                                    count
+                                    count,
+                                    failure_policy.failure_threshold
                                 );
                             }
                         }
@@ -3716,13 +4108,16 @@ impl Node {
     }
 
     async fn add_peer(&self, id: EndpointId, addr: EndpointAddr, ann: &PeerAnnouncement) {
+        let imported_ranking = import_remote_moe_rankings(&ann.served_model_descriptors);
         let mut state = self.state.lock().await;
         if id == self.endpoint.id() {
             return;
         }
+        let now = std::time::Instant::now();
         // If this peer was previously dead, clear it — add_peer is only called
         // after a successful gossip exchange, which is proof of life.
-        if state.dead_peers.remove(&id) {
+        let recovered = state.dead_peers.remove(&id);
+        if recovered {
             eprintln!(
                 "🔄 Peer {} back from the dead (successful gossip)",
                 id.fmt_short()
@@ -3758,7 +4153,10 @@ impl Node {
             existing.hosted_models_known = ann.hosted_models.is_some();
             existing.available_models.clear();
             existing.requested_models = ann.requested_models.clone();
-            existing.last_seen = std::time::Instant::now();
+            existing.last_seen = now;
+            if recovered {
+                existing.moe_recovered_at = Some(now);
+            }
             existing.served_model_descriptors = ann.served_model_descriptors.clone();
             existing.served_model_runtime = ann.served_model_runtime.clone();
             if ann.version.is_some() {
@@ -3802,6 +4200,9 @@ impl Node {
                     .await;
                 }
             }
+            if imported_ranking {
+                self.refresh_served_model_descriptors().await;
+            }
             return;
         }
         tracing::info!(
@@ -3813,7 +4214,10 @@ impl Node {
             ann.available_models,
             state.peers.len() + 1
         );
-        let peer = PeerInfo::from_announcement(id, addr, ann);
+        let mut peer = PeerInfo::from_announcement(id, addr, ann);
+        if recovered {
+            peer.moe_recovered_at = Some(now);
+        }
         state.peers.insert(id, peer.clone());
         let count = state.peers.len();
         drop(state);
@@ -3824,6 +4228,9 @@ impl Node {
             String::new(),
         )
         .await;
+        if imported_ranking {
+            self.refresh_served_model_descriptors().await;
+        }
     }
 
     /// Update a peer learned transitively through gossip (not directly connected).
@@ -3837,6 +4244,7 @@ impl Node {
         addr: &EndpointAddr,
         ann: &PeerAnnouncement,
     ) {
+        let imported_ranking = import_remote_moe_rankings(&ann.served_model_descriptors);
         let mut state = self.state.lock().await;
         if id == self.endpoint.id() {
             return;
@@ -3872,6 +4280,9 @@ impl Node {
                     .await;
                 }
             }
+            if imported_ranking {
+                self.refresh_served_model_descriptors().await;
+            }
         } else {
             // New transitive peer — add with last_seen = now but no peer_change event.
             // It will get pruned after PEER_STALE_SECS*2 if never directly contacted.
@@ -3884,6 +4295,9 @@ impl Node {
                 String::new(),
             )
             .await;
+            if imported_ranking {
+                self.refresh_served_model_descriptors().await;
+            }
         }
     }
 
@@ -4803,6 +5217,7 @@ mod tests {
             available_models: vec![],
             requested_models: vec![],
             last_seen: std::time::Instant::now(),
+            moe_recovered_at: None,
             version: None,
             gpu_name: None,
             hostname: None,
@@ -4815,6 +5230,174 @@ mod tests {
             served_model_descriptors: vec![],
             served_model_runtime: vec![],
         }
+    }
+
+    fn make_test_moe_descriptor(model_name: &str, identity_hash: &str) -> ServedModelDescriptor {
+        ServedModelDescriptor {
+            identity: ServedModelIdentity {
+                model_name: model_name.to_string(),
+                is_primary: true,
+                source_kind: ModelSourceKind::HuggingFace,
+                canonical_ref: Some(format!("hf://{identity_hash}")),
+                repository: Some("Qwen".to_string()),
+                revision: Some("main".to_string()),
+                artifact: Some(format!("{model_name}.gguf")),
+                local_file_name: Some(format!("{model_name}.gguf")),
+                identity_hash: Some(identity_hash.to_string()),
+            },
+            capabilities: crate::models::ModelCapabilities {
+                moe: true,
+                ..Default::default()
+            },
+            topology: Some(crate::models::ModelTopology {
+                moe: Some(crate::models::ModelMoeInfo {
+                    expert_count: 512,
+                    used_expert_count: 10,
+                    min_experts_per_node: Some(160),
+                    source: Some("test".to_string()),
+                    ranking_source: None,
+                    ranking_origin: None,
+                    ranking: Vec::new(),
+                    ranking_prompt_count: None,
+                    ranking_tokens: None,
+                    ranking_layer_scope: None,
+                }),
+            }),
+        }
+    }
+
+    fn make_test_endpoint_id(seed: u8) -> EndpointId {
+        let mut bytes = [0u8; 32];
+        bytes[0] = seed;
+        EndpointId::from(SecretKey::from_bytes(&bytes).public())
+    }
+
+    #[test]
+    fn shared_exact_moe_identity_uses_stricter_heartbeat_without_inbound_grace() {
+        let mut peer = make_test_peer_info(make_test_endpoint_id(7));
+        peer.served_model_descriptors = vec![make_test_moe_descriptor(
+            "Qwen3-Coder-Next-Q4_K_M",
+            "same-model",
+        )];
+        let local_descriptors = vec![make_test_moe_descriptor(
+            "Qwen3-Coder-Next-Q4_K_M",
+            "same-model",
+        )];
+        let local_runtime = vec![];
+
+        let policy = heartbeat_failure_policy_for_peer(&local_descriptors, &local_runtime, &peer);
+
+        assert_eq!(
+            policy,
+            HeartbeatFailurePolicy {
+                allow_recent_inbound_grace: false,
+                failure_threshold: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn non_matching_or_non_moe_peers_keep_default_heartbeat_grace() {
+        let mut peer = make_test_peer_info(make_test_endpoint_id(8));
+        peer.served_model_descriptors = vec![make_test_moe_descriptor(
+            "Qwen3-Coder-Next-Q4_K_M",
+            "remote-model",
+        )];
+        let local_descriptors = vec![make_test_moe_descriptor(
+            "Qwen3-Coder-Next-Q4_K_M",
+            "local-model",
+        )];
+        let local_runtime = vec![];
+
+        let policy = heartbeat_failure_policy_for_peer(&local_descriptors, &local_runtime, &peer);
+
+        assert_eq!(
+            policy,
+            HeartbeatFailurePolicy {
+                allow_recent_inbound_grace: true,
+                failure_threshold: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn shared_exact_moe_startup_relaxes_heartbeat_during_convergence() {
+        let mut peer = make_test_peer_info(make_test_endpoint_id(11));
+        peer.served_model_descriptors = vec![make_test_moe_descriptor(
+            "Qwen3-Coder-Next-Q4_K_M",
+            "same-model",
+        )];
+        let local_descriptors = vec![make_test_moe_descriptor(
+            "Qwen3-Coder-Next-Q4_K_M",
+            "same-model",
+        )];
+        let local_runtime = vec![ModelRuntimeDescriptor {
+            model_name: "Qwen3-Coder-Next-Q4_K_M".to_string(),
+            identity_hash: Some("same-model".to_string()),
+            context_length: None,
+            ready: false,
+        }];
+
+        let policy = heartbeat_failure_policy_for_peer(&local_descriptors, &local_runtime, &peer);
+
+        assert_eq!(
+            policy,
+            HeartbeatFailurePolicy {
+                allow_recent_inbound_grace: true,
+                failure_threshold: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn recovered_moe_peer_stays_out_of_active_placement_until_probation_expires() {
+        let mut peer = make_test_peer_info(make_test_endpoint_id(9));
+        peer.serving_models = vec!["Qwen3-Coder-Next-Q4_K_M".to_string()];
+        peer.served_model_descriptors = vec![make_test_moe_descriptor(
+            "Qwen3-Coder-Next-Q4_K_M",
+            "same-model",
+        )];
+        let local_descriptors = vec![make_test_moe_descriptor(
+            "Qwen3-Coder-Next-Q4_K_M",
+            "same-model",
+        )];
+
+        peer.moe_recovered_at = Some(std::time::Instant::now());
+        assert!(!peer_is_eligible_for_active_moe(
+            &local_descriptors,
+            &peer,
+            "Qwen3-Coder-Next-Q4_K_M"
+        ));
+
+        peer.moe_recovered_at = Some(
+            std::time::Instant::now()
+                - std::time::Duration::from_secs(MOE_RECOVERY_PROBATION_SECS + 1),
+        );
+        assert!(peer_is_eligible_for_active_moe(
+            &local_descriptors,
+            &peer,
+            "Qwen3-Coder-Next-Q4_K_M"
+        ));
+    }
+
+    #[test]
+    fn requested_model_peer_is_eligible_for_active_moe_during_startup() {
+        let mut peer = make_test_peer_info(make_test_endpoint_id(10));
+        peer.requested_models = vec!["Qwen3-Coder-Next-Q4_K_M".to_string()];
+        peer.served_model_descriptors = vec![make_test_moe_descriptor(
+            "Qwen3-Coder-Next-Q4_K_M",
+            "same-model",
+        )];
+        let local_descriptors = vec![make_test_moe_descriptor(
+            "Qwen3-Coder-Next-Q4_K_M",
+            "same-model",
+        )];
+
+        assert!(peer_is_eligible_for_active_moe(
+            &local_descriptors,
+            &peer,
+            "Qwen3-Coder-Next-Q4_K_M"
+        ));
     }
 
     #[test]
@@ -7045,6 +7628,7 @@ mod tests {
             available_models: vec![],
             requested_models: vec![],
             last_seen: std::time::Instant::now(),
+            moe_recovered_at: None,
             version: None,
             gpu_name: None,
             hostname: None,

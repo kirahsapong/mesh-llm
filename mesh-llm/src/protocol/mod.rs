@@ -413,6 +413,7 @@ mod tests {
             available_models: vec![],
             requested_models: vec![],
             last_seen: std::time::Instant::now(),
+            moe_recovered_at: None,
             version: None,
             gpu_name: None,
             hostname: None,

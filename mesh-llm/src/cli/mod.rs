@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+use crate::cli::benchmark::BenchmarkCommand;
 use crate::cli::runtime::RuntimeCommand;
 
 #[derive(Subcommand, Debug)]
@@ -26,6 +27,7 @@ pub(crate) enum AuthCommand {
     },
 }
 
+pub(crate) mod benchmark;
 pub(crate) mod commands;
 pub mod models;
 pub(crate) mod runtime;
@@ -57,7 +59,7 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub(crate) auto: bool,
 
-    /// Model to serve (path, catalog name, or HuggingFace URL).
+    /// Model to serve (path, catalog name, HF exact ref, or HuggingFace URL).
     #[arg(long)]
     pub(crate) model: Vec<PathBuf>,
 
@@ -130,8 +132,8 @@ pub(crate) struct Cli {
     #[arg(long, hide = true)]
     pub(crate) ctx_size: Option<u32>,
 
-    /// Limit VRAM advertised to the mesh (GB).
-    #[arg(long, hide = true)]
+    /// Cap VRAM used for planning, local-fit decisions, and mesh advertisement (GB).
+    #[arg(long)]
     pub(crate) max_vram: Option<f64>,
 
     /// Enumerate host hardware (GPU name, hostname) at startup.
@@ -321,6 +323,12 @@ pub(crate) enum Command {
     Plugin {
         #[command(subcommand)]
         command: PluginCommand,
+    },
+    /// Benchmark and compare model/runtime strategies.
+    #[command(hide = true)]
+    Benchmark {
+        #[command(subcommand)]
+        command: BenchmarkCommand,
     },
     /// Manage owner identity and keystore.
     Auth {
