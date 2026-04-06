@@ -8502,6 +8502,12 @@ mod tests {
     /// Helper: create a test node that has a cached owner_id and a config_state
     /// pointing to the given directory. The `signing_key` is used to derive the
     /// owner fingerprint; it is NOT stored by the node (tests sign externally).
+    /// Create a test `Node` with a cached `owner_id` derived from `signing_key` and a
+    /// `ConfigState` whose backing file lives in `config_dir`.
+    ///
+    /// The `signing_key` is used **only** to derive the owner fingerprint stored in
+    /// `cached_owner_id`; the node does not retain the key itself. Callers that need
+    /// to sign `ConfigPush` messages must hold on to `signing_key` themselves.
     async fn make_test_node_with_owner(
         role: super::NodeRole,
         signing_key: &ed25519_dalek::SigningKey,
@@ -8590,6 +8596,11 @@ mod tests {
     }
 
     /// Helper: build and sign a ConfigPush proto for the given node/owner/config.
+    /// Build a `ConfigPush` proto that is correctly signed with `signing_key`.
+    ///
+    /// The resulting push targets `target_node_id`, is attributed to `requester_id`,
+    /// and carries `expected_revision` for CAS enforcement. The signature covers the
+    /// canonical protobuf encoding of the push with the `signature` field cleared.
     fn build_signed_config_push(
         signing_key: &ed25519_dalek::SigningKey,
         requester_id: &EndpointId,
@@ -8619,6 +8630,9 @@ mod tests {
     }
 
     /// Wait until `node` has `target` in its peers list. Times out after 5 s.
+    /// Poll `node.peers()` until `target` appears in the list.
+    ///
+    /// Panics (via `expect`) if `target` is not admitted within 5 seconds.
     async fn wait_for_peer(node: &Node, target: EndpointId) {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {

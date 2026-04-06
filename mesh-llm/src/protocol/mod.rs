@@ -260,11 +260,7 @@ impl ValidateControlFrame for crate::proto::node::ConfigSnapshotResponse {
         }
         // Error responses have empty node_id/config_hash/config — skip structural
         // checks so callers can surface the actual error message.
-        let is_error = self
-            .error
-            .as_deref()
-            .map(|e| !e.is_empty())
-            .unwrap_or(false);
+        let is_error = matches!(self.error.as_deref(), Some(s) if !s.is_empty());
         if !is_error {
             validate_endpoint_id_length(self.node_id.len())?;
             validate_config_hash_length(self.config_hash.len())?;
