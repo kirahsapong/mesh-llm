@@ -16,10 +16,9 @@ use std::sync::Arc;
 use tokio::sync::{watch, Mutex};
 
 use crate::crypto::{
-    certificate_needs_renewal, default_node_ownership_path, load_node_ownership,
-    save_node_ownership, sign_node_ownership, verify_node_ownership, OwnershipStatus,
-    OwnershipSummary, SignedNodeOwnership, TrustPolicy, TrustStore,
-    DEFAULT_NODE_CERT_LIFETIME_SECS, DEFAULT_NODE_CERT_RENEW_WINDOW_SECS,
+    default_node_ownership_path, save_node_ownership, sign_node_ownership, verify_node_ownership,
+    OwnershipStatus, OwnershipSummary, SignedNodeOwnership, TrustPolicy, TrustStore,
+    DEFAULT_NODE_CERT_LIFETIME_SECS,
 };
 use crate::inference::moe;
 use crate::protocol::*;
@@ -826,23 +825,10 @@ fn load_or_refresh_owner_attestation(
     node_label: Option<String>,
     hostname_hint: Option<String>,
 ) -> Result<SignedNodeOwnership> {
+    // Always sign a fresh attestation on startup when the owner key is available.
+    // This ensures that key rotation is always reflected immediately and no stale
+    // certificate can persist across restarts.
     let path = default_node_ownership_path()?;
-    if path.exists() {
-        if let Ok(existing) = load_node_ownership(&path) {
-            let owner_matches = existing.claim.owner_id == owner_keypair.owner_id()
-                && existing.claim.node_endpoint_id == hex::encode(endpoint_id.as_bytes());
-            if owner_matches
-                && !certificate_needs_renewal(
-                    &existing,
-                    DEFAULT_NODE_CERT_RENEW_WINDOW_SECS,
-                    current_time_unix_ms(),
-                )
-            {
-                return Ok(existing);
-            }
-        }
-    }
-
     let ownership = sign_node_ownership(
         owner_keypair,
         endpoint_id.as_bytes(),
@@ -1430,6 +1416,9 @@ struct MeshState {
     dead_peers: std::collections::HashSet<EndpointId>,
     seen_plugin_messages: HashSet<String>,
     seen_plugin_message_order: VecDeque<String>,
+    /// Last policy-rejection status per peer — used to suppress duplicate log lines.
+    /// Only logs when the status transitions (first rejection or status change).
+    policy_rejected_peers: HashMap<EndpointId, OwnershipStatus>,
 }
 
 /// Returns `true` if the given peer has completed gossip validation and is
@@ -1752,6 +1741,7 @@ impl Node {
                 dead_peers: std::collections::HashSet::new(),
                 seen_plugin_messages: HashSet::new(),
                 seen_plugin_message_order: VecDeque::new(),
+                policy_rejected_peers: HashMap::new(),
             })),
             role: Arc::new(Mutex::new(role)),
             models: Arc::new(Mutex::new(Vec::new())),
@@ -1847,6 +1837,7 @@ impl Node {
                 dead_peers: std::collections::HashSet::new(),
                 seen_plugin_messages: HashSet::new(),
                 seen_plugin_message_order: VecDeque::new(),
+                policy_rejected_peers: HashMap::new(),
             })),
             role: Arc::new(Mutex::new(role)),
             models: Arc::new(Mutex::new(Vec::new())),
@@ -3955,7 +3946,6 @@ impl Node {
                 let error_snapshot = crate::proto::node::ConfigSnapshotResponse {
                     gen: NODE_PROTOCOL_GENERATION,
                     node_id: vec![],
-                    owner_id: String::new(),
                     revision: 0,
                     config_hash: vec![],
                     config: None,
@@ -3975,7 +3965,6 @@ impl Node {
             let error_snapshot = crate::proto::node::ConfigSnapshotResponse {
                 gen: NODE_PROTOCOL_GENERATION,
                 node_id: vec![],
-                owner_id: String::new(),
                 revision: 0,
                 config_hash: vec![],
                 config: None,
@@ -3992,7 +3981,6 @@ impl Node {
                 let error_snapshot = crate::proto::node::ConfigSnapshotResponse {
                     gen: NODE_PROTOCOL_GENERATION,
                     node_id: vec![],
-                    owner_id: String::new(),
                     revision: 0,
                     config_hash: vec![],
                     config: None,
@@ -4004,18 +3992,16 @@ impl Node {
             }
         };
 
-        if frame.owner_id != local_owner_id || subscriber_owner_id != local_owner_id {
+        if subscriber_owner_id != local_owner_id {
             tracing::warn!(
-                "config subscribe from {}: owner_id mismatch (want {}, frame {}, subscriber {})",
+                "config subscribe from {}: owner_id mismatch (want {}, subscriber {})",
                 remote.fmt_short(),
                 local_owner_id,
-                frame.owner_id,
                 subscriber_owner_id
             );
             let error_snapshot = crate::proto::node::ConfigSnapshotResponse {
                 gen: NODE_PROTOCOL_GENERATION,
                 node_id: vec![],
-                owner_id: String::new(),
                 revision: 0,
                 config_hash: vec![],
                 config: None,
@@ -4032,7 +4018,6 @@ impl Node {
             ConfigSnapshotResponse {
                 gen: NODE_PROTOCOL_GENERATION,
                 node_id: self.endpoint.id().as_bytes().to_vec(),
-                owner_id: local_owner_id.clone(),
                 revision: state.revision(),
                 config_hash: state.config_hash().to_vec(),
                 config: Some(proto_cfg),
@@ -4042,7 +4027,6 @@ impl Node {
         };
         write_len_prefixed(&mut send, &snapshot.encode_to_vec()).await?;
 
-        let owner_id_owned = local_owner_id;
         let mut rev_rx = self.config_revision_tx.subscribe();
         loop {
             if rev_rx.changed().await.is_err() {
@@ -4054,7 +4038,6 @@ impl Node {
                 ConfigUpdateNotification {
                     gen: NODE_PROTOCOL_GENERATION,
                     node_id: self.endpoint.id().as_bytes().to_vec(),
-                    owner_id: owner_id_owned.clone(),
                     revision: state.revision(),
                     config_hash: state.config_hash().to_vec(),
                     config: Some(proto_cfg),
@@ -4139,11 +4122,6 @@ impl Node {
 
         if requester_owner_id != local_id {
             send_push_error(&mut send, "not the owner of this node").await?;
-            return Ok(());
-        }
-
-        if push.owner_id != requester_owner_id {
-            send_push_error(&mut send, "owner_id mismatch").await?;
             return Ok(());
         }
 
@@ -4269,7 +4247,6 @@ impl Node {
     pub(crate) async fn subscribe_to_config(
         &self,
         conn: &iroh::endpoint::Connection,
-        owner_id: &str,
     ) -> anyhow::Result<(
         crate::proto::node::ConfigSnapshotResponse,
         tokio::sync::watch::Receiver<crate::proto::node::ConfigUpdateNotification>,
@@ -4284,7 +4261,6 @@ impl Node {
         let req = ConfigSubscribe {
             gen: NODE_PROTOCOL_GENERATION,
             subscriber_id: self.endpoint.id().as_bytes().to_vec(),
-            owner_id: owner_id.to_string(),
         };
         write_len_prefixed(&mut send, &req.encode_to_vec()).await?;
 
@@ -4301,7 +4277,6 @@ impl Node {
         let empty_notif = ConfigUpdateNotification {
             gen: NODE_PROTOCOL_GENERATION,
             node_id: snapshot.node_id.clone(),
-            owner_id: snapshot.owner_id.clone(),
             revision: snapshot.revision,
             config_hash: snapshot.config_hash.clone(),
             config: snapshot.config.clone(),
@@ -4674,18 +4649,26 @@ impl Node {
             current_time_unix_ms(),
         );
         if !policy_accepts_peer(self.trust_policy, &owner_summary) {
-            tracing::warn!(
-                "Rejecting peer {} due to owner policy: {:?}",
-                id.fmt_short(),
-                owner_summary.status
-            );
             let mut state = self.state.lock().await;
+            let last_status = state.policy_rejected_peers.get(&id).cloned();
+            if last_status.as_ref() != Some(&owner_summary.status) {
+                tracing::warn!(
+                    "Rejecting peer {} due to owner policy: {:?}",
+                    id.fmt_short(),
+                    owner_summary.status
+                );
+                state
+                    .policy_rejected_peers
+                    .insert(id, owner_summary.status.clone());
+            }
             if state.peers.remove(&id).is_some() {
                 let _ = self.peer_change_tx.send(state.peers.len());
             }
             return;
         }
         let mut state = self.state.lock().await;
+        // Peer accepted — clear any prior rejection record so future rejections log again.
+        state.policy_rejected_peers.remove(&id);
         if id == self.endpoint.id() {
             return;
         }
@@ -5053,6 +5036,7 @@ mod tests {
                 dead_peers: HashSet::new(),
                 seen_plugin_messages: HashSet::new(),
                 seen_plugin_message_order: VecDeque::new(),
+                policy_rejected_peers: HashMap::new(),
             })),
             role: Arc::new(Mutex::new(role)),
             models: Arc::new(Mutex::new(Vec::new())),
@@ -8461,7 +8445,6 @@ mod tests {
         let snapshot = ConfigSnapshotResponse {
             gen: NODE_PROTOCOL_GENERATION,
             node_id: vec![0xAA; 32],
-            owner_id: "test-owner".to_string(),
             revision: 7,
             config_hash: vec![0xBB; 32],
             config: Some(NodeConfigSnapshot {
@@ -8483,7 +8466,6 @@ mod tests {
 
         assert_eq!(decoded.gen, NODE_PROTOCOL_GENERATION);
         assert_eq!(decoded.node_id, vec![0xAA; 32]);
-        assert_eq!(decoded.owner_id, "test-owner");
         assert_eq!(decoded.revision, 7);
         assert_eq!(decoded.config_hash, vec![0xBB; 32]);
         assert_eq!(decoded.hostname, Some("test-host".to_string()));
@@ -8515,12 +8497,10 @@ mod tests {
     fn config_sync_push_signature_payload_deterministic() {
         use crate::proto::node::{ConfigPush, NodeConfigSnapshot};
 
-        let (_, owner_id) = test_signing_key();
         let push = ConfigPush {
             gen: NODE_PROTOCOL_GENERATION,
             requester_id: vec![0xAA; 32],
             target_node_id: vec![0xBB; 32],
-            owner_id: owner_id.clone(),
             owner_signing_public_key: vec![0x42u8; 32],
             expected_revision: 3,
             config: Some(NodeConfigSnapshot {
@@ -8538,38 +8518,9 @@ mod tests {
         assert!(!p1.is_empty(), "payload must not be empty");
     }
 
-    #[test]
-    fn config_sync_push_wrong_owner_detected() {
-        use crate::proto::node::ConfigPush;
-
-        let (signing_key, real_owner_id) = test_signing_key();
-        let vk = signing_key.verifying_key();
-        let derived = crate::crypto::owner_id_from_verifying_key(&vk);
-
-        let push_owner_id = "some-other-owner-id".to_string();
-        assert_ne!(
-            push_owner_id, derived,
-            "test requires push.owner_id to differ from the derived owner_id"
-        );
-
-        let push = ConfigPush {
-            gen: NODE_PROTOCOL_GENERATION,
-            requester_id: vec![0xAA; 32],
-            target_node_id: vec![0xBB; 32],
-            owner_id: push_owner_id.clone(),
-            owner_signing_public_key: vk.to_bytes().to_vec(),
-            expected_revision: 0,
-            config: None,
-            signature: vec![0u8; 64],
-        };
-
-        let mismatch = derived != push.owner_id;
-        assert!(
-            mismatch,
-            "owner_id derived from public key ({derived}) must not match push.owner_id ({push_owner_id})"
-        );
-        let _ = real_owner_id;
-    }
+    // config_sync_push_wrong_owner_detected was removed: the `owner_id` field no longer
+    // exists in ConfigPush. Wrong-owner detection is now handled entirely through the
+    // gossip-attested peer identity check in handle_config_push.
 
     #[test]
     fn config_sync_push_bad_signature_bytes_length() {
@@ -8625,7 +8576,6 @@ mod tests {
             gen: NODE_PROTOCOL_GENERATION,
             requester_id: vec![0xAA; 32],
             target_node_id: vec![0xBB; 32],
-            owner_id: owner_id.clone(),
             owner_signing_public_key: vk.to_bytes().to_vec(),
             expected_revision: 0,
             config: Some(NodeConfigSnapshot {
@@ -8659,13 +8609,10 @@ mod tests {
     fn config_sync_signature_payload_excludes_signature_field() {
         use crate::proto::node::{ConfigPush, NodeConfigSnapshot};
 
-        let (_, owner_id) = test_signing_key();
-
         let mut push = ConfigPush {
             gen: NODE_PROTOCOL_GENERATION,
             requester_id: vec![0xAA; 32],
             target_node_id: vec![0xBB; 32],
-            owner_id: owner_id.clone(),
             owner_signing_public_key: vec![0x42u8; 32],
             expected_revision: 0,
             config: Some(NodeConfigSnapshot {
@@ -8757,6 +8704,7 @@ mod tests {
                 dead_peers: HashSet::new(),
                 seen_plugin_messages: HashSet::new(),
                 seen_plugin_message_order: VecDeque::new(),
+                policy_rejected_peers: HashMap::new(),
             })),
             role: Arc::new(Mutex::new(role)),
             models: Arc::new(Mutex::new(Vec::new())),
@@ -8824,13 +8772,11 @@ mod tests {
         use ed25519_dalek::Signer as _;
 
         let vk = owner_keypair.signing.verifying_key();
-        let owner_id = owner_keypair.owner_id();
 
         let mut push = crate::proto::node::ConfigPush {
             gen: NODE_PROTOCOL_GENERATION,
             requester_id: requester_id.as_bytes().to_vec(),
             target_node_id: target_node_id.as_bytes().to_vec(),
-            owner_id,
             owner_signing_public_key: vk.to_bytes().to_vec(),
             expected_revision,
             config: Some(config),
@@ -8862,7 +8808,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn config_subscribe_matching_owner_receives_snapshot() -> Result<()> {
         let owner_keypair = test_owner_keypair(0x11, 0x12);
-        let owner_id = owner_keypair.owner_id();
 
         let tmp = std::env::temp_dir().join(format!("mesh-llm-cfg-sub-{}", rand::random::<u64>()));
         std::fs::create_dir_all(tmp.join("server")).ok();
@@ -8905,12 +8850,8 @@ mod tests {
                 .expect("connection to server must exist after join")
         };
 
-        let (snapshot, _notif_rx) = client.subscribe_to_config(&conn, &owner_id).await?;
+        let (snapshot, _notif_rx) = client.subscribe_to_config(&conn).await?;
 
-        assert_eq!(
-            snapshot.owner_id, owner_id,
-            "snapshot owner_id must match the server's owner"
-        );
         assert_eq!(
             snapshot.node_id,
             server_id.as_bytes().to_vec(),
@@ -8938,7 +8879,6 @@ mod tests {
     async fn config_subscribe_wrong_owner_returns_error() -> Result<()> {
         let server_owner = test_owner_keypair(0x22, 0x23);
         let client_owner = test_owner_keypair(0x33, 0x34);
-        let client_owner_id = client_owner.owner_id();
 
         let tmp =
             std::env::temp_dir().join(format!("mesh-llm-cfg-wrong-{}", rand::random::<u64>()));
@@ -8982,8 +8922,8 @@ mod tests {
                 .expect("connection to server must exist after join")
         };
 
-        // Subscribe with client's own owner_id, which differs from the server's
-        let result = client.subscribe_to_config(&conn, &client_owner_id).await;
+        // Subscribe - the subscriber's attested owner doesn't match the server's owner
+        let result = client.subscribe_to_config(&conn).await;
         assert!(
             result.is_err(),
             "subscribing with wrong owner_id must return an error"
@@ -9001,7 +8941,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn config_subscribe_unowned_node_returns_error() -> Result<()> {
         let client_owner = test_owner_keypair(0x44, 0x45);
-        let client_owner_id = client_owner.owner_id();
 
         let tmp =
             std::env::temp_dir().join(format!("mesh-llm-cfg-unowned-{}", rand::random::<u64>()));
@@ -9036,7 +8975,7 @@ mod tests {
                 .expect("connection to server must exist after join")
         };
 
-        let result = client.subscribe_to_config(&conn, &client_owner_id).await;
+        let result = client.subscribe_to_config(&conn).await;
         assert!(
             result.is_err(),
             "subscribing to an unowned node must return an error"
@@ -9323,7 +9262,6 @@ mod tests {
         use prost::Message as _;
 
         let owner_keypair = test_owner_keypair(0x88, 0x89);
-        let owner_id = owner_keypair.owner_id();
 
         let tmp =
             std::env::temp_dir().join(format!("mesh-llm-cfg-notif-{}", rand::random::<u64>()));
@@ -9365,7 +9303,7 @@ mod tests {
         };
 
         // Subscribe to config on the server from the client
-        let (initial_snapshot, mut notif_rx) = client.subscribe_to_config(&conn, &owner_id).await?;
+        let (initial_snapshot, mut notif_rx) = client.subscribe_to_config(&conn).await?;
         let initial_revision = initial_snapshot.revision;
 
         // Now push a config change to the server from the client

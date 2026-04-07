@@ -69,7 +69,6 @@ pub(crate) enum ControlFrameError {
         got: usize,
     },
     MissingHttpPort,
-    MissingOwnerId,
     InvalidConfigHashLength {
         got: usize,
     },
@@ -114,7 +113,6 @@ impl std::fmt::Display for ControlFrameError {
             ControlFrameError::MissingHttpPort => {
                 write!(f, "HOST-role peer annotation missing http_port")
             }
-            ControlFrameError::MissingOwnerId => write!(f, "config frame missing owner_id"),
             ControlFrameError::InvalidConfigHashLength { got } => {
                 write!(f, "invalid config_hash length: expected 32, got {}", got)
             }
@@ -246,9 +244,6 @@ impl ValidateControlFrame for crate::proto::node::ConfigSubscribe {
             return Err(ControlFrameError::BadGeneration { got: self.gen });
         }
         validate_endpoint_id_length(self.subscriber_id.len())?;
-        if self.owner_id.is_empty() {
-            return Err(ControlFrameError::MissingOwnerId);
-        }
         Ok(())
     }
 }
@@ -265,9 +260,6 @@ impl ValidateControlFrame for crate::proto::node::ConfigSnapshotResponse {
             if self.config.is_none() {
                 return Err(ControlFrameError::MissingConfig);
             }
-            if self.owner_id.is_empty() {
-                return Err(ControlFrameError::MissingOwnerId);
-            }
         }
         Ok(())
     }
@@ -283,9 +275,6 @@ impl ValidateControlFrame for crate::proto::node::ConfigUpdateNotification {
         if self.config.is_none() {
             return Err(ControlFrameError::MissingConfig);
         }
-        if self.owner_id.is_empty() {
-            return Err(ControlFrameError::MissingOwnerId);
-        }
         Ok(())
     }
 }
@@ -297,9 +286,6 @@ impl ValidateControlFrame for crate::proto::node::ConfigPush {
         }
         validate_endpoint_id_length(self.requester_id.len())?;
         validate_endpoint_id_length(self.target_node_id.len())?;
-        if self.owner_id.is_empty() {
-            return Err(ControlFrameError::MissingOwnerId);
-        }
         validate_public_key_length(self.owner_signing_public_key.len())?;
         if self.signature.is_empty() {
             return Err(ControlFrameError::MissingSignature);
@@ -564,7 +550,6 @@ mod tests {
         ConfigSubscribe {
             gen: NODE_PROTOCOL_GENERATION,
             subscriber_id: vec![0xAA; 32],
-            owner_id: "owner-1".to_string(),
         }
     }
 
@@ -701,14 +686,12 @@ mod tests {
 
         let subscribe = make_valid_config_subscribe();
         let encoded = encode_control_frame(STREAM_CONFIG_SUBSCRIBE, &subscribe);
-        let decoded: ConfigSubscribe = decode_control_frame(STREAM_CONFIG_SUBSCRIBE, &encoded)
+        let _decoded: ConfigSubscribe = decode_control_frame(STREAM_CONFIG_SUBSCRIBE, &encoded)
             .expect("valid config subscribe must decode");
-        assert_eq!(decoded.owner_id, "owner-1");
 
         let snapshot_response = ConfigSnapshotResponse {
             gen: NODE_PROTOCOL_GENERATION,
             node_id: node_id.clone(),
-            owner_id: "owner-1".to_string(),
             revision: 7,
             config_hash: config_hash.clone(),
             config: Some(snapshot.clone()),
@@ -726,7 +709,6 @@ mod tests {
         let update = ConfigUpdateNotification {
             gen: NODE_PROTOCOL_GENERATION,
             node_id: node_id.clone(),
-            owner_id: "owner-1".to_string(),
             revision: 8,
             config_hash: config_hash.clone(),
             config: Some(snapshot.clone()),
@@ -741,7 +723,6 @@ mod tests {
             gen: NODE_PROTOCOL_GENERATION,
             requester_id: vec![0x10; 32],
             target_node_id: node_id.clone(),
-            owner_id: "owner-1".to_string(),
             expected_revision: 8,
             config: Some(snapshot.clone()),
             owner_signing_public_key: vec![0x02; 32],
@@ -784,17 +765,9 @@ mod tests {
             .expect_err("invalid subscriber id length must be rejected");
         assert!(matches!(err, ControlFrameError::InvalidEndpointId { .. }));
 
-        let mut subscribe = make_valid_config_subscribe();
-        subscribe.owner_id = String::new();
-        let encoded = encode_control_frame(STREAM_CONFIG_SUBSCRIBE, &subscribe);
-        let err = decode_control_frame::<ConfigSubscribe>(STREAM_CONFIG_SUBSCRIBE, &encoded)
-            .expect_err("missing owner id must be rejected");
-        assert!(matches!(err, ControlFrameError::MissingOwnerId));
-
         let snapshot_response = ConfigSnapshotResponse {
             gen: NODE_PROTOCOL_GENERATION,
             node_id: vec![0x01; 16],
-            owner_id: "owner-1".to_string(),
             revision: 1,
             config_hash: vec![0x02; 32],
             config: Some(make_config_snapshot()),
@@ -809,7 +782,6 @@ mod tests {
         let snapshot_response = ConfigSnapshotResponse {
             gen: NODE_PROTOCOL_GENERATION,
             node_id: vec![0xAA; 32],
-            owner_id: "owner-1".to_string(),
             revision: 1,
             config_hash: vec![0x02; 16],
             config: Some(make_config_snapshot()),
@@ -827,7 +799,6 @@ mod tests {
         let update = ConfigUpdateNotification {
             gen: NODE_PROTOCOL_GENERATION,
             node_id: vec![0xBB; 32],
-            owner_id: "owner-1".to_string(),
             revision: 2,
             config_hash: vec![0xCC; 16],
             config: Some(make_config_snapshot()),
@@ -845,19 +816,11 @@ mod tests {
             gen: NODE_PROTOCOL_GENERATION,
             requester_id: vec![0x01; 32],
             target_node_id: vec![0x02; 32],
-            owner_id: String::new(),
             expected_revision: 2,
             config: Some(make_config_snapshot()),
-            owner_signing_public_key: vec![0x03; 32],
+            owner_signing_public_key: vec![0x03; 16],
             signature: vec![0x04],
         };
-        let encoded = encode_control_frame(STREAM_CONFIG_PUSH, &push);
-        let err = decode_control_frame::<ConfigPush>(STREAM_CONFIG_PUSH, &encoded)
-            .expect_err("empty owner id must be rejected");
-        assert!(matches!(err, ControlFrameError::MissingOwnerId));
-
-        push.owner_id = "owner-1".to_string();
-        push.owner_signing_public_key = vec![0x05; 16];
         let encoded = encode_control_frame(STREAM_CONFIG_PUSH, &push);
         let err = decode_control_frame::<ConfigPush>(STREAM_CONFIG_PUSH, &encoded)
             .expect_err("short public key must be rejected");
@@ -895,7 +858,6 @@ mod tests {
         let error_snapshot = ConfigSnapshotResponse {
             gen: NODE_PROTOCOL_GENERATION,
             node_id: vec![],
-            owner_id: String::new(),
             revision: 0,
             config_hash: vec![],
             config: None,
@@ -933,7 +895,6 @@ mod tests {
             gen: NODE_PROTOCOL_GENERATION,
             requester_id: vec![0x01; 32],
             target_node_id: vec![0x02; 32],
-            owner_id: "owner-1".to_string(),
             expected_revision: 0,
             config: Some(make_config_snapshot()),
             owner_signing_public_key: vec![0x03; 32],
@@ -951,7 +912,6 @@ mod tests {
             gen: NODE_PROTOCOL_GENERATION,
             requester_id: vec![0x01; 32],
             target_node_id: vec![0x02; 32],
-            owner_id: "owner-1".to_string(),
             expected_revision: 0,
             config: Some(make_config_snapshot()),
             owner_signing_public_key: vec![0x03; 32],
@@ -970,7 +930,6 @@ mod tests {
             gen: NODE_PROTOCOL_GENERATION,
             requester_id: vec![0x01; 32],
             target_node_id: vec![0x02; 32],
-            owner_id: "owner-1".to_string(),
             expected_revision: 0,
             config: Some(make_config_snapshot()),
             owner_signing_public_key: vec![0x03; 32],
@@ -1721,13 +1680,11 @@ mod tests {
 
         let signing_key = SigningKey::from_bytes(&[0x42u8; 32]);
         let verifying_key = signing_key.verifying_key();
-        let owner_id = crate::crypto::owner_id_from_verifying_key(&verifying_key);
 
         let push = ConfigPush {
             gen: NODE_PROTOCOL_GENERATION,
             requester_id: vec![0x01; 32],
             target_node_id: vec![0x02; 32],
-            owner_id: owner_id.clone(),
             expected_revision: 0,
             config: Some(NodeConfigSnapshot {
                 version: 1,
@@ -1766,13 +1723,11 @@ mod tests {
 
         let signing_key = SigningKey::from_bytes(&[0x43u8; 32]);
         let verifying_key = signing_key.verifying_key();
-        let owner_id = crate::crypto::owner_id_from_verifying_key(&verifying_key);
 
         let push = ConfigPush {
             gen: NODE_PROTOCOL_GENERATION,
             requester_id: vec![0x01; 32],
             target_node_id: vec![0x02; 32],
-            owner_id: owner_id.clone(),
             expected_revision: 0,
             config: Some(NodeConfigSnapshot {
                 version: 1,
@@ -1921,7 +1876,6 @@ mod tests {
             gen: NODE_PROTOCOL_GENERATION,
             requester_id: vec![0x01; 32],
             target_node_id: vec![0x02; 32],
-            owner_id: "owner-1".to_string(),
             expected_revision: 0,
             config: Some(make_config_snapshot()),
             owner_signing_public_key: vec![0x03; 32],
@@ -1944,7 +1898,6 @@ mod tests {
             gen: NODE_PROTOCOL_GENERATION,
             requester_id: vec![0x01; 32],
             target_node_id: vec![0x02; 32],
-            owner_id: "owner-1".to_string(),
             expected_revision: 0,
             config: Some(make_config_snapshot()),
             owner_signing_public_key: vec![0x03; 32],
@@ -1966,7 +1919,6 @@ mod tests {
         let response = ConfigSnapshotResponse {
             gen: NODE_PROTOCOL_GENERATION,
             node_id: vec![0x01; 32],
-            owner_id: "owner-1".to_string(),
             revision: 1,
             config_hash: vec![0x02; 32],
             config: None,
@@ -1989,7 +1941,6 @@ mod tests {
         let notification = ConfigUpdateNotification {
             gen: NODE_PROTOCOL_GENERATION,
             node_id: vec![0x01; 32],
-            owner_id: "owner-1".to_string(),
             revision: 1,
             config_hash: vec![0x02; 32],
             config: None,
