@@ -127,6 +127,7 @@ import {
   getAttachmentSendIssue,
   validateAttachmentFile,
 } from "./lib/attachments";
+import { createRafBatcher } from "./lib/streaming";
 import { cn } from "./lib/utils";
 import {
   TOPOLOGY_LAYOUT_OPTIONS,
@@ -1357,7 +1358,12 @@ export function App() {
     const el = chatScrollRef.current;
     if (!el) return;
     if (!activeConversationId && !lastMessageId && !isSending) return;
-    el.scrollTop = el.scrollHeight;
+    // Only auto-scroll if the user is already near the bottom.
+    // This lets them scroll up to read earlier content while streaming.
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    if (distanceFromBottom < 80) {
+      el.scrollTop = el.scrollHeight;
+    }
   }, [activeConversationId, isSending, lastMessageId]);
 
   useEffect(() => () => currentAbortRef.current?.abort(), []);
@@ -1506,6 +1512,7 @@ export function App() {
     const reqStart = performance.now();
     const controller = new AbortController();
     currentAbortRef.current = controller;
+    let batcher: ReturnType<typeof createRafBatcher> | null = null;
 
     try {
       const requestId = providedRequestId ?? randomId();
@@ -1552,6 +1559,24 @@ export function App() {
       let completionTokens: number | null = null;
       let firstTokenAt: number | null = null;
 
+      // Batch token deltas so React re-renders at most once per frame.
+      batcher = createRafBatcher((snapshot) => {
+        updateChatState((prev) => ({
+          ...prev,
+          conversations: updateConversationList(
+            prev.conversations,
+            conversationId,
+            (conversation) => ({
+              ...conversation,
+              messages: conversation.messages.map((m) =>
+                m.id === assistantId ? { ...m, content: snapshot } : m,
+              ),
+              updatedAt: Date.now(),
+            }),
+          ),
+        }));
+      });
+
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
@@ -1587,20 +1612,7 @@ export function App() {
               }
               if (firstTokenAt == null) firstTokenAt = performance.now();
               full += contentDelta;
-              updateChatState((prev) => ({
-                ...prev,
-                conversations: updateConversationList(
-                  prev.conversations,
-                  conversationId,
-                  (conversation) => ({
-                    ...conversation,
-                    messages: conversation.messages.map((m) =>
-                      m.id === assistantId ? { ...m, content: full } : m,
-                    ),
-                    updatedAt: Date.now(),
-                  }),
-                ),
-              }));
+              batcher.push(full);
             } else if (eventName === "response.completed") {
               const responsePayload =
                 payload.response && typeof payload.response === "object"
@@ -1630,6 +1642,8 @@ export function App() {
           frameEnd = buf.indexOf("\n\n");
         }
       }
+
+      batcher.flush();
 
       const endAt = performance.now();
       const genStart = firstTokenAt ?? reqStart;
@@ -1702,6 +1716,7 @@ export function App() {
         }));
       }
     } finally {
+      batcher?.cancel();
       if (currentAbortRef.current === controller)
         currentAbortRef.current = null;
       setIsSending(false);
