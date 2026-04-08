@@ -3123,12 +3123,12 @@ mod tests {
     }
 
     /// `probe_http_response_local` uses a much longer timeout (10 min)
-    /// than `probe_http_response` (60s), because local llama-server
+    /// than `probe_http_response` (5 min), because local llama-server
     /// prefill can legitimately take minutes under load.
     ///
     /// This test sends a response after a 2s delay and verifies that
     /// `probe_http_response_local` waits for it (well within its 10-min
-    /// window) rather than failing at the 60s remote timeout.
+    /// window) rather than failing at the shorter remote timeout.
     #[tokio::test]
     async fn test_probe_http_response_local_tolerates_slow_first_byte() {
         use tokio::io::AsyncWriteExt;

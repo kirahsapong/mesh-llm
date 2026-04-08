@@ -286,8 +286,8 @@ async fn handle_inbound_stream(
     Ok(())
 }
 
-/// Handle an inbound HTTP tunnel bi-stream: connect to the local API proxy and relay.
-/// Plain byte relay — the proxy handles model-aware routing behind this ingress.
+/// Handle an inbound HTTP tunnel bi-stream: connect directly to the local llama-server and relay.
+/// Plain byte relay — the client proxy already normalized the request before tunneling.
 async fn handle_inbound_http_stream(
     node: Node,
     quic_send: iroh::endpoint::SendStream,
