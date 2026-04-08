@@ -124,7 +124,7 @@ pub(crate) enum AuthCommand {
         #[arg(long)]
         trust_store: Option<PathBuf>,
         /// Override trust policy used for verification.
-        #[arg(long, value_enum)]
+        #[arg(long = "verify-trust-policy", value_enum)]
         trust_policy: Option<TrustPolicy>,
     },
     /// Rotate the local node identity key.
