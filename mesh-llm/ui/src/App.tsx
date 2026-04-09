@@ -2956,18 +2956,26 @@ export function ChatPage(props: {
     setComposerError(null);
   }
 
-  /** Check if any warm model in the mesh has vision support. */
-  function hasWarmVisionModel(): boolean {
-    return warmModels.some((m) => meshModelByName[m]?.vision);
+  /**
+   * Check if the image will be sent to a vision-capable model.
+   * True when the selected model has vision, or auto mode and a warm
+   * vision model exists.
+   */
+  function willUseVisionModel(): boolean {
+    if (selectedModelVision) return true;
+    if (!selectedModel || selectedModel === "auto") {
+      return warmModels.some((m) => meshModelByName[m]?.vision);
+    }
+    return false;
   }
 
   /**
    * Add an image attachment, then auto-describe it via a browser-local
-   * vision model if no warm vision model is available in the mesh.
+   * vision model if the image won't be handled by a real vision model.
    */
   function addImageAttachment(attachment: Omit<ChatAttachment, "id" | "status" | "error">) {
     const attachmentId = randomId();
-    const needsDescription = !hasWarmVisionModel() && canRunBrowserVision();
+    const needsDescription = !willUseVisionModel() && canRunBrowserVision();
     setPendingAttachments((prev) => [
       ...prev,
       {
