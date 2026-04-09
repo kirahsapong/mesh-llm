@@ -83,6 +83,7 @@ enum RouteAttemptResult {
     Delivered { status_code: u16 },
     RetryableUnavailable,
     RetryableContextOverflow,
+    ClientDisconnected,
 }
 
 fn route_attempt_result_label(result: &RouteAttemptResult) -> &'static str {
@@ -90,7 +91,28 @@ fn route_attempt_result_label(result: &RouteAttemptResult) -> &'static str {
         RouteAttemptResult::Delivered { .. } => "delivered",
         RouteAttemptResult::RetryableUnavailable => "retryable_unavailable",
         RouteAttemptResult::RetryableContextOverflow => "retryable_context_overflow",
+        RouteAttemptResult::ClientDisconnected => "client_disconnected",
     }
+}
+
+fn is_disconnect_kind(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::NotConnected
+            | std::io::ErrorKind::UnexpectedEof
+    )
+}
+
+fn is_client_disconnect_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .map(|io_err| is_disconnect_kind(io_err.kind()))
+            .unwrap_or(false)
+    })
 }
 
 struct ParsedResponseHeaders {
@@ -837,6 +859,14 @@ async fn relay_translated_responses_stream<R: AsyncRead + Unpin>(
     probe: ResponseProbe,
     retry_context_overflow: bool,
 ) -> Result<RouteAttemptResult> {
+    fn should_parse_stream_chunk(data: &str, model_missing: bool, usage_missing: bool) -> bool {
+        model_missing
+            || usage_missing
+            || data.contains("\"delta\"")
+            || data.contains("\"content\"")
+            || data.contains("\"usage\"")
+    }
+
     if retry_context_overflow && probe.retryable_context_overflow {
         return Ok(RouteAttemptResult::RetryableContextOverflow);
     }
@@ -863,9 +893,11 @@ async fn relay_translated_responses_stream<R: AsyncRead + Unpin>(
     let mut created_emitted = false;
     let mut done_seen = false;
     loop {
-        while let Some(frame_end) = carry.find("\n\n") {
-            let frame = carry[..frame_end].to_string();
-            carry = carry[frame_end + 2..].to_string();
+        let mut processed = 0usize;
+        while let Some(frame_end_rel) = carry[processed..].find("\n\n") {
+            let frame_end = processed + frame_end_rel;
+            let frame = &carry[processed..frame_end];
+            processed = frame_end + 2;
             let data_lines = frame
                 .lines()
                 .filter_map(|line| line.strip_prefix("data:"))
@@ -879,6 +911,11 @@ async fn relay_translated_responses_stream<R: AsyncRead + Unpin>(
                 done_seen = true;
                 break;
             }
+
+            if !should_parse_stream_chunk(&data, model.is_empty(), usage.is_none()) {
+                continue;
+            }
+
             let chunk = adapter::parse_chat_stream_chunk(&data)?;
             if let Some(chunk_model) = chunk.model.as_deref() {
                 if model.is_empty() {
@@ -923,6 +960,9 @@ async fn relay_translated_responses_stream<R: AsyncRead + Unpin>(
                     .as_ref()
                     .map(response_adapter::stream_usage_to_responses_usage);
             }
+        }
+        if processed > 0 {
+            carry = carry[processed..].to_string();
         }
 
         if done_seen {
@@ -1284,6 +1324,13 @@ async fn route_local_attempt(
                     {
                         Ok(result) => result,
                         Err(err) => {
+                            if is_client_disconnect_error(&err) {
+                                let _ = upstream.shutdown().await;
+                                tracing::info!(
+                                    "API proxy (local): downstream client disconnected during relay"
+                                );
+                                return RouteAttemptResult::ClientDisconnected;
+                            }
                             tracing::debug!("API proxy (local) ended after commit: {err}");
                             RouteAttemptResult::Delivered { status_code }
                         }
@@ -1335,6 +1382,12 @@ async fn route_remote_attempt(
                     {
                         Ok(result) => result,
                         Err(err) => {
+                            if is_client_disconnect_error(&err) {
+                                tracing::info!(
+                                    "API proxy (remote): downstream client disconnected during relay"
+                                );
+                                return RouteAttemptResult::ClientDisconnected;
+                            }
                             tracing::debug!("API proxy (remote) ended after commit: {err}");
                             RouteAttemptResult::Delivered { status_code }
                         }
@@ -1429,6 +1482,13 @@ async fn route_http_endpoint_attempt(
                     {
                         Ok(result) => result,
                         Err(err) => {
+                            if is_client_disconnect_error(&err) {
+                                let _ = upstream.shutdown().await;
+                                tracing::info!(
+                                    "API proxy (external endpoint): downstream client disconnected during relay"
+                                );
+                                return RouteAttemptResult::ClientDisconnected;
+                            }
                             tracing::debug!(
                                 "API proxy (external endpoint) ended after commit: {err}"
                             );
@@ -1763,6 +1823,14 @@ pub async fn handle_mesh_request(
                     refreshed = true;
                 }
             }
+            RouteAttemptResult::ClientDisconnected => {
+                tracing::info!(
+                    "Downstream client disconnected while routing to host {}",
+                    target_host.fmt_short()
+                );
+                release_request_objects(&node, &request.request_object_request_ids).await;
+                return;
+            }
         }
     }
     // All hosts failed
@@ -1945,6 +2013,15 @@ pub async fn route_model_request(
                 }
                 tracing::warn!("Target {target:?} unavailable, trying next");
             }
+            RouteAttemptResult::ClientDisconnected => {
+                tracing::info!(
+                    model = model,
+                    attempts = attempts,
+                    route_ms = route_started.elapsed().as_millis(),
+                    "openai route_model_request downstream disconnected"
+                );
+                return true;
+            }
         }
     }
 
@@ -2053,6 +2130,16 @@ pub async fn route_moe_request(
                 }
                 tracing::warn!("MoE target {target:?} unavailable, trying next");
             }
+            RouteAttemptResult::ClientDisconnected => {
+                tracing::info!(
+                    model = model,
+                    session_hint = session_hint,
+                    attempts = attempts,
+                    route_ms = route_started.elapsed().as_millis(),
+                    "openai route_moe_request downstream disconnected"
+                );
+                return true;
+            }
         }
     }
 
@@ -2116,6 +2203,7 @@ pub async fn route_to_target(
             .await;
             false
         }
+        RouteAttemptResult::ClientDisconnected => true,
     }
 }
 
@@ -2148,6 +2236,7 @@ pub async fn route_http_endpoint_request(
         RouteAttemptResult::RetryableContextOverflow | RouteAttemptResult::RetryableUnavailable => {
             false
         }
+        RouteAttemptResult::ClientDisconnected => true,
     }
 }
 
@@ -2509,6 +2598,10 @@ mod tests {
         assert_eq!(
             route_attempt_result_label(&RouteAttemptResult::RetryableContextOverflow),
             "retryable_context_overflow"
+        );
+        assert_eq!(
+            route_attempt_result_label(&RouteAttemptResult::ClientDisconnected),
+            "client_disconnected"
         );
     }
 
