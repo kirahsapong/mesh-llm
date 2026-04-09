@@ -35,6 +35,11 @@ pub const DEMAND_TTL_SECS: u64 = 86400; // 24 hours
 /// Peers above this threshold are skipped during election.
 /// Used by both the election RTT gate and the RTT-improvement re-election trigger.
 pub const MAX_SPLIT_RTT_MS: u32 = 80;
+const RELAY_HEALTH_CHECK_SECS: u64 = 300;
+const RELAY_MISSING_GRACE_SECS: u64 = 180;
+const RELAY_ONLY_RECONNECT_SECS: u64 = 1800;
+const RELAY_RECONNECT_COOLDOWN_SECS: u64 = 600;
+const RELAY_DEGRADED_RTT_MS: u32 = 1500;
 
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
@@ -541,6 +546,113 @@ fn import_remote_moe_rankings(descriptors: &[ServedModelDescriptor]) -> bool {
 struct HeartbeatFailurePolicy {
     allow_recent_inbound_grace: bool,
     failure_threshold: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum SelectedPathKind {
+    Direct,
+    Relay,
+    #[default]
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RelayPathSnapshot {
+    kind: SelectedPathKind,
+    rtt_ms: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct RelayPeerHealth {
+    relay_since: Option<std::time::Instant>,
+    last_direct_at: Option<std::time::Instant>,
+    last_reconnect_at: Option<std::time::Instant>,
+}
+
+impl RelayPeerHealth {
+    fn observe(&mut self, snapshot: RelayPathSnapshot, now: std::time::Instant) {
+        match snapshot.kind {
+            SelectedPathKind::Direct => {
+                self.relay_since = None;
+                self.last_direct_at = Some(now);
+            }
+            SelectedPathKind::Relay => {
+                if self.relay_since.is_none() {
+                    self.relay_since = Some(now);
+                }
+            }
+            SelectedPathKind::Unknown => {}
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RelayReconnectReason {
+    RelayRttDegraded,
+    RelayOnlyTooLong,
+}
+
+impl RelayReconnectReason {
+    fn label(self) -> &'static str {
+        match self {
+            RelayReconnectReason::RelayRttDegraded => "relay RTT degraded",
+            RelayReconnectReason::RelayOnlyTooLong => "relay path aged out",
+        }
+    }
+}
+
+fn selected_path_snapshot(conn: &Connection) -> RelayPathSnapshot {
+    let mut paths = conn.paths();
+    let path_list = iroh::Watcher::get(&mut paths);
+    for path_info in path_list {
+        if path_info.is_selected() {
+            return RelayPathSnapshot {
+                kind: if path_info.is_ip() {
+                    SelectedPathKind::Direct
+                } else {
+                    SelectedPathKind::Relay
+                },
+                rtt_ms: path_info.rtt().map(|rtt| rtt.as_millis() as u32),
+            };
+        }
+    }
+    RelayPathSnapshot::default()
+}
+
+fn relay_reconnect_reason(
+    health: &RelayPeerHealth,
+    snapshot: RelayPathSnapshot,
+    now: std::time::Instant,
+    inflight_requests: u64,
+    has_home_relay: bool,
+) -> Option<RelayReconnectReason> {
+    if inflight_requests > 0 || !has_home_relay {
+        return None;
+    }
+    if health.last_reconnect_at.is_some_and(|last| {
+        now.duration_since(last) < std::time::Duration::from_secs(RELAY_RECONNECT_COOLDOWN_SECS)
+    }) {
+        return None;
+    }
+    if snapshot.kind != SelectedPathKind::Relay {
+        return None;
+    }
+    if snapshot
+        .rtt_ms
+        .is_some_and(|rtt_ms| rtt_ms >= RELAY_DEGRADED_RTT_MS)
+    {
+        return Some(RelayReconnectReason::RelayRttDegraded);
+    }
+    if health.relay_since.is_some_and(|started| {
+        now.duration_since(started) >= std::time::Duration::from_secs(RELAY_ONLY_RECONNECT_SECS)
+    }) {
+        return Some(RelayReconnectReason::RelayOnlyTooLong);
+    }
+    None
+}
+
+fn should_remove_connection(current_stable_id: Option<usize>, closing_stable_id: usize) -> bool {
+    current_stable_id == Some(closing_stable_id)
 }
 
 fn descriptors_share_exact_moe_identity(
@@ -2585,6 +2697,102 @@ impl Node {
         });
     }
 
+    /// Start a background task that watches relay-backed connections and
+    /// refreshes one degraded relay path at a time.
+    pub fn start_relay_health_monitor(&self) {
+        let node = self.clone();
+        tokio::spawn(async move {
+            let mut addr_watch = node.endpoint.watch_addr();
+            let mut peer_health: HashMap<EndpointId, RelayPeerHealth> = HashMap::new();
+            let mut relay_missing_since: Option<std::time::Instant> = None;
+            let mut relay_missing_warned = false;
+
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(RELAY_HEALTH_CHECK_SECS)).await;
+
+                let now = std::time::Instant::now();
+                let endpoint_addr = iroh::Watcher::get(&mut addr_watch);
+                let has_home_relay = endpoint_addr.relay_urls().next().is_some();
+
+                if has_home_relay {
+                    if relay_missing_since.take().is_some() {
+                        tracing::info!("Relay health: home relay restored");
+                    }
+                    relay_missing_warned = false;
+                } else {
+                    let missing_since = *relay_missing_since.get_or_insert(now);
+                    if !relay_missing_warned
+                        && now.duration_since(missing_since)
+                            >= std::time::Duration::from_secs(RELAY_MISSING_GRACE_SECS)
+                    {
+                        relay_missing_warned = true;
+                        tracing::warn!(
+                            "Relay health: no home relay for {}s",
+                            now.duration_since(missing_since).as_secs()
+                        );
+                    }
+                }
+
+                let inflight_requests = node.inflight_requests();
+                let mut connections: Vec<(EndpointId, Connection)> = {
+                    let state = node.state.lock().await;
+                    state
+                        .peers
+                        .keys()
+                        .filter_map(|id| state.connections.get(id).cloned().map(|conn| (*id, conn)))
+                        .collect()
+                };
+
+                if connections.is_empty() {
+                    peer_health.clear();
+                    continue;
+                }
+
+                connections.sort_by_key(|(peer_id, _)| endpoint_id_hex(*peer_id));
+                peer_health.retain(|peer_id, _| connections.iter().any(|(id, _)| id == peer_id));
+
+                let mut stale_candidate: Option<(EndpointId, RelayReconnectReason)> = None;
+                for (peer_id, conn) in connections {
+                    let snapshot = selected_path_snapshot(&conn);
+                    let health = peer_health.entry(peer_id).or_default();
+                    health.observe(snapshot, now);
+
+                    let Some(reason) = relay_reconnect_reason(
+                        health,
+                        snapshot,
+                        now,
+                        inflight_requests,
+                        has_home_relay,
+                    ) else {
+                        continue;
+                    };
+
+                    if reason == RelayReconnectReason::RelayRttDegraded {
+                        stale_candidate = Some((peer_id, reason));
+                        break;
+                    }
+                    if stale_candidate.is_none() {
+                        stale_candidate = Some((peer_id, reason));
+                    }
+                }
+
+                let Some((peer_id, reason)) = stale_candidate else {
+                    continue;
+                };
+
+                if let Some(health) = peer_health.get_mut(&peer_id) {
+                    health.last_reconnect_at = Some(now);
+                }
+
+                if node.refresh_peer_connection(peer_id, reason).await {
+                    if let Some(health) = peer_health.get_mut(&peer_id) {
+                        health.relay_since = Some(now);
+                    }
+                }
+            }
+        });
+    }
+
     /// Handle a peer death: remove from state, broadcast to all other peers.
     pub async fn handle_peer_death(&self, dead_id: EndpointId) {
         eprintln!(
@@ -3415,6 +3623,7 @@ impl Node {
     }
 
     async fn _dispatch_streams(&self, conn: Connection, remote: EndpointId) {
+        let connection_stable_id = conn.stable_id();
         let protocol = connection_protocol(&conn);
         loop {
             let (send, mut recv) = match conn.accept_bi().await {
@@ -3424,13 +3633,35 @@ impl Node {
                     // Remove the stale connection
                     {
                         let mut state = self.state.lock().await;
-                        state.connections.remove(&remote);
+                        if should_remove_connection(
+                            state
+                                .connections
+                                .get(&remote)
+                                .map(|tracked| tracked.stable_id()),
+                            connection_stable_id,
+                        ) {
+                            state.connections.remove(&remote);
+                        }
                     }
                     // Try to reconnect — if the peer is still alive, re-learn their role
-                    let addr = {
+                    let (addr, replaced_by_newer_conn) = {
                         let state = self.state.lock().await;
-                        state.peers.get(&remote).map(|p| p.addr.clone())
+                        (
+                            state.peers.get(&remote).map(|p| p.addr.clone()),
+                            state
+                                .connections
+                                .get(&remote)
+                                .map(|tracked| tracked.stable_id())
+                                .is_some_and(|tracked| tracked != connection_stable_id),
+                        )
                     };
+                    if replaced_by_newer_conn {
+                        tracing::debug!(
+                            "Connection to {} already replaced by a newer stream dispatcher",
+                            remote.fmt_short()
+                        );
+                        break;
+                    }
                     if let Some(addr) = addr {
                         tracing::info!("Attempting reconnect to {}...", remote.fmt_short());
                         match tokio::time::timeout(
@@ -4248,6 +4479,114 @@ impl Node {
             }
         });
         Ok(())
+    }
+
+    async fn refresh_peer_connection(
+        &self,
+        peer_id: EndpointId,
+        reason: RelayReconnectReason,
+    ) -> bool {
+        let (addr, existing_conn) = {
+            let mut state = self.state.lock().await;
+            let Some(peer) = state.peers.get(&peer_id).cloned() else {
+                return false;
+            };
+            let conn = state.connections.remove(&peer_id);
+            (peer.addr, conn)
+        };
+
+        let Some(existing_conn) = existing_conn else {
+            return false;
+        };
+
+        let existing_id = existing_conn.stable_id();
+        eprintln!(
+            "🔄 Relay health: refreshing {} ({})",
+            peer_id.fmt_short(),
+            reason.label()
+        );
+        tracing::info!(
+            "Relay health: refreshing {} ({})",
+            peer_id.fmt_short(),
+            reason.label()
+        );
+
+        existing_conn.close(0u32.into(), b"relay-health-refresh");
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(1), existing_conn.closed()).await;
+
+        let new_conn = match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            connect_mesh(&self.endpoint, addr.clone()),
+        )
+        .await
+        {
+            Ok(Ok(conn)) => conn,
+            Ok(Err(err)) => {
+                tracing::debug!(
+                    "Relay health refresh dial to {} failed: {err}",
+                    peer_id.fmt_short()
+                );
+                return false;
+            }
+            Err(_) => {
+                tracing::debug!(
+                    "Relay health refresh dial to {} timed out",
+                    peer_id.fmt_short()
+                );
+                return false;
+            }
+        };
+
+        {
+            let mut state = self.state.lock().await;
+            if let Some(current) = state.connections.get(&peer_id) {
+                if !should_remove_connection(Some(current.stable_id()), existing_id) {
+                    tracing::debug!(
+                        "Relay health refresh for {} raced with another reconnect; keeping newer connection",
+                        peer_id.fmt_short()
+                    );
+                    drop(state);
+                    new_conn.close(0u32.into(), b"relay-health-raced");
+                    return false;
+                }
+            }
+            state.connections.insert(peer_id, new_conn.clone());
+        }
+
+        let node_for_dispatch = self.clone();
+        let conn_for_dispatch = new_conn.clone();
+        tokio::spawn(async move {
+            node_for_dispatch
+                .dispatch_streams(conn_for_dispatch, peer_id)
+                .await;
+        });
+
+        let gossip_ok = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            self.initiate_gossip_inner(new_conn.clone(), peer_id, false),
+        )
+        .await
+        .map(|result| result.is_ok())
+        .unwrap_or(false);
+
+        if !gossip_ok {
+            tracing::debug!(
+                "Relay health refresh gossip with {} failed",
+                peer_id.fmt_short()
+            );
+            let mut state = self.state.lock().await;
+            if should_remove_connection(
+                state.connections.get(&peer_id).map(|conn| conn.stable_id()),
+                new_conn.stable_id(),
+            ) {
+                state.connections.remove(&peer_id);
+            }
+            new_conn.close(0u32.into(), b"relay-health-gossip-failed");
+            return false;
+        }
+
+        true
     }
 
     /// Open a gossip stream on an existing connection to exchange peer info.
@@ -8066,6 +8405,166 @@ mod tests {
             served_model_runtime: vec![],
             owner_id: None,
         }
+    }
+
+    #[test]
+    fn relay_health_prefers_direct_paths_and_clears_relay_age() {
+        let now = std::time::Instant::now();
+        let mut health = RelayPeerHealth::default();
+        health.observe(
+            RelayPathSnapshot {
+                kind: SelectedPathKind::Relay,
+                rtt_ms: Some(240),
+            },
+            now - std::time::Duration::from_secs(RELAY_ONLY_RECONNECT_SECS + 5),
+        );
+        assert!(
+            health.relay_since.is_some(),
+            "relay age should start on relay path"
+        );
+
+        health.observe(
+            RelayPathSnapshot {
+                kind: SelectedPathKind::Direct,
+                rtt_ms: Some(18),
+            },
+            now,
+        );
+        assert!(
+            health.relay_since.is_none(),
+            "direct path should clear relay-only aging"
+        );
+        assert_eq!(health.last_direct_at, Some(now));
+    }
+
+    #[test]
+    fn relay_health_reconnects_degraded_relay_paths() {
+        let now = std::time::Instant::now();
+        let mut health = RelayPeerHealth::default();
+        health.observe(
+            RelayPathSnapshot {
+                kind: SelectedPathKind::Relay,
+                rtt_ms: Some(RELAY_DEGRADED_RTT_MS + 50),
+            },
+            now - std::time::Duration::from_secs(30),
+        );
+
+        assert_eq!(
+            relay_reconnect_reason(
+                &health,
+                RelayPathSnapshot {
+                    kind: SelectedPathKind::Relay,
+                    rtt_ms: Some(RELAY_DEGRADED_RTT_MS + 50),
+                },
+                now,
+                0,
+                true,
+            ),
+            Some(RelayReconnectReason::RelayRttDegraded)
+        );
+    }
+
+    #[test]
+    fn relay_health_reconnects_long_lived_relay_paths() {
+        let now = std::time::Instant::now();
+        let mut health = RelayPeerHealth::default();
+        health.observe(
+            RelayPathSnapshot {
+                kind: SelectedPathKind::Relay,
+                rtt_ms: Some(260),
+            },
+            now - std::time::Duration::from_secs(RELAY_ONLY_RECONNECT_SECS + 5),
+        );
+
+        assert_eq!(
+            relay_reconnect_reason(
+                &health,
+                RelayPathSnapshot {
+                    kind: SelectedPathKind::Relay,
+                    rtt_ms: Some(260),
+                },
+                now,
+                0,
+                true,
+            ),
+            Some(RelayReconnectReason::RelayOnlyTooLong)
+        );
+    }
+
+    #[test]
+    fn relay_health_respects_cooldown_and_inflight_requests() {
+        let now = std::time::Instant::now();
+        let mut health = RelayPeerHealth::default();
+        health.observe(
+            RelayPathSnapshot {
+                kind: SelectedPathKind::Relay,
+                rtt_ms: Some(RELAY_DEGRADED_RTT_MS + 10),
+            },
+            now - std::time::Duration::from_secs(30),
+        );
+        health.last_reconnect_at =
+            Some(now - std::time::Duration::from_secs(RELAY_RECONNECT_COOLDOWN_SECS - 1));
+
+        assert_eq!(
+            relay_reconnect_reason(
+                &health,
+                RelayPathSnapshot {
+                    kind: SelectedPathKind::Relay,
+                    rtt_ms: Some(RELAY_DEGRADED_RTT_MS + 10),
+                },
+                now,
+                0,
+                true,
+            ),
+            None,
+            "cooldown should suppress immediate retry"
+        );
+
+        health.last_reconnect_at = None;
+        assert_eq!(
+            relay_reconnect_reason(
+                &health,
+                RelayPathSnapshot {
+                    kind: SelectedPathKind::Relay,
+                    rtt_ms: Some(RELAY_DEGRADED_RTT_MS + 10),
+                },
+                now,
+                1,
+                true,
+            ),
+            None,
+            "active requests should suppress relay refresh"
+        );
+        assert_eq!(
+            relay_reconnect_reason(
+                &health,
+                RelayPathSnapshot {
+                    kind: SelectedPathKind::Relay,
+                    rtt_ms: Some(RELAY_DEGRADED_RTT_MS + 10),
+                },
+                now,
+                0,
+                false,
+            ),
+            None,
+            "missing home relay should suppress churn"
+        );
+    }
+
+    #[test]
+    fn stale_dispatcher_cannot_remove_replacement_connection() {
+        assert!(
+            should_remove_connection(Some(7), 7),
+            "matching stable id should remove tracked connection"
+        );
+        assert!(
+            !should_remove_connection(Some(8), 7),
+            "stale dispatcher must not remove a newer replacement connection"
+        );
+        assert!(
+            !should_remove_connection(None, 7),
+            "missing connection slot should be a no-op"
+        );
     }
 
     /// RTT re-election: when a peer's RTT drops from above the 80ms split
