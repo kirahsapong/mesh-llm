@@ -1066,17 +1066,31 @@ export function App() {
         if (attachment.renderedPageImages?.length) kinds.add("image");
         continue;
       }
-      // Images with a browser-generated description will be sent as
-      // input_text — no vision model needed.
-      if (attachment.kind === "image" && attachment.imageDescription) {
+      // Images with a browser-generated description (or one in progress)
+      // will be sent as input_text — no vision model needed.
+      if (
+        attachment.kind === "image" &&
+        (attachment.imageDescription || attachment.status === "uploading")
+      ) {
         continue;
       }
       kinds.add(attachment.kind);
     }
     return kinds;
   }, [pendingAttachments]);
+  const imageDescriptionInProgress = useMemo(
+    () =>
+      pendingAttachments.some(
+        (a) =>
+          a.kind === "image" &&
+          a.status === "uploading" &&
+          !a.imageDescription,
+      ),
+    [pendingAttachments],
+  );
   const attachmentSendIssue = useMemo(() => {
     if (!pendingAttachments.length || !status) return null;
+    if (imageDescriptionInProgress) return "Describing image...";
     return getAttachmentSendIssue({
       pendingKinds,
       selectedModel,
