@@ -189,22 +189,20 @@ pub(crate) fn derive_quantization_type(stem: &str) -> String {
     let parts: Vec<&str> = stem.split('-').collect();
     for &part in parts.iter().rev() {
         let upper = part.to_uppercase();
-        if upper.starts_with('Q')
+        if (upper.starts_with('Q')
             || upper.starts_with("IQ")
             || upper.starts_with('F')
-            || upper.starts_with("BF")
-        {
-            if upper.len() >= 2
+            || upper.starts_with("BF"))
+            && ((upper.len() >= 2
                 && upper
                     .chars()
                     .nth(1)
                     .map(|c| c.is_ascii_digit())
-                    .unwrap_or(false)
+                    .unwrap_or(false))
                 || upper.starts_with("IQ")
-                || upper.starts_with("BF")
-            {
-                return part.to_string();
-            }
+                || upper.starts_with("BF"))
+        {
+            return part.to_string();
         }
     }
     String::new()

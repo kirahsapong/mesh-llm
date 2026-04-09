@@ -16,10 +16,14 @@ use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use tokio::sync::watch;
+
+pub use mesh_client_core::inference::election::{
+    should_be_host_for_model, total_model_bytes, InferenceTarget, LocalProcessInfo, ModelTargets,
+    MoeState,
+};
 
 /// Returns `true` when `flavor` and `gpu_count` together call for row-split
 /// tensor parallelism.
@@ -59,99 +63,6 @@ pub(crate) fn local_multi_gpu_split_mode(flavor: Option<BinaryFlavor>) -> Option
     } else {
         None
     }
-}
-
-/// Calculate total model size, summing all split files if present.
-/// Split files follow the pattern: name-00001-of-00004.gguf
-pub fn total_model_bytes(model: &Path) -> u64 {
-    let name = model.to_string_lossy();
-    // Check for split pattern: *-00001-of-NNNNN.gguf
-    if let Some(pos) = name.find("-00001-of-") {
-        let of_pos = pos + 10;
-        if let Some(ext_pos) = name[of_pos..].find(".gguf") {
-            if let Ok(n_split) = name[of_pos..of_pos + ext_pos].parse::<u32>() {
-                let prefix = &name[..pos + 1];
-                let suffix = &name[of_pos + ext_pos..];
-                let mut total: u64 = 0;
-                for i in 1..=n_split {
-                    let split_name = format!("{}{:05}-of-{:05}{}", prefix, i, n_split, suffix);
-                    total += std::fs::metadata(&split_name).map(|m| m.len()).unwrap_or(0);
-                }
-                return total;
-            }
-        }
-    }
-    std::fs::metadata(model).map(|m| m.len()).unwrap_or(0)
-}
-
-/// Determine if this node should be host for its model group.
-/// Only considers peers serving the same model.
-/// Deterministic: highest VRAM wins, tie-break by node ID.
-pub fn should_be_host_for_model(
-    my_id: iroh::EndpointId,
-    my_vram: u64,
-    model_peers: &[mesh::PeerInfo],
-) -> bool {
-    for peer in model_peers {
-        if matches!(peer.role, NodeRole::Client) {
-            continue;
-        }
-        if peer.vram_bytes > my_vram {
-            return false;
-        }
-        if peer.vram_bytes == my_vram && peer.id > my_id {
-            return false;
-        }
-    }
-    true
-}
-
-/// The current state of llama-server as managed by the election loop.
-/// The API proxy reads this to know where to forward requests.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum InferenceTarget {
-    /// No llama-server running anywhere (election in progress, mesh empty, etc.)
-    None,
-    /// We are host — llama-server is on this local port.
-    Local(u16),
-    /// Another node is host — proxy via QUIC to this peer.
-    Remote(iroh::EndpointId),
-    /// MoE mode — this node runs its own llama-server with its expert shard.
-    /// All MoE nodes are independent; the proxy picks one per session.
-    MoeLocal(u16),
-    /// MoE mode — another node is running its shard; proxy via QUIC.
-    MoeRemote(iroh::EndpointId),
-}
-
-/// MoE deployment state shared between election and proxy.
-/// The proxy uses this to route sessions to MoE nodes.
-#[derive(Clone, Debug, Default)]
-pub struct MoeState {
-    /// All MoE node targets (local + remote), in stable order.
-    pub nodes: Vec<InferenceTarget>,
-    /// Full-coverage targets that can serve the whole model if the active shard set fails.
-    pub fallbacks: Vec<InferenceTarget>,
-}
-
-/// Per-model routing table. The API proxy uses this to route by model name.
-#[derive(Clone, Debug, Default)]
-pub struct ModelTargets {
-    /// model_name → list of inference targets (multiple hosts = load balancing)
-    pub targets: HashMap<String, Vec<InferenceTarget>>,
-    /// MoE state — if set, this model uses MoE expert sharding.
-    /// The proxy uses this for session-sticky routing across MoE nodes.
-    pub moe: Option<MoeState>,
-    /// Round-robin counter for load balancing, shared across clones via Arc<AtomicU64>
-    /// so that all ModelTargets clones (including per-request proxy clones) share a sequence.
-    counter: Arc<AtomicU64>,
-}
-
-#[derive(Clone, Debug)]
-pub struct LocalProcessInfo {
-    pub backend: String,
-    pub pid: u32,
-    pub port: u16,
-    pub context_length: u32,
 }
 
 fn stop_requested(stop_rx: &watch::Receiver<bool>) -> bool {
@@ -206,74 +117,6 @@ async fn wait_for_peer_moe_ranking(
                 }
             }
         }
-    }
-}
-
-impl ModelTargets {
-    /// Get target for a specific model. Round-robins across multiple hosts.
-    pub fn get(&self, model: &str) -> InferenceTarget {
-        match self.targets.get(model) {
-            Some(targets) if !targets.is_empty() => {
-                let idx = self.counter.fetch_add(1, Ordering::Relaxed) as usize % targets.len();
-                targets[idx].clone()
-            }
-            _ => InferenceTarget::None,
-        }
-    }
-
-    /// All candidate targets for a model, preserving their current order.
-    pub fn candidates(&self, model: &str) -> Vec<InferenceTarget> {
-        self.targets.get(model).cloned().unwrap_or_default()
-    }
-
-    /// Round-robin pick from a caller-supplied candidate slice.
-    pub fn pick_from(&self, candidates: &[InferenceTarget]) -> InferenceTarget {
-        if candidates.is_empty() {
-            InferenceTarget::None
-        } else {
-            let idx = self.counter.fetch_add(1, Ordering::Relaxed) as usize % candidates.len();
-            candidates[idx].clone()
-        }
-    }
-
-    /// Sticky pick from a caller-supplied candidate slice.
-    pub fn pick_sticky_from(candidates: &[InferenceTarget], sticky_key: u64) -> InferenceTarget {
-        if candidates.is_empty() {
-            InferenceTarget::None
-        } else {
-            let idx = sticky_key as usize % candidates.len();
-            candidates[idx].clone()
-        }
-    }
-
-    /// Get MoE target for a session (hash-based routing).
-    /// Returns None if not in MoE mode.
-    pub fn get_moe_target(&self, session_hint: &str) -> Option<InferenceTarget> {
-        let moe = self.moe.as_ref()?;
-        if moe.nodes.is_empty() {
-            return None;
-        }
-        // Simple hash routing: hash the session hint, pick a node
-        let hash = session_hint
-            .bytes()
-            .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
-        let idx = (hash as usize) % moe.nodes.len();
-        Some(moe.nodes[idx].clone())
-    }
-
-    pub fn get_moe_failover_targets(&self, session_hint: &str) -> Vec<InferenceTarget> {
-        let Some(primary) = self.get_moe_target(session_hint) else {
-            return Vec::new();
-        };
-        let mut ordered = vec![primary.clone()];
-        if let Some(moe) = self.moe.as_ref() {
-            for fallback in &moe.fallbacks {
-                if fallback != &primary {
-                    ordered.push(fallback.clone());
-                }
-            }
-        }
-        ordered
     }
 }
 
@@ -400,10 +243,10 @@ impl MoePlacementPlan {
     }
 }
 
-fn running_plan_state<'a>(
-    last_plan: Option<&'a MoePlacementPlan>,
+fn running_plan_state(
+    last_plan: Option<&MoePlacementPlan>,
     currently_running: bool,
-) -> (&'a [iroh::EndpointId], &'a [iroh::EndpointId]) {
+) -> (&[iroh::EndpointId], &[iroh::EndpointId]) {
     if currently_running {
         let active_ids = last_plan
             .map(|plan| plan.active_ids.as_slice())
@@ -651,7 +494,7 @@ fn resolve_runtime_moe_config(
     eprintln!(
         "🧩 [{}] MoE ranking={} resolved in {:.1}s",
         model_name,
-        format!("{ranking_source} origin={ranking_origin}"),
+        format_args!("{ranking_source} origin={ranking_origin}"),
         started.elapsed().as_secs_f64()
     );
 
@@ -742,6 +585,7 @@ fn format_moe_analysis_progress_line(
     total: Option<usize>,
     elapsed: std::time::Duration,
 ) -> String {
+    let mode_label = format!("MoE {mode}");
     let progress = match total {
         Some(total) if total > 0 => format!(
             "{:>5.1}%  {}/{}",
@@ -753,10 +597,8 @@ fn format_moe_analysis_progress_line(
         None => "starting".to_string(),
     };
     format!(
-        "🧩 [{}] {:<17} {}  {:>3}s",
-        model_name,
-        format!("MoE {mode}"),
-        format!("{spinner} {progress}"),
+        "🧩 [{model_name}] {:<17} {spinner} {progress}  {:>3}s",
+        mode_label,
         elapsed.as_secs()
     )
 }
@@ -1156,6 +998,7 @@ fn default_micro_prompts() -> &'static [&'static str] {
 ///
 /// Publishes the current ModelTargets via the watch channel so the
 /// API proxy knows where to forward requests.
+#[allow(clippy::too_many_arguments)]
 pub async fn election_loop(
     node: mesh::Node,
     tunnel_mgr: tunnel::Manager,
@@ -1193,12 +1036,12 @@ pub async fn election_loop(
 
     // Check if this is a MoE model with enough metadata to plan expert routing.
     let moe_config = lookup_moe_config(&model_name, &model);
-    if moe_config.is_some() {
+    if let Some(ref moe_config) = moe_config {
         eprintln!(
             "🧩 [{}] MoE model detected ({} experts, top-{})",
             model_name,
-            moe_config.as_ref().unwrap().n_expert,
-            moe_config.as_ref().unwrap().n_expert_used
+            moe_config.n_expert,
+            moe_config.n_expert_used
         );
     }
 
@@ -1251,7 +1094,7 @@ pub async fn election_loop(
                 model_name,
                 resolved_moe_cfg,
                 my_vram,
-                model_bytes as u64,
+                model_bytes,
                 binary_flavor,
                 ctx_size_override,
                 target_tx,
@@ -1340,10 +1183,7 @@ pub async fn election_loop(
             model_peers
                 .iter()
                 .filter(|p| !matches!(p.role, NodeRole::Client))
-                .filter(|p| match p.rtt_ms {
-                    Some(rtt) if rtt > mesh::MAX_SPLIT_RTT_MS => false,
-                    _ => true,
-                })
+                .filter(|p| !matches!(p.rtt_ms, Some(rtt) if rtt > mesh::MAX_SPLIT_RTT_MS))
                 .map(|p| p.id)
                 .collect()
         } else {
@@ -1606,6 +1446,7 @@ pub async fn election_loop(
 /// - Each node runs moe-split locally to produce its shard (cached)
 /// - Each node starts its own llama-server with its shard GGUF
 /// - The proxy routes sessions to nodes via hash-based affinity
+#[allow(clippy::too_many_arguments)]
 async fn moe_election_loop(
     node: mesh::Node,
     tunnel_mgr: tunnel::Manager,
@@ -2265,15 +2106,16 @@ async fn update_targets(
         }
     }
 
-    target_tx.send_replace(ModelTargets {
-        targets,
-        moe: None,
-        counter: Default::default(),
-    });
+    {
+        let mut mt = ModelTargets::default();
+        mt.targets = targets;
+        target_tx.send_replace(mt);
+    }
 }
 
 /// Start llama-server with --rpc pointing at model-group nodes (self + workers).
 /// Returns the ephemeral port and a death notification receiver, or None on failure.
+#[allow(clippy::too_many_arguments)]
 async fn start_llama(
     node: &mesh::Node,
     tunnel_mgr: &tunnel::Manager,
@@ -2441,7 +2283,7 @@ async fn start_llama(
 
     // Look up mmproj for vision models
     let mmproj_path =
-        crate::models::resolve_mmproj_path(model_name, model, explicit_mmproj.as_deref());
+        crate::models::resolve_mmproj_path(model_name, model, explicit_mmproj);
 
     // In split mode (pipeline parallel), pass total group VRAM so context size
     // accounts for the host only holding its share of layers. KV cache is also

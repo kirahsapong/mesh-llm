@@ -2,6 +2,10 @@
 members = [
     "mesh-llm",
     "mesh-llm/plugin",
+    "mesh-client-core",
+    "mesh-host-core",
+    "mesh-ffi",
+    "mesh-llm-test-harness",
 ]
 default-members = [
     "mesh-llm",

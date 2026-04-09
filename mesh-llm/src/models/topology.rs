@@ -1,44 +1,18 @@
 use super::catalog;
 use super::local::{huggingface_hub_cache, huggingface_identity_for_path};
 use hf_hub::Repo;
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ModelTopology {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub moe: Option<ModelMoeInfo>,
-}
+pub use mesh_client_core::models::topology::{ModelMoeInfo, ModelTopology};
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ModelMoeInfo {
-    pub expert_count: u32,
-    pub used_expert_count: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub min_experts_per_node: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ranking_source: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ranking_origin: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub ranking: Vec<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ranking_prompt_count: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ranking_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ranking_layer_scope: Option<String>,
-}
-
+#[allow(dead_code)]
 pub fn infer_catalog_topology(model: &catalog::CatalogModel) -> Option<ModelTopology> {
     model.moe.as_ref().map(|moe| ModelTopology {
         moe: Some(ModelMoeInfo {
-            expert_count: moe.n_expert as u32,
-            used_expert_count: moe.n_expert_used as u32,
-            min_experts_per_node: Some(moe.min_experts_per_node as u32),
+            expert_count: moe.n_expert,
+            used_expert_count: moe.n_expert_used,
+            min_experts_per_node: Some(moe.min_experts_per_node),
             source: Some("catalog".to_string()),
             ranking_source: None,
             ranking_origin: None,
@@ -50,6 +24,7 @@ pub fn infer_catalog_topology(model: &catalog::CatalogModel) -> Option<ModelTopo
     })
 }
 
+#[allow(dead_code)]
 pub fn infer_local_model_topology(
     path: &Path,
     catalog: Option<&catalog::CatalogModel>,
@@ -61,6 +36,7 @@ pub fn infer_local_model_topology(
     read_local_config(path).and_then(|config| infer_hf_metadata_topology(&config))
 }
 
+#[allow(dead_code)]
 fn infer_hf_metadata_topology(config: &Value) -> Option<ModelTopology> {
     let expert_count = config.get("num_experts").and_then(|value| value.as_u64())? as u32;
     if expert_count <= 1 {
@@ -88,6 +64,7 @@ fn infer_hf_metadata_topology(config: &Value) -> Option<ModelTopology> {
     })
 }
 
+#[allow(dead_code)]
 fn read_local_config(path: &Path) -> Option<Value> {
     // Derive the snapshot root using the hf-hub CacheRepo::pointer_path() API.
     // This matches the authoritative cache layout: cache/models--{org}--{repo}/snapshots/{revision}/

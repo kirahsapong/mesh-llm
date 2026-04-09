@@ -181,7 +181,7 @@ pub(super) async fn api_proxy(
 
                     let use_pipeline = classification
                         .as_ref()
-                        .map(|cl| pipeline::should_pipeline(cl))
+                        .map(pipeline::should_pipeline)
                         .unwrap_or(false)
                         && request.response_adapter == proxy::ResponseAdapter::None;
 
@@ -357,7 +357,6 @@ pub(super) async fn api_proxy(
                 }
                 Err(err) => {
                     let _ = proxy::send_400(tcp_stream, &err.to_string()).await;
-                    return;
                 }
             };
         });

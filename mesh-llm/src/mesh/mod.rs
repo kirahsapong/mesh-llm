@@ -4,6 +4,13 @@
 //! one QUIC connection per peer. Bi-streams are multiplexed by first byte:
 //! 0x01 = gossip, 0x02 = tunnel (RPC), 0x03 = tunnel map, 0x04 = tunnel (HTTP).
 
+pub use mesh_client_core::mesh::{
+    infer_available_model_descriptors, infer_local_served_model_descriptor,
+    infer_served_model_descriptors, merge_demand, ModelDemand, ModelRuntimeDescriptor,
+    ModelSourceKind, NodeRole, PeerAnnouncement, PeerInfo, ServedModelDescriptor,
+    ServedModelIdentity, DEMAND_TTL_SECS, MAX_SPLIT_RTT_MS,
+};
+
 use anyhow::Result;
 use base64::Engine;
 use iroh::endpoint::Connection;
@@ -17,24 +24,6 @@ use tokio::sync::{watch, Mutex};
 
 use crate::inference::moe;
 use crate::protocol::*;
-
-/// Demand signal for a model — tracks interest via API requests and --model declarations.
-/// Gossiped across the mesh and merged via max(). Decays naturally when last_active gets old.
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
-pub struct ModelDemand {
-    /// Unix timestamp of the most recent request or declaration.
-    pub last_active: u64,
-    /// Total requests seen (merged across peers via max).
-    pub request_count: u64,
-}
-
-/// How long a demand entry stays relevant without being refreshed.
-pub const DEMAND_TTL_SECS: u64 = 86400; // 24 hours
-
-/// Maximum RTT (ms) for a peer to be included in split mode.
-/// Peers above this threshold are skipped during election.
-/// Used by both the election RTT gate and the RTT-improvement re-election trigger.
-pub const MAX_SPLIT_RTT_MS: u32 = 80;
 
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
@@ -61,126 +50,6 @@ fn node_role_label(role: &NodeRole) -> String {
         NodeRole::Host { .. } => "host".into(),
         NodeRole::Client => "client".into(),
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct ServedModelIdentity {
-    pub model_name: String,
-    pub is_primary: bool,
-    pub source_kind: ModelSourceKind,
-    pub canonical_ref: Option<String>,
-    pub repository: Option<String>,
-    pub revision: Option<String>,
-    pub artifact: Option<String>,
-    pub local_file_name: Option<String>,
-    pub identity_hash: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct ServedModelDescriptor {
-    pub identity: ServedModelIdentity,
-    pub capabilities: crate::models::ModelCapabilities,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub topology: Option<crate::models::ModelTopology>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct ModelRuntimeDescriptor {
-    pub model_name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub identity_hash: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub context_length: Option<u32>,
-    pub ready: bool,
-}
-
-impl ModelRuntimeDescriptor {
-    pub fn advertised_context_length(&self) -> Option<u32> {
-        self.ready.then_some(self.context_length).flatten()
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum ModelSourceKind {
-    Catalog,
-    HuggingFace,
-    LocalGguf,
-    DirectUrl,
-    #[default]
-    Unknown,
-}
-
-pub fn infer_served_model_descriptors(
-    primary_model_name: &str,
-    serving_models: &[String],
-    model_source: Option<&str>,
-    primary_model_path: Option<&std::path::Path>,
-) -> Vec<ServedModelDescriptor> {
-    let primary = model_source
-        .and_then(identity_from_model_source)
-        .or_else(|| {
-            primary_model_path.and_then(|path| identity_from_model_path(primary_model_name, path))
-        });
-    serving_models
-        .iter()
-        .enumerate()
-        .map(|(idx, model_name)| {
-            if idx == 0 || model_name == primary_model_name {
-                let mut identity = primary.clone().unwrap_or_default();
-                identity.model_name = model_name.clone();
-                identity.is_primary = true;
-                if identity.local_file_name.is_none() {
-                    identity.local_file_name = Some(format!("{model_name}.gguf"));
-                }
-                descriptor_from_identity(model_name, identity)
-            } else {
-                descriptor_from_model_path(
-                    model_name,
-                    &crate::models::find_model_path(model_name),
-                    false,
-                )
-                .unwrap_or_else(|| ServedModelDescriptor {
-                    identity: ServedModelIdentity {
-                        model_name: model_name.clone(),
-                        is_primary: false,
-                        source_kind: ModelSourceKind::Unknown,
-                        canonical_ref: None,
-                        repository: None,
-                        revision: None,
-                        artifact: None,
-                        local_file_name: Some(format!("{model_name}.gguf")),
-                        identity_hash: None,
-                    },
-                    capabilities: crate::models::ModelCapabilities::default(),
-                    topology: None,
-                })
-            }
-        })
-        .collect()
-}
-
-pub fn infer_available_model_descriptors(
-    available_models: &[String],
-) -> Vec<ServedModelDescriptor> {
-    available_models
-        .iter()
-        .filter_map(|model_name| {
-            let path = crate::models::find_model_path(model_name);
-            descriptor_from_model_path(model_name, &path, false)
-        })
-        .collect()
-}
-
-pub fn infer_local_served_model_descriptor(
-    model_name: &str,
-    is_primary: bool,
-) -> Option<ServedModelDescriptor> {
-    descriptor_from_model_path(
-        model_name,
-        &crate::models::find_model_path(model_name),
-        is_primary,
-    )
 }
 
 pub fn backfill_legacy_descriptors(ann: &mut PeerAnnouncement) {
@@ -371,6 +240,7 @@ fn identity_from_model_path(
     None
 }
 
+#[allow(dead_code)]
 fn descriptor_from_model_path(
     model_name: &str,
     path: &std::path::Path,
@@ -381,6 +251,7 @@ fn descriptor_from_model_path(
     Some(descriptor_from_identity(model_name, identity))
 }
 
+#[allow(dead_code)]
 fn descriptor_from_identity(
     model_name: &str,
     mut identity: ServedModelIdentity,
@@ -422,6 +293,7 @@ fn descriptor_from_identity(
     }
 }
 
+#[allow(dead_code)]
 fn enrich_topology_with_local_shared_ranking(
     path: &std::path::Path,
     topology: &mut Option<crate::models::ModelTopology>,
@@ -1007,176 +879,45 @@ fn apply_transitive_ann(
     serving_changed
 }
 
-/// Merge two demand maps. For each model, take max of last_active and request_count.
-pub fn merge_demand(
-    ours: &mut HashMap<String, ModelDemand>,
-    theirs: &HashMap<String, ModelDemand>,
-) {
-    for (model, their_demand) in theirs {
-        let entry = ours.entry(model.clone()).or_default();
-        entry.last_active = entry.last_active.max(their_demand.last_active);
-        entry.request_count = entry.request_count.max(their_demand.request_count);
-    }
-}
-
-/// Role a node plays in the mesh.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub enum NodeRole {
-    /// Provides GPU compute via rpc-server for a specific model.
-    Worker,
-    /// Runs llama-server for a specific model, orchestrates inference, provides HTTP API.
-    Host { http_port: u16 },
-    /// Lite client — no compute, accesses the API via tunnel.
-    Client,
-}
-
-impl Default for NodeRole {
-    fn default() -> Self {
-        NodeRole::Worker
-    }
-}
-
-/// Gossip payload — extends EndpointAddr with role metadata.
-/// Internal mesh gossip model. Legacy JSON v0 is adapted at the boundary.
-#[derive(Debug, Clone)]
-pub(crate) struct PeerAnnouncement {
-    pub(crate) addr: EndpointAddr,
-    pub(crate) role: NodeRole,
-    pub(crate) models: Vec<String>,
-    pub(crate) vram_bytes: u64,
-    pub(crate) model_source: Option<String>,
-    pub(crate) serving_models: Vec<String>,
-    pub(crate) hosted_models: Option<Vec<String>>,
-    /// All GGUF filenames on disk in managed or legacy local storage (for mesh catalog)
-    pub(crate) available_models: Vec<String>,
-    pub(crate) requested_models: Vec<String>,
-    pub(crate) version: Option<String>,
-    pub(crate) model_demand: HashMap<String, ModelDemand>,
-    pub(crate) mesh_id: Option<String>,
-    pub(crate) gpu_name: Option<String>,
-    pub(crate) hostname: Option<String>,
-    pub(crate) is_soc: Option<bool>,
-    pub(crate) gpu_vram: Option<String>,
-    pub(crate) gpu_bandwidth_gbps: Option<String>,
-    pub(crate) available_model_metadata: Vec<crate::proto::node::CompactModelMetadata>,
-    pub(crate) experts_summary: Option<crate::proto::node::ExpertsSummary>,
-    pub(crate) available_model_sizes: HashMap<String, u64>,
-    pub(crate) served_model_descriptors: Vec<ServedModelDescriptor>,
-    pub(crate) served_model_runtime: Vec<ModelRuntimeDescriptor>,
-    pub(crate) owner_id: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct PeerInfo {
-    pub id: EndpointId,
-    pub addr: EndpointAddr,
-    pub tunnel_port: Option<u16>,
-    pub role: NodeRole,
-    pub models: Vec<String>,
-    pub vram_bytes: u64,
-    pub rtt_ms: Option<u32>,
-    pub model_source: Option<String>,
-    /// All models assigned to this peer, even if not yet healthy.
-    pub serving_models: Vec<String>,
-    /// Models this node is actively routing inference for.
-    pub hosted_models: Vec<String>,
-    /// True when this peer explicitly advertised `hosted_models`.
-    pub hosted_models_known: bool,
-    /// All GGUFs on disk
-    pub available_models: Vec<String>,
-    /// Models this node has requested the mesh to serve
-    pub requested_models: Vec<String>,
-    /// Last time we directly communicated with this peer (gossip, heartbeat, tunnel).
-    /// Peers not seen in PEER_STALE_SECS are pruned from gossip and eventually removed.
-    pub last_seen: std::time::Instant,
-    /// When this peer returned after being considered dead. MoE scale-up should
-    /// wait briefly before treating the peer as eligible again.
-    pub moe_recovered_at: Option<std::time::Instant>,
-    /// mesh-llm version (e.g. "0.23.0")
-    pub version: Option<String>,
-    /// GPU name/model (e.g. "NVIDIA A100", "Apple M4 Max")
-    pub gpu_name: Option<String>,
-    /// Hostname of the node
-    pub hostname: Option<String>,
-    pub is_soc: Option<bool>,
-    pub gpu_vram: Option<String>,
-    pub gpu_bandwidth_gbps: Option<String>,
-    pub available_model_metadata: Vec<crate::proto::node::CompactModelMetadata>,
-    pub experts_summary: Option<crate::proto::node::ExpertsSummary>,
-    pub available_model_sizes: HashMap<String, u64>,
-    pub served_model_descriptors: Vec<ServedModelDescriptor>,
-    pub served_model_runtime: Vec<ModelRuntimeDescriptor>,
-    pub owner_id: Option<String>,
-}
-
 #[derive(Debug, Clone)]
 pub struct MeshCatalogEntry {
     pub model_name: String,
     pub descriptor: Option<ServedModelDescriptor>,
 }
 
-impl PeerInfo {
-    fn from_announcement(id: EndpointId, addr: EndpointAddr, ann: &PeerAnnouncement) -> Self {
-        Self {
-            id,
-            addr,
-            tunnel_port: None,
-            role: ann.role.clone(),
-            models: ann.models.clone(),
-            vram_bytes: ann.vram_bytes,
-            rtt_ms: None,
-            model_source: ann.model_source.clone(),
-            serving_models: ann.serving_models.clone(),
-            hosted_models: ann.hosted_models.clone().unwrap_or_default(),
-            hosted_models_known: ann.hosted_models.is_some(),
-            available_models: ann.available_models.clone(),
-            requested_models: ann.requested_models.clone(),
-            last_seen: std::time::Instant::now(),
-            moe_recovered_at: None,
-            version: ann.version.clone(),
-            gpu_name: ann.gpu_name.clone(),
-            hostname: ann.hostname.clone(),
-            is_soc: ann.is_soc,
-            gpu_vram: ann.gpu_vram.clone(),
-            gpu_bandwidth_gbps: ann.gpu_bandwidth_gbps.clone(),
-            available_model_metadata: ann.available_model_metadata.clone(),
-            experts_summary: ann.experts_summary.clone(),
-            available_model_sizes: ann.available_model_sizes.clone(),
-            served_model_descriptors: ann.served_model_descriptors.clone(),
-            served_model_runtime: ann.served_model_runtime.clone(),
-            owner_id: ann.owner_id.clone(),
-        }
-    }
-
-    pub fn is_assigned_model(&self, model: &str) -> bool {
-        self.serving_models.iter().any(|m| m == model)
-    }
-
-    pub fn routable_models(&self) -> Vec<String> {
-        if self.hosted_models_known {
-            self.hosted_models.clone()
-        } else {
-            self.serving_models.clone()
-        }
-    }
-
-    pub fn routes_model(&self, model: &str) -> bool {
-        if self.hosted_models_known {
-            self.hosted_models.iter().any(|m| m == model)
-        } else {
-            self.is_assigned_model(model)
-        }
-    }
-
-    pub fn moe_recovery_ready(&self) -> bool {
-        moe_recovery_ready_at(self.moe_recovered_at, std::time::Instant::now())
-    }
-
-    pub fn advertised_context_length(&self, model: &str) -> Option<u32> {
-        self.served_model_runtime
-            .iter()
-            .find(|runtime| runtime.model_name == model)
-            .and_then(ModelRuntimeDescriptor::advertised_context_length)
+fn peer_info_from_announcement(
+    id: EndpointId,
+    addr: EndpointAddr,
+    ann: &PeerAnnouncement,
+) -> PeerInfo {
+    PeerInfo {
+        id,
+        addr,
+        tunnel_port: None,
+        role: ann.role.clone(),
+        models: ann.models.clone(),
+        vram_bytes: ann.vram_bytes,
+        rtt_ms: None,
+        model_source: ann.model_source.clone(),
+        serving_models: ann.serving_models.clone(),
+        hosted_models: ann.hosted_models.clone().unwrap_or_default(),
+        hosted_models_known: ann.hosted_models.is_some(),
+        available_models: ann.available_models.clone(),
+        requested_models: ann.requested_models.clone(),
+        last_seen: std::time::Instant::now(),
+        moe_recovered_at: None,
+        version: ann.version.clone(),
+        gpu_name: ann.gpu_name.clone(),
+        hostname: ann.hostname.clone(),
+        is_soc: ann.is_soc,
+        gpu_vram: ann.gpu_vram.clone(),
+        gpu_bandwidth_gbps: ann.gpu_bandwidth_gbps.clone(),
+        available_model_metadata: ann.available_model_metadata.clone(),
+        experts_summary: ann.experts_summary.clone(),
+        available_model_sizes: ann.available_model_sizes.clone(),
+        served_model_descriptors: ann.served_model_descriptors.clone(),
+        served_model_runtime: ann.served_model_runtime.clone(),
+        owner_id: ann.owner_id.clone(),
     }
 }
 
@@ -1295,7 +1036,7 @@ async fn stun_public_addr(advertised_port: u16) -> Option<std::net::SocketAddr> 
                     }
 
                     // Attributes are padded to 4-byte boundary
-                    i += 4 + (attr_len + 3) & !3;
+                    i += (4 + (attr_len + 3)) & !3;
                 }
             }
             _ => continue,
@@ -2185,7 +1926,7 @@ impl Node {
             // If RTT dropped from above the split threshold (80ms) to below it
             // (e.g. relay → direct), trigger a re-election so the peer can now
             // be included in split mode.
-            let was_above = old_rtt.map_or(false, |r| r > MAX_SPLIT_RTT_MS);
+            let was_above = old_rtt.is_some_and(|r| r > MAX_SPLIT_RTT_MS);
             if was_above && rtt_ms <= MAX_SPLIT_RTT_MS {
                 eprintln!(
                     "📡 Peer {} RTT improved ({}ms → {}ms) — re-electing for split",
@@ -3512,7 +3253,6 @@ impl Node {
             match stream_type {
                 STREAM_GOSSIP => {
                     let node = self.clone();
-                    let protocol = protocol;
                     tokio::spawn(async move {
                         if let Err(e) = node
                             .handle_gossip_stream(remote, protocol, send, recv)
@@ -3530,7 +3270,6 @@ impl Node {
                 }
                 STREAM_TUNNEL_MAP => {
                     let node = self.clone();
-                    let protocol = protocol;
                     tokio::spawn(async move {
                         if let Err(e) = node.handle_tunnel_map_stream(remote, protocol, recv).await
                         {
@@ -3549,7 +3288,6 @@ impl Node {
                 }
                 STREAM_ROUTE_REQUEST => {
                     let node = self.clone();
-                    let protocol = protocol;
                     tokio::spawn(async move {
                         if protocol == ControlProtocol::ProtoV1 {
                             let proto_buf = match read_len_prefixed(&mut recv).await {
@@ -3599,7 +3337,6 @@ impl Node {
                 }
                 STREAM_PEER_DOWN => {
                     let node = self.clone();
-                    let protocol = protocol;
                     tokio::spawn(async move {
                         let peer_id_arr: [u8; 32] = match protocol {
                             ControlProtocol::ProtoV1 => {
@@ -3694,7 +3431,6 @@ impl Node {
                 }
                 STREAM_PEER_LEAVING => {
                     let node = self.clone();
-                    let protocol = protocol;
                     tokio::spawn(async move {
                         let leaving_id = match protocol {
                             ControlProtocol::ProtoV1 => {
@@ -4133,24 +3869,21 @@ impl Node {
         };
         let (notif_tx, notif_rx) = tokio::sync::watch::channel(empty_notif);
         tokio::spawn(async move {
-            loop {
-                match read_len_prefixed(&mut recv).await {
-                    Ok(buf) => match ConfigUpdateNotification::decode(buf.as_slice()) {
-                        Ok(notif) => {
-                            if let Err(e) = notif.validate_frame() {
-                                tracing::warn!("ConfigUpdateNotification validation error: {e}");
-                                break;
-                            }
-                            if notif_tx.send(notif).is_err() {
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("ConfigUpdateNotification decode error: {e}");
+            while let Ok(buf) = read_len_prefixed(&mut recv).await {
+                match ConfigUpdateNotification::decode(buf.as_slice()) {
+                    Ok(notif) => {
+                        if let Err(e) = notif.validate_frame() {
+                            tracing::warn!("ConfigUpdateNotification validation error: {e}");
                             break;
                         }
-                    },
-                    Err(_) => break,
+                        if notif_tx.send(notif).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("ConfigUpdateNotification decode error: {e}");
+                        break;
+                    }
                 }
             }
         });
@@ -4595,7 +4328,7 @@ impl Node {
             ann.available_models,
             state.peers.len() + 1
         );
-        let mut peer = PeerInfo::from_announcement(id, addr, ann);
+        let mut peer = peer_info_from_announcement(id, addr, ann);
         if recovered {
             peer.moe_recovered_at = Some(now);
         }
@@ -4667,7 +4400,7 @@ impl Node {
         } else {
             // New transitive peer — add with last_seen = now but no peer_change event.
             // It will get pruned after PEER_STALE_SECS*2 if never directly contacted.
-            let peer = PeerInfo::from_announcement(id, addr.clone(), ann);
+            let peer = peer_info_from_announcement(id, addr.clone(), ann);
             state.peers.insert(id, peer.clone());
             drop(state);
             self.emit_plugin_mesh_event(
@@ -7071,7 +6804,7 @@ mod tests {
 
         // Build PeerInfo as add_peer would, verify passive inventory metadata stays empty.
         let mut peers: HashMap<EndpointId, PeerInfo> = HashMap::new();
-        let peer_info = PeerInfo::from_announcement(peer_id, addr.clone(), &local_ann);
+        let peer_info = peer_info_from_announcement(peer_id, addr.clone(), &local_ann);
         peers.insert(peer_id, peer_info);
 
         let stored = peers.get(&peer_id).unwrap();

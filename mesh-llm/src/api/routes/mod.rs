@@ -40,6 +40,7 @@ async fn dispatch_blackboard(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn dispatch_request(
     stream: &mut TcpStream,
     state: &MeshApi,

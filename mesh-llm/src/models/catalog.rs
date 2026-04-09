@@ -1,182 +1,23 @@
-//! Built-in model catalog plus managed acquisition helpers.
+pub use mesh_client_core::models::catalog::*;
 
 use anyhow::{Context, Result};
 use hf_hub::api::Progress as HfProgress;
 use hf_hub::{Repo, RepoType};
-use serde::Deserialize;
 #[cfg(test)]
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::Arc;
+#[cfg(test)]
 use std::sync::LazyLock;
 #[cfg(test)]
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
-#[derive(Clone, Debug, Deserialize)]
-pub struct CatalogAsset {
-    pub file: String,
-    pub url: String,
-}
 
-#[derive(Clone, Debug)]
-pub struct CatalogModel {
-    pub name: String,
-    pub file: String,
-    /// Legacy transport field. Prefer `source_repo()`, `source_revision()`,
-    /// and `source_file()` for curated model identity.
-    pub url: String,
-    pub size: String,
-    pub description: String,
-    /// If set, this model has a recommended draft model for speculative decoding.
-    pub draft: Option<String>,
-    /// MoE expert routing config. If set, this model supports expert sharding.
-    /// Pre-computed from `moe-analyze --export-ranking --all-layers`.
-    pub moe: Option<MoeConfig>,
-    /// Additional split GGUF files (for models too large for a single file).
-    /// llama.cpp auto-discovers splits from the first file, but all parts
-    /// must be present in the same directory.
-    pub extra_files: Vec<CatalogAsset>,
-    /// Multimodal projector for vision models.
-    /// When set, llama-server is launched with `--mmproj <file>`.
-    pub mmproj: Option<CatalogAsset>,
-}
-
-impl CatalogModel {
-    pub fn source_repo(&self) -> Option<&str> {
-        parse_hf_resolve_url_parts(&self.url).map(|(repo, _, _)| repo)
-    }
-
-    pub fn source_revision(&self) -> Option<&str> {
-        parse_hf_resolve_url_parts(&self.url).and_then(|(_, revision, _)| revision)
-    }
-
-    pub fn source_file(&self) -> Option<&str> {
-        parse_hf_resolve_url_parts(&self.url).map(|(_, _, file)| file)
-    }
-}
-
-/// Pre-computed MoE expert sharding configuration for a model.
-/// Derived from router gate mass analysis — determines which experts go where.
-#[derive(Clone, Debug)]
-pub struct MoeConfig {
-    /// Total number of experts in the model
-    pub n_expert: u32,
-    /// Number of experts selected per token (top-k)
-    pub n_expert_used: u32,
-    /// Minimum number of experts per node for coherent output.
-    /// Determined experimentally per model (~36% for Qwen3-30B-A3B).
-    pub min_experts_per_node: u32,
-    /// Expert IDs sorted by gate mass descending (hottest first).
-    pub ranking: Vec<u32>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CatalogModelJson {
-    name: String,
-    file: String,
-    url: String,
-    size: String,
-    description: String,
-    draft: Option<String>,
-    moe: Option<MoeConfigJson>,
-    #[serde(default)]
-    extra_files: Vec<CatalogAsset>,
-    mmproj: Option<CatalogAsset>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct MoeConfigJson {
-    n_expert: u32,
-    n_expert_used: u32,
-    min_experts_per_node: u32,
-}
-
-pub static MODEL_CATALOG: LazyLock<Vec<CatalogModel>> = LazyLock::new(load_catalog);
-
-fn load_catalog() -> Vec<CatalogModel> {
-    let raw: Vec<CatalogModelJson> =
-        serde_json::from_str(include_str!("catalog.json")).expect("parse bundled catalog.json");
-    raw.into_iter().map(CatalogModel::from_json).collect()
-}
-
-impl CatalogModel {
-    fn from_json(raw: CatalogModelJson) -> Self {
-        Self {
-            name: raw.name,
-            file: raw.file,
-            url: raw.url,
-            size: raw.size,
-            description: raw.description,
-            draft: raw.draft,
-            moe: raw.moe.map(MoeConfig::from_json),
-            extra_files: raw.extra_files,
-            mmproj: raw.mmproj,
-        }
-    }
-}
-
-impl MoeConfig {
-    fn from_json(raw: MoeConfigJson) -> Self {
-        Self {
-            n_expert: raw.n_expert,
-            n_expert_used: raw.n_expert_used,
-            min_experts_per_node: raw.min_experts_per_node,
-            ranking: Vec::new(),
-        }
-    }
-}
-
-/// Get the canonical managed model root (the Hugging Face hub cache).
 pub fn models_dir() -> PathBuf {
     crate::models::huggingface_hub_cache_dir()
-}
-
-/// Find a catalog model by name (case-insensitive partial match)
-/// Parse a size string like "20GB", "4.4GB", "491MB" into GB as f64.
-pub fn parse_size_gb(s: &str) -> f64 {
-    let s = s.trim();
-    if let Some(gb) = s.strip_suffix("GB") {
-        gb.trim().parse().unwrap_or(0.0)
-    } else if let Some(mb) = s.strip_suffix("MB") {
-        mb.trim().parse::<f64>().unwrap_or(0.0) / 1000.0
-    } else {
-        0.0
-    }
-}
-
-pub fn find_model(query: &str) -> Option<&'static CatalogModel> {
-    let q = query.to_lowercase();
-    MODEL_CATALOG
-        .iter()
-        .find(|m| m.name.to_lowercase() == q)
-        .or_else(|| {
-            MODEL_CATALOG
-                .iter()
-                .find(|m| m.name.to_lowercase().contains(&q))
-        })
-}
-
-fn parse_hf_resolve_url_parts(url: &str) -> Option<(&str, Option<&str>, &str)> {
-    let tail = url
-        .strip_prefix("https://huggingface.co/")
-        .or_else(|| url.strip_prefix("http://huggingface.co/"))?;
-    let (repo, rest) = tail.split_once("/resolve/")?;
-    if !repo.contains('/') {
-        return None;
-    }
-    let (revision, file) = rest.split_once('/')?;
-    if file.is_empty() {
-        return None;
-    }
-    Some((repo, Some(revision), file))
-}
-
-pub fn huggingface_repo_url(url: &str) -> Option<String> {
-    let (repo, _, _) = parse_hf_resolve_url_parts(url)?;
-    Some(format!("https://huggingface.co/{repo}"))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -587,9 +428,6 @@ pub async fn download_hf_repo_file(
         })
 }
 
-/// Download a model into the managed model store with resume support.
-/// Returns the path to the primary downloaded file.
-/// For split GGUFs (extra_files), downloads all parts to the same directory.
 pub async fn download_model(model: &CatalogModel) -> Result<PathBuf> {
     let hf_assets: Option<Vec<HfAsset>> = std::iter::once(model.url.as_str())
         .chain(model.extra_files.iter().map(|asset| asset.url.as_str()))
@@ -622,7 +460,6 @@ pub async fn download_model(model: &CatalogModel) -> Result<PathBuf> {
     tokio::fs::create_dir_all(&dir).await?;
     let dest = dir.join(&model.file);
 
-    // Collect all files to download: primary + extra splits + mmproj
     let mut files: Vec<(&str, &str)> = vec![(model.file.as_str(), model.url.as_str())];
     for asset in &model.extra_files {
         files.push((asset.file.as_str(), asset.url.as_str()));
@@ -659,7 +496,6 @@ pub async fn download_model(model: &CatalogModel) -> Result<PathBuf> {
 
     eprintln!("📥 Downloading {} ({})...", model.name, model.size);
 
-    // Collect files that still need downloading
     let mut needed: Vec<(String, String)> = Vec::new();
     for (file, url) in &files {
         let path = dir.join(file);
@@ -677,7 +513,6 @@ pub async fn download_model(model: &CatalogModel) -> Result<PathBuf> {
     }
 
     if needed.len() > 1 {
-        // Parallel download of split files
         eprintln!("  ⚡ Downloading {} files in parallel...", needed.len());
         let total = needed.len();
         let completed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -696,7 +531,6 @@ pub async fn download_model(model: &CatalogModel) -> Result<PathBuf> {
             handle.await??;
         }
     } else if let Some((file, url)) = needed.into_iter().next() {
-        // Single file — just download it
         let path = dir.join(&file);
         download_with_resume(&path, &url).await?;
     }
@@ -705,7 +539,6 @@ pub async fn download_model(model: &CatalogModel) -> Result<PathBuf> {
     Ok(dest)
 }
 
-/// Download any URL to a destination path with resume support.
 pub async fn download_url(url: &str, dest: &Path) -> Result<()> {
     download_with_resume(dest, url).await
 }
@@ -739,9 +572,6 @@ fn path_suffix_matches_ignore_case(path: &Path, expected: &str) -> bool {
     true
 }
 
-/// Download a HuggingFace GGUF URL, auto-detecting split files (-00001-of-NNNNN.gguf).
-/// If the filename matches the split pattern, discovers and downloads all parts in parallel.
-/// Returns the path to the first part (or the single file).
 pub async fn download_hf_split_gguf(url: &str, filename: &str) -> Result<PathBuf> {
     if let Some(asset) = hf_asset_from_url(url) {
         return download_hf_repo_file(&asset.repo, Some(&asset.revision), &asset.file).await;
@@ -755,7 +585,6 @@ pub async fn download_hf_split_gguf(url: &str, filename: &str) -> Result<PathBuf
         let n: u32 = caps[1].parse()?;
         eprintln!("📥 Detected split GGUF: {n} parts");
 
-        // Build list of (part_filename, part_url) for all parts
         let mut files: Vec<(String, String)> = Vec::new();
         for i in 1..=n {
             let part_filename = filename.replace("-00001-of-", &format!("-{i:05}-of-"));
@@ -763,7 +592,6 @@ pub async fn download_hf_split_gguf(url: &str, filename: &str) -> Result<PathBuf
             files.push((part_filename, part_url));
         }
 
-        // Filter to parts that still need downloading
         let mut needed: Vec<(String, String)> = Vec::new();
         for (f, u) in &files {
             let path = dir.join(f);
@@ -803,7 +631,6 @@ pub async fn download_hf_split_gguf(url: &str, filename: &str) -> Result<PathBuf
         return Ok(dir.join(filename));
     }
 
-    // Not a split file — single download
     let dest = dir.join(filename);
     if dest.exists() {
         let size = tokio::fs::metadata(&dest).await?.len();
@@ -821,7 +648,6 @@ pub async fn download_hf_split_gguf(url: &str, filename: &str) -> Result<PathBuf
     Ok(dest)
 }
 
-/// Download with resume support and retries using reqwest.
 async fn download_with_resume(dest: &Path, url: &str) -> Result<()> {
     use tokio_stream::StreamExt;
 
@@ -831,14 +657,13 @@ async fn download_with_resume(dest: &Path, url: &str) -> Result<()> {
         .and_then(|value| value.to_str())
         .unwrap_or("download");
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(3600)) // 1h overall timeout
+        .timeout(std::time::Duration::from_secs(3600))
         .connect_timeout(std::time::Duration::from_secs(30))
         .build()?;
 
     let mut attempt: u64 = 0;
     loop {
         attempt += 1;
-        // Check how much we already have (for resume)
         let existing_bytes = if tmp.exists() {
             tokio::fs::metadata(&tmp).await?.len()
         } else {
@@ -852,7 +677,6 @@ async fn download_with_resume(dest: &Path, url: &str) -> Result<()> {
             request = request.header("Range", format!("bytes={existing_bytes}-"));
         }
 
-        // Exponential backoff: 3s, 6s, 12s, ... capped at 60s
         let backoff_secs = std::cmp::min(3 * (1u64 << (attempt - 1).min(4)), 60);
 
         let response = match request.send().await {
@@ -868,7 +692,6 @@ async fn download_with_resume(dest: &Path, url: &str) -> Result<()> {
 
         let status = response.status();
         if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
-            // If server doesn't support resume (416 Range Not Satisfiable), start fresh
             if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
                 let _ = tokio::fs::remove_file(&tmp).await;
                 eprintln!();
@@ -881,9 +704,7 @@ async fn download_with_resume(dest: &Path, url: &str) -> Result<()> {
             continue;
         }
 
-        // Total size from Content-Length (or Content-Range)
         let total_bytes = if status == reqwest::StatusCode::PARTIAL_CONTENT {
-            // Content-Range: bytes 1234-5678/9999
             response
                 .headers()
                 .get("content-range")
@@ -894,12 +715,10 @@ async fn download_with_resume(dest: &Path, url: &str) -> Result<()> {
             response.content_length().map(|cl| cl + existing_bytes)
         };
 
-        // On first successful response, check disk space
         if attempt == 1 || existing_bytes == 0 {
             if let Some(total) = total_bytes {
                 let remaining = total.saturating_sub(existing_bytes);
                 if let Some(free) = free_disk_space(dest) {
-                    // Need remaining bytes + 1GB headroom
                     let needed = remaining + 1_000_000_000;
                     if free < needed {
                         anyhow::bail!(
@@ -913,7 +732,6 @@ async fn download_with_resume(dest: &Path, url: &str) -> Result<()> {
             }
         }
 
-        // Open file for append (resume) or create
         let mut file = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -925,10 +743,8 @@ async fn download_with_resume(dest: &Path, url: &str) -> Result<()> {
         let mut downloaded = existing_bytes;
         let mut last_progress = std::time::Instant::now();
 
-        // Print initial progress
         print_transfer_status(label, downloaded, total_bytes, attempt, "downloading")?;
 
-        // Reset backoff on successful data receipt
         let mut got_data = false;
 
         loop {
@@ -940,7 +756,6 @@ async fn download_with_resume(dest: &Path, url: &str) -> Result<()> {
                     downloaded += chunk.len() as u64;
                     got_data = true;
 
-                    // Update progress every 500ms
                     if last_progress.elapsed() >= std::time::Duration::from_millis(500) {
                         print_transfer_status(
                             label,
@@ -959,7 +774,6 @@ async fn download_with_resume(dest: &Path, url: &str) -> Result<()> {
                         "  ⚠️ {label}: interrupted at {}: {e}",
                         format_size_bytes(downloaded)
                     );
-                    // If we got data, reset attempt counter (connection was working)
                     if got_data {
                         attempt = 0;
                     }
@@ -969,7 +783,6 @@ async fn download_with_resume(dest: &Path, url: &str) -> Result<()> {
                     break;
                 }
                 None => {
-                    // Stream complete
                     file.flush().await?;
                     print_transfer_status(label, downloaded, total_bytes, attempt, "complete")?;
                     eprintln!();
@@ -983,10 +796,7 @@ async fn download_with_resume(dest: &Path, url: &str) -> Result<()> {
     }
 }
 
-/// Check free disk space on the filesystem containing `path`.
-/// Returns None if the check fails (e.g. path doesn't exist yet).
 fn free_disk_space(path: &Path) -> Option<u64> {
-    // Walk up to find an existing directory for statvfs
     let mut check = path.to_path_buf();
     loop {
         if check.exists() {
@@ -1003,8 +813,7 @@ fn free_disk_space(path: &Path) -> Option<u64> {
         let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
         let ret = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
         if ret == 0 {
-            // f_bavail = blocks available to unprivileged users
-            Some(stat.f_bavail as u64 * stat.f_frsize as u64)
+            Some(stat.f_bavail as u64 * stat.f_frsize)
         } else {
             None
         }
@@ -1051,44 +860,9 @@ fn format_size_bytes(bytes: u64) -> String {
     }
 }
 
-/// List available models
-pub fn list_models() {
-    eprintln!("Available models:");
-    eprintln!();
-    for m in MODEL_CATALOG.iter() {
-        let draft_info = if let Some(d) = m.draft.as_deref() {
-            format!(" (draft: {})", d)
-        } else {
-            String::new()
-        };
-        eprintln!(
-            "  {:40} {:>6}  {}{}",
-            m.name, m.size, m.description, draft_info
-        );
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn source_identity_is_exposed_for_hf_catalog_entries() {
-        let model = find_model("Qwen3-8B-Q4_K_M").unwrap();
-        assert_eq!(model.source_repo(), Some("unsloth/Qwen3-8B-GGUF"));
-        assert_eq!(model.source_revision(), Some("main"));
-        assert_eq!(model.source_file(), Some("Qwen3-8B-Q4_K_M.gguf"));
-        assert!(model.source_repo().is_some());
-    }
-
-    #[test]
-    fn source_identity_is_absent_for_direct_url_entries() {
-        let model = find_model("Qwen3.5-27B-Q4_K_M").unwrap();
-        assert_eq!(model.source_repo(), None);
-        assert_eq!(model.source_revision(), None);
-        assert_eq!(model.source_file(), None);
-        assert!(model.source_repo().is_none());
-    }
 
     #[test]
     fn test_free_disk_space() {
@@ -1116,7 +890,6 @@ mod tests {
     fn test_split_gguf_detection() {
         let re = regex_lite::Regex::new(r"-00001-of-(\d{5})\.gguf$").unwrap();
 
-        // Should match split GGUFs
         let caps = re.captures("Model-Q4_K_M-00001-of-00004.gguf");
         assert!(caps.is_some());
         assert_eq!(&caps.unwrap()[1], "00004");
@@ -1127,7 +900,6 @@ mod tests {
         let caps = re.captures("MiniMax-M2.5-Q4_K_M-00001-of-00004.gguf");
         assert!(caps.is_some());
 
-        // Should NOT match non-split or other parts
         assert!(re.captures("Model-Q4_K_M.gguf").is_none());
         assert!(re.captures("Model-Q4_K_M-00002-of-00004.gguf").is_none());
         assert!(re.captures("Model-Q4_K_M-00001-of-00004.bin").is_none());
@@ -1156,7 +928,7 @@ mod tests {
 
     #[test]
     fn path_file_name_matches_nested_path_ignore_case() {
-        let path = Path::new("/tmp/cache/Subdir/Model.Q4_K_M.gguf");
+        let path = std::path::Path::new("/tmp/cache/Subdir/Model.Q4_K_M.gguf");
         assert!(path_suffix_matches_ignore_case(
             path,
             "subdir/model.q4_k_m.gguf"
@@ -1165,7 +937,7 @@ mod tests {
 
     #[test]
     fn path_file_name_matches_rejects_wrong_suffix() {
-        let path = Path::new("/tmp/cache/other/Model.Q4_K_M.gguf");
+        let path = std::path::Path::new("/tmp/cache/other/Model.Q4_K_M.gguf");
         assert!(!path_suffix_matches_ignore_case(
             path,
             "subdir/model.q4_k_m.gguf"

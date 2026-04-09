@@ -1962,7 +1962,7 @@ pub async fn handle_mesh_request(
     let routed_model =
         if request.model_name.is_none() || request.model_name.as_deref() == Some("auto") {
             if let Some(body_json) = request.body_json.as_ref() {
-                let cl = router::classify(&body_json);
+                let cl = router::classify(body_json);
                 let served = node.models_being_served().await;
                 let media = router::media_requirements(body_json);
                 let available: Vec<(&str, f64)> = served
@@ -2205,6 +2205,7 @@ async fn route_attempt_for_target(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn route_model_request(
     node: mesh::Node,
     tcp_stream: TcpStream,

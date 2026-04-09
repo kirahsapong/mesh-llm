@@ -7,6 +7,11 @@
 //! No cross-node traffic during inference — each node runs independently.
 
 use clap::ValueEnum;
+pub use mesh_client_core::inference::moe::{
+    compute_assignments_with_overlap, compute_snake_draft_assignments, expert_list_arg,
+    load_cached_ranking, NodeAssignment,
+};
+
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
@@ -99,6 +104,31 @@ impl Default for MoeRuntimeOptions {
         }
     }
 }
+
+pub fn ranking_strength_key(artifact: &SharedRankingArtifact) -> (u8, u8, usize, u32) {
+    match artifact.kind {
+        SharedRankingKind::Analyze => (2, 0, 0, 0),
+        SharedRankingKind::MicroAnalyze => (
+            1,
+            match artifact
+                .micro_layer_scope
+                .unwrap_or(MoeMicroLayerScope::First)
+            {
+                MoeMicroLayerScope::All => 1,
+                MoeMicroLayerScope::First => 0,
+            },
+            artifact.micro_prompt_count.unwrap_or(0),
+            artifact.micro_tokens.unwrap_or(0),
+        ),
+    }
+}
+
+pub fn better_shared_ranking(
+    candidate: &SharedRankingArtifact,
+    current: &SharedRankingArtifact,
+) -> bool {
+    ranking_strength_key(candidate) > ranking_strength_key(current)
+}
 // ── GGUF assembler: combine trunk + expert files into a shard ──
 
 // ── Ranking cache ──
@@ -123,31 +153,6 @@ fn split_cache_root() -> PathBuf {
 
 fn ranking_cache_root() -> PathBuf {
     mesh_cache_dir().join("moe-rankings")
-}
-
-fn ranking_strength_key(artifact: &SharedRankingArtifact) -> (u8, u8, usize, u32) {
-    match artifact.kind {
-        SharedRankingKind::Analyze => (2, 0, 0, 0),
-        SharedRankingKind::MicroAnalyze => (
-            1,
-            match artifact
-                .micro_layer_scope
-                .unwrap_or(MoeMicroLayerScope::First)
-            {
-                MoeMicroLayerScope::All => 1,
-                MoeMicroLayerScope::First => 0,
-            },
-            artifact.micro_prompt_count.unwrap_or(0),
-            artifact.micro_tokens.unwrap_or(0),
-        ),
-    }
-}
-
-fn better_shared_ranking(
-    candidate: &SharedRankingArtifact,
-    current: &SharedRankingArtifact,
-) -> bool {
-    ranking_strength_key(candidate) > ranking_strength_key(current)
 }
 
 fn sanitize_cache_component(input: &str) -> String {
@@ -215,6 +220,27 @@ pub fn micro_ranking_cache_path(
     };
     ranking_cache_root().join(format!(
         "{stem}.micro-p{prompt_count}-t{tokens}-{layer_suffix}.csv"
+    ))
+}
+
+fn parse_micro_cache_filename(
+    model_path: &Path,
+    file_name: &str,
+) -> Option<(usize, u32, MoeMicroLayerScope)> {
+    let stem = ranking_cache_stem(model_path);
+    let prefix = format!("{stem}.micro-p");
+    let rest = file_name.strip_prefix(&prefix)?.strip_suffix(".csv")?;
+    let (prompt_count, rest) = rest.split_once("-t")?;
+    let (tokens, layer_scope) = rest.split_once('-')?;
+    let layer_scope = match layer_scope {
+        "all" => MoeMicroLayerScope::All,
+        "first" => MoeMicroLayerScope::First,
+        _ => return None,
+    };
+    Some((
+        prompt_count.parse().ok()?,
+        tokens.parse().ok()?,
+        layer_scope,
     ))
 }
 
@@ -300,13 +326,7 @@ pub fn load_shared_ranking_artifact(
     })
 }
 
-/// Load a cached ranking CSV. Format: one expert_id per line, sorted by gate mass descending.
-/// Also supports the full CSV format from moe-analyze: expert_id,total_mass,mass_fraction,selection_count
-pub fn load_cached_ranking(path: &Path) -> Option<Vec<u32>> {
-    load_cached_ranking_file(path).map(|file| file.ranking)
-}
-
-fn write_shared_ranking_artifact(
+pub fn write_shared_ranking_artifact(
     path: &Path,
     artifact: &SharedRankingArtifact,
 ) -> anyhow::Result<()> {
@@ -339,27 +359,6 @@ fn write_shared_ranking_artifact(
     lines.extend(artifact.ranking.iter().map(u32::to_string));
     std::fs::write(path, format!("{}\n", lines.join("\n")))?;
     Ok(())
-}
-
-fn parse_micro_cache_filename(
-    model_path: &Path,
-    file_name: &str,
-) -> Option<(usize, u32, MoeMicroLayerScope)> {
-    let stem = ranking_cache_stem(model_path);
-    let prefix = format!("{stem}.micro-p");
-    let rest = file_name.strip_prefix(&prefix)?.strip_suffix(".csv")?;
-    let (prompt_count, rest) = rest.split_once("-t")?;
-    let (tokens, layer_scope) = rest.split_once('-')?;
-    let layer_scope = match layer_scope {
-        "all" => MoeMicroLayerScope::All,
-        "first" => MoeMicroLayerScope::First,
-        _ => return None,
-    };
-    Some((
-        prompt_count.parse().ok()?,
-        tokens.parse().ok()?,
-        layer_scope,
-    ))
 }
 
 pub fn best_shared_ranking_artifact(model_path: &Path) -> Option<SharedRankingArtifact> {
@@ -493,24 +492,8 @@ pub fn shared_ranking_cache_path(model_path: &Path, artifact: &SharedRankingArti
 
 // ── Expert assignment ──
 
-/// Expert assignment for a single node: which expert IDs it should hold.
-#[derive(Clone, Debug)]
-pub struct NodeAssignment {
-    /// All expert IDs for this node (shared core + unique shard), sorted.
-    pub experts: Vec<u32>,
-    /// How many of these are shared (replicated to every node).
-    pub n_shared: usize,
-    /// How many are unique to this node.
-    pub n_unique: usize,
-}
-
 /// Compute expert assignments for N nodes using the overlap strategy.
 ///
-/// - `ranking`: expert IDs sorted by gate mass descending (hottest first)
-/// - `n_nodes`: number of mesh nodes to split across
-/// - `min_experts`: minimum experts per node for coherent output
-///
-/// Returns one NodeAssignment per node. Every expert appears in at least one node.
 /// Convenience wrapper for compute_assignments_with_overlap with overlap=1.
 #[cfg(test)]
 pub fn compute_assignments(
@@ -519,137 +502,6 @@ pub fn compute_assignments(
     min_experts: u32,
 ) -> Vec<NodeAssignment> {
     compute_assignments_with_overlap(ranking, n_nodes, min_experts, 1)
-}
-
-/// Compute expert assignments with a configurable overlap factor.
-///
-/// - `overlap`: how many nodes each expert should live on (1 = no redundancy,
-///   2 = every expert on at least 2 nodes, etc.). Capped at n_nodes.
-///
-/// Strategy:
-/// 1. Shared core = top `min_experts` by gate mass → replicated to every node
-/// 2. Remaining experts distributed with `overlap` copies each
-///
-/// With overlap=2, losing any single node doesn't orphan any expert —
-/// at least one other node still has it.
-pub fn compute_assignments_with_overlap(
-    ranking: &[u32],
-    n_nodes: usize,
-    min_experts: u32,
-    overlap: usize,
-) -> Vec<NodeAssignment> {
-    let n_expert = ranking.len();
-    let min_exp = min_experts as usize;
-    let overlap = overlap.min(n_nodes).max(1);
-
-    if n_nodes <= 1 || min_exp >= n_expert {
-        // Single node or core covers everything — give everyone all experts
-        return vec![
-            NodeAssignment {
-                experts: ranking.to_vec(),
-                n_shared: n_expert,
-                n_unique: 0,
-            };
-            n_nodes.max(1)
-        ];
-    }
-
-    // Shared core = top min_experts by gate mass (replicated to every node)
-    let shared_core: Vec<u32> = ranking[..min_exp].to_vec();
-
-    // Remaining experts to distribute with overlap
-    let remaining: Vec<u32> = ranking[min_exp..].to_vec();
-
-    // With overlap, each expert goes to `overlap` nodes.
-    // Total expert-slots = remaining.len() * overlap, distributed round-robin.
-    let mut node_experts: Vec<Vec<u32>> = vec![Vec::new(); n_nodes];
-
-    for (i, &expert_id) in remaining.iter().enumerate() {
-        // Assign to `overlap` consecutive nodes (wrapping)
-        for j in 0..overlap {
-            let node = (i + j) % n_nodes;
-            node_experts[node].push(expert_id);
-        }
-    }
-
-    let mut assignments = Vec::with_capacity(n_nodes);
-    for node_exps in node_experts {
-        let n_unique = node_exps.len();
-        let mut experts = shared_core.clone();
-        experts.extend_from_slice(&node_exps);
-        experts.sort();
-        experts.dedup(); // in case overlap wraps and duplicates with shared core
-
-        assignments.push(NodeAssignment {
-            experts,
-            n_shared: min_exp,
-            n_unique,
-        });
-    }
-
-    assignments
-}
-
-/// Compute expert assignments by snake-drafting the ranking across nodes.
-///
-/// The first `replicate` experts are replicated to every node. Remaining experts
-/// are assigned in snake order to balance hot and cold experts across nodes.
-pub fn compute_snake_draft_assignments(
-    ranking: &[u32],
-    n_nodes: usize,
-    replicate: usize,
-) -> Vec<NodeAssignment> {
-    let n_expert = ranking.len();
-    if n_nodes <= 1 || replicate >= n_expert {
-        return vec![
-            NodeAssignment {
-                experts: ranking.to_vec(),
-                n_shared: n_expert,
-                n_unique: 0,
-            };
-            n_nodes.max(1)
-        ];
-    }
-
-    let shared_core: Vec<u32> = ranking[..replicate].to_vec();
-    let remaining = &ranking[replicate..];
-    let mut node_experts: Vec<Vec<u32>> = vec![Vec::new(); n_nodes];
-
-    for (i, &expert_id) in remaining.iter().enumerate() {
-        let round = i / n_nodes;
-        let pos = i % n_nodes;
-        let node = if round % 2 == 0 {
-            pos
-        } else {
-            n_nodes - 1 - pos
-        };
-        node_experts[node].push(expert_id);
-    }
-
-    node_experts
-        .into_iter()
-        .map(|node_unique| {
-            let n_unique = node_unique.len();
-            let mut experts = shared_core.clone();
-            experts.extend(node_unique);
-            experts.sort();
-            NodeAssignment {
-                experts,
-                n_shared: shared_core.len(),
-                n_unique,
-            }
-        })
-        .collect()
-}
-
-/// Format expert list as comma-separated string for moe-split --expert-list.
-pub fn expert_list_arg(assignment: &NodeAssignment) -> String {
-    assignment
-        .experts
-        .iter()
-        .map(|e| e.to_string())
-        .collect::<Vec<_>>()
-        .join(",")
 }
 
 /// Path to the cached split GGUF for a given model + node count + node index.

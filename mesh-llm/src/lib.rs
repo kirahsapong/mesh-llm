@@ -7,15 +7,11 @@ mod models;
 mod network;
 mod plugin;
 mod plugins;
-mod protocol;
+mod protocol; // portable wire types extracted to mesh_client_core::protocol (phase-2/wave-2)
 pub(crate) mod runtime;
 mod system;
 
-pub mod proto {
-    pub mod node {
-        include!(concat!(env!("OUT_DIR"), "/meshllm.node.v1.rs"));
-    }
-}
+pub use mesh_client_core::proto;
 
 pub(crate) use plugins::blackboard;
 

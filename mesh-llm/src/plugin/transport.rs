@@ -25,6 +25,7 @@ pub(crate) enum LocalListener {
     Pipe(String, tokio::net::windows::named_pipe::NamedPipeServer),
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn connection_loop(
     mut stream: LocalStream,
     mut outbound_rx: mpsc::Receiver<super::proto::Envelope>,
@@ -243,7 +244,7 @@ pub(crate) async fn bind_local_listener(instance_id: &str, name: &str) -> Result
         }
         let listener = tokio::net::UnixListener::bind(&path)
             .with_context(|| format!("Failed to bind plugin socket {}", path.display()))?;
-        return Ok(LocalListener::Unix(listener, path));
+        Ok(LocalListener::Unix(listener, path))
     }
     #[cfg(windows)]
     {
@@ -251,7 +252,7 @@ pub(crate) async fn bind_local_listener(instance_id: &str, name: &str) -> Result
         let server = tokio::net::windows::named_pipe::ServerOptions::new()
             .create(&endpoint)
             .with_context(|| format!("Failed to create plugin pipe {endpoint}"))?;
-        return Ok(LocalListener::Pipe(endpoint, server));
+        Ok(LocalListener::Pipe(endpoint, server))
     }
 }
 

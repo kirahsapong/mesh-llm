@@ -174,7 +174,7 @@ pub(crate) async fn run() -> Result<()> {
             );
         }
 
-        match nostr::smart_auto(&meshes, my_vram_gb, target_name) {
+        match nostr::smart_auto(&meshes, my_vram_gb, target_name, last_mesh_id.as_deref()) {
             nostr::AutoDecision::Join { candidates } => {
                 if cli.client {
                     // Clients skip health probe — joining itself is the test.
@@ -201,8 +201,7 @@ pub(crate) async fn run() -> Result<()> {
                     // GPU nodes: try to join each candidate directly.
                     // No ephemeral probe — it fails when the target has a firewall
                     // even though the real join (via relay) would succeed.
-                    let mut joined = false;
-                    for (i, (token, mesh)) in candidates.iter().enumerate() {
+                    if let Some((i, (token, mesh))) = candidates.iter().enumerate().next() {
                         eprintln!(
                             "  Trying mesh {}{}...",
                             mesh.listing.name.as_deref().unwrap_or("unnamed"),
@@ -229,10 +228,7 @@ pub(crate) async fn run() -> Result<()> {
                                 .unwrap_or_default()
                         );
                         cli.join.push(token.clone());
-                        joined = true;
-                        break;
-                    }
-                    if !joined {
+                    } else {
                         eprintln!("⚠️  No meshes found — starting new");
                         let models = nostr::default_models_for_vram(my_vram_gb);
                         start_new_mesh(&mut cli, &models, my_vram_gb, has_startup_models);
@@ -248,9 +244,12 @@ pub(crate) async fn run() -> Result<()> {
                         tokio::time::sleep(std::time::Duration::from_secs(15)).await;
                         eprintln!("🔍 Retry {attempt}/20...");
                         if let Ok(retry_meshes) = nostr::discover(&relays, &filter, None).await {
-                            if let nostr::AutoDecision::Join { candidates } =
-                                nostr::smart_auto(&retry_meshes, my_vram_gb, target_name)
-                            {
+                            if let nostr::AutoDecision::Join { candidates } = nostr::smart_auto(
+                                &retry_meshes,
+                                my_vram_gb,
+                                target_name,
+                                last_mesh_id.as_deref(),
+                            ) {
                                 let (token, mesh) = &candidates[0];
                                 if cli.mesh_name.is_none() {
                                     if let Some(ref name) = mesh.listing.name {
@@ -325,7 +324,7 @@ pub(crate) async fn run() -> Result<()> {
         .filter_map(|m| {
             m.file_stem()
                 .and_then(|s| s.to_str())
-                .map(|s| router::strip_split_suffix_owned(s))
+                .map(router::strip_split_suffix_owned)
         })
         .collect();
 
@@ -465,6 +464,7 @@ pub async fn ensure_draft(model: &std::path::Path) -> Option<PathBuf> {
 /// Priority:
 /// 1. Models the mesh needs that we already have on disk
 /// 2. Models in the mesh catalog that nobody is serving yet (on disk preferred)
+///
 /// Parse a catalog size string like "18.3GB" or "491MB" into bytes.
 fn parse_size_str(s: &str) -> u64 {
     let s = s.trim();
@@ -814,7 +814,8 @@ async fn join_mesh_for_mcp(cli: &Cli, node: &mesh::Node) -> Result<()> {
         };
         let target_name = cli.discover.as_deref().or(cli.mesh_name.as_deref());
         let meshes = nostr::discover(&relays, &filter, None).await?;
-        match nostr::smart_auto(&meshes, 0.0, target_name) {
+        let last_mesh_id_here = crate::mesh::load_last_mesh_id();
+        match nostr::smart_auto(&meshes, 0.0, target_name, last_mesh_id_here.as_deref()) {
             nostr::AutoDecision::Join { candidates } => {
                 let (token, mesh) = &candidates[0];
                 eprintln!(
@@ -856,7 +857,7 @@ pub(crate) async fn run_plugin_mcp(cli: &Cli) -> Result<()> {
 
     let (plugin_mesh_tx, plugin_mesh_rx) = tokio::sync::mpsc::channel(256);
     let plugin_manager =
-        plugin::PluginManager::start(&resolved_plugins, plugin_host_mode(&cli), plugin_mesh_tx)
+        plugin::PluginManager::start(&resolved_plugins, plugin_host_mode(cli), plugin_mesh_tx)
             .await?;
     node.set_plugin_manager(plugin_manager.clone()).await;
     node.start_plugin_channel_forwarder(plugin_mesh_rx);
@@ -1152,12 +1153,7 @@ async fn run_auto(
             match run_passive(&cli, node.clone(), is_client, plugin_manager.clone()).await? {
                 Some(model_name) => {
                     // Promoted! Resolve the model path and continue to serving
-                    let model_path = models::find_model_path(&model_name);
-                    if model_path.exists() {
-                        model_path
-                    } else {
-                        model_path
-                    }
+                    models::find_model_path(&model_name)
                 }
                 None => return Ok(()), // clean shutdown
             }

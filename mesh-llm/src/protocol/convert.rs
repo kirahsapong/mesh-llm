@@ -305,7 +305,7 @@ pub(crate) fn build_gossip_frame(
     sender_id: EndpointId,
 ) -> crate::proto::node::GossipFrame {
     let peers: Vec<crate::proto::node::PeerAnnouncement> =
-        anns.iter().map(|ann| local_ann_to_proto_ann(ann)).collect();
+        anns.iter().map(local_ann_to_proto_ann).collect();
     crate::proto::node::GossipFrame {
         gen: NODE_PROTOCOL_GENERATION,
         sender_id: sender_id.as_bytes().to_vec(),

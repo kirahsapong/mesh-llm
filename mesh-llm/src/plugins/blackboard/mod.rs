@@ -156,6 +156,10 @@ impl BlackboardStore {
     }
 
     #[allow(dead_code)]
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    #[allow(dead_code)]
     pub fn set_enabled(&self, v: bool) {
         self.enabled.store(v, std::sync::atomic::Ordering::Relaxed);
     }
@@ -506,7 +510,7 @@ pub fn pii_check(text: &str) -> Vec<String> {
         });
         if w.contains('@') && w.contains('.') && w.len() > 5 {
             let parts: Vec<&str> = w.split('@').collect();
-            if parts.len() == 2 && parts[1].contains('.') && parts[0].len() > 0 {
+            if parts.len() == 2 && parts[1].contains('.') && !parts[0].is_empty() {
                 issues.push(format!("Possible email: {}", w));
             }
         }
