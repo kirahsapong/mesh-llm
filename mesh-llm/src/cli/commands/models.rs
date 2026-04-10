@@ -2,12 +2,15 @@ use crate::cli::models::ModelsCommand;
 use crate::models::{
     capabilities, catalog, download_exact_ref, find_catalog_model_exact, huggingface_hub_cache_dir,
     installed_model_capabilities, scan_installed_models, search_catalog_models, search_huggingface,
-    show_exact_model, show_model_variants, SearchArtifactFilter, SearchProgress,
+    show_exact_model, show_model_variants_with_progress, SearchArtifactFilter, SearchProgress,
+    ShowVariantsProgress,
 };
 use crate::system::hardware;
 use anyhow::{anyhow, Result};
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::Path;
+use std::time::Instant;
+use unicode_width::UnicodeWidthStr;
 
 pub async fn run_model_search(
     query: &[String],
@@ -222,7 +225,18 @@ pub fn run_model_installed() {
 }
 
 pub async fn run_model_show(model_ref: &str) -> Result<()> {
+    let interactive = std::io::stdout().is_terminal();
+    let detail_started = Instant::now();
+    if interactive {
+        eprintln!("🔎 Resolving model details from Hugging Face...");
+    }
     let details = show_exact_model(model_ref).await?;
+    if interactive {
+        eprintln!(
+            "✅ Resolved model details ({:.1}s)",
+            detail_started.elapsed().as_secs_f32()
+        );
+    }
     println!("🔎 {}", details.display_name);
     if let Some(summary) = local_capacity_summary() {
         println!("{}", summary);
@@ -273,7 +287,36 @@ pub async fn run_model_show(model_ref: &str) -> Result<()> {
     println!("📥 Download:");
     println!("   {}", details.download_url);
 
-    if let Some(variants) = show_model_variants(model_ref).await? {
+    let variants_started = Instant::now();
+    if interactive {
+        eprintln!("🔎 Fetching GGUF variants from Hugging Face...");
+    }
+    if let Some(variants) = show_model_variants_with_progress(model_ref, |progress| {
+        if !interactive {
+            return;
+        }
+        match progress {
+            ShowVariantsProgress::Inspecting { completed, total } => {
+                if total == 0 {
+                    return;
+                }
+                eprint!("\r   Inspecting variant sizes {completed}/{total}...");
+                let _ = std::io::stderr().flush();
+                if completed == total {
+                    eprintln!();
+                }
+            }
+        }
+    })
+    .await?
+    {
+        if interactive {
+            eprintln!(
+                "✅ Fetched {} GGUF variants ({:.1}s)",
+                variants.len(),
+                variants_started.elapsed().as_secs_f32()
+            );
+        }
         if !variants.is_empty() {
             println!();
             println!("Variants:");
@@ -294,45 +337,55 @@ pub async fn run_model_show(model_ref: &str) -> Result<()> {
                     selected,
                 ));
             }
+            let sel_width = 3usize;
             let quant_width = rows
                 .iter()
-                .map(|(quant, _, _, _, _)| quant.len())
+                .map(|(quant, _, _, _, _)| display_width(quant))
                 .max()
                 .unwrap_or(5)
-                .max("quant".len());
+                .max(display_width("quant"));
             let size_width = rows
                 .iter()
-                .map(|(_, size, _, _, _)| size.len())
+                .map(|(_, size, _, _, _)| display_width(size))
                 .max()
                 .unwrap_or(4)
-                .max("size".len());
+                .max(display_width("size"));
             let fit_width = rows
                 .iter()
-                .map(|(_, _, fit, _, _)| fit.len())
+                .map(|(_, _, fit, _, _)| display_width(fit))
                 .max()
                 .unwrap_or(3)
-                .max("fit".len());
-
+                .max(display_width("fit"));
             println!(
-                "{:<quant_width$}  {:>size_width$}  {:<fit_width$}  ref",
-                "quant", "size", "fit"
+                "{}  {}  {}  {}  ref",
+                pad_right_display("sel", sel_width),
+                pad_right_display("quant", quant_width),
+                pad_left_display("size", size_width),
+                pad_right_display("fit", fit_width)
             );
             println!(
-                "{:-<quant_width$}  {:-<size_width$}  {:-<fit_width$}  {:-<3}",
-                "", "", "", ""
+                "{}  {}  {}  {}  ---",
+                "-".repeat(sel_width),
+                "-".repeat(quant_width),
+                "-".repeat(size_width),
+                "-".repeat(fit_width)
             );
-
             for (quant, size, fit, r#ref, selected) in rows {
                 println!(
-                    "{:<quant_width$}  {:>size_width$}  {:<fit_width$}  {}{}",
-                    quant,
-                    size,
-                    fit,
-                    r#ref,
-                    if selected { "  ← selected" } else { "" }
+                    "{}  {}  {}  {}  {}",
+                    pad_right_display(if selected { "*" } else { " " }, sel_width),
+                    pad_right_display(&quant, quant_width),
+                    pad_left_display(&size, size_width),
+                    pad_right_display(&fit, fit_width),
+                    r#ref
                 );
             }
         }
+    } else if interactive {
+        eprintln!(
+            "✅ No GGUF variants for this ref ({:.1}s)",
+            variants_started.elapsed().as_secs_f32()
+        );
     }
     Ok(())
 }
@@ -449,6 +502,20 @@ fn variant_selector_label(exact_ref: &str) -> String {
         .and_then(|value| value.to_str())
         .unwrap_or(exact_ref)
         .to_string()
+}
+
+fn display_width(value: &str) -> usize {
+    UnicodeWidthStr::width(value)
+}
+
+fn pad_right_display(value: &str, width: usize) -> String {
+    let pad = width.saturating_sub(display_width(value));
+    format!("{value}{}", " ".repeat(pad))
+}
+
+fn pad_left_display(value: &str, width: usize) -> String {
+    let pad = width.saturating_sub(display_width(value));
+    format!("{}{value}", " ".repeat(pad))
 }
 
 pub async fn dispatch_models_command(command: &ModelsCommand) -> Result<()> {

@@ -20,6 +20,11 @@ pub struct ModelDetails {
     pub moe: Option<catalog::MoeConfig>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShowVariantsProgress {
+    Inspecting { completed: usize, total: usize },
+}
+
 #[derive(Clone, Debug)]
 enum ExactModelRef {
     Catalog(&'static catalog::CatalogModel),
@@ -220,7 +225,13 @@ pub async fn show_exact_model(input: &str) -> Result<ModelDetails> {
     }
 }
 
-pub async fn show_model_variants(input: &str) -> Result<Option<Vec<ModelDetails>>> {
+pub async fn show_model_variants_with_progress<F>(
+    input: &str,
+    mut progress: F,
+) -> Result<Option<Vec<ModelDetails>>>
+where
+    F: FnMut(ShowVariantsProgress),
+{
     let input = canonicalize_model_ref_input(input).await?;
     let parsed = parse_huggingface_repo_ref(&input).or_else(|| parse_huggingface_repo_url(&input));
     let Some((repo, revision, selector)) = parsed else {
@@ -253,14 +264,25 @@ pub async fn show_model_variants(input: &str) -> Result<Option<Vec<ModelDetails>
         return Ok(Some(Vec::new()));
     }
 
+    let quant_variants: Vec<_> = variants
+        .into_iter()
+        .filter(|(file, _)| quant_selector_from_gguf_file(file).is_some())
+        .collect();
+    let total = quant_variants.len();
+    progress(ShowVariantsProgress::Inspecting {
+        completed: 0,
+        total,
+    });
+
     let mut seen_refs = HashSet::new();
     let mut out = Vec::new();
-    for (file, size_bytes) in variants {
-        let Some(_selector) = quant_selector_from_gguf_file(&file) else {
-            continue;
-        };
+    for (idx, (file, size_bytes)) in quant_variants.into_iter().enumerate() {
         let exact_ref = format_huggingface_display_ref(&repo, revision.as_deref(), &file);
         if !seen_refs.insert(exact_ref.clone()) {
+            progress(ShowVariantsProgress::Inspecting {
+                completed: idx + 1,
+                total,
+            });
             continue;
         }
         let size_label = match size_bytes {
@@ -282,6 +304,10 @@ pub async fn show_model_variants(input: &str) -> Result<Option<Vec<ModelDetails>
             draft: None,
             capabilities: ModelCapabilities::default(),
             moe: None,
+        });
+        progress(ShowVariantsProgress::Inspecting {
+            completed: idx + 1,
+            total,
         });
     }
 
