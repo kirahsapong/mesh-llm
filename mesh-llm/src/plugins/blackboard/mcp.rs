@@ -8,8 +8,9 @@ use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{Implementation, ServerCapabilities, ServerInfo},
     service::ServiceExt,
-    tool, tool_handler, tool_router, ServerHandler,
+    tool, tool_handler, tool_router,
     transport::io::stdio,
+    ServerHandler,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};

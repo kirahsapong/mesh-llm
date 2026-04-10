@@ -461,10 +461,7 @@ fn suggested_client_command(original_args: &[OsString]) -> String {
 }
 
 fn shell_join(args: &[OsString]) -> String {
-    args.iter()
-        .map(shell_display)
-        .collect::<Vec<_>>()
-        .join(" ")
+    args.iter().map(shell_display).collect::<Vec<_>>().join(" ")
 }
 
 fn shell_display(arg: &OsString) -> String {

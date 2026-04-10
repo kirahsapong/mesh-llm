@@ -1039,9 +1039,7 @@ pub async fn election_loop(
     if let Some(ref moe_config) = moe_config {
         eprintln!(
             "🧩 [{}] MoE model detected ({} experts, top-{})",
-            model_name,
-            moe_config.n_expert,
-            moe_config.n_expert_used
+            model_name, moe_config.n_expert, moe_config.n_expert_used
         );
     }
 
@@ -2282,8 +2280,7 @@ async fn start_llama(
     };
 
     // Look up mmproj for vision models
-    let mmproj_path =
-        crate::models::resolve_mmproj_path(model_name, model, explicit_mmproj);
+    let mmproj_path = crate::models::resolve_mmproj_path(model_name, model, explicit_mmproj);
 
     // In split mode (pipeline parallel), pass total group VRAM so context size
     // accounts for the host only holding its share of layers. KV cache is also
