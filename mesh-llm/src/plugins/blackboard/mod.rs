@@ -326,7 +326,7 @@ fn build_blackboard_plugin(name: String) -> mesh_llm_plugin::SimplePlugin {
         ),
         startup_policy: PluginStartupPolicy::PrivateMeshOnly,
         provides: [
-            capability("blackboard.v1"),
+            capability(crate::plugin::BLACKBOARD_CAPABILITY),
         ],
         mesh: [
             mesh_llm_plugin::mesh::channel(BLACKBOARD_CHANNEL),

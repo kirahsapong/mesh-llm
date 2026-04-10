@@ -87,7 +87,9 @@ pub(super) async fn api_proxy(
                                     let _ = proxy::send_error(tcp_stream, code, &msg).await;
                                 }
                                 Err(_) => {
-                                    let _ = proxy::send_503(tcp_stream).await;
+                                    let _ =
+                                        proxy::send_503(tcp_stream, "runtime load channel closed")
+                                            .await;
                                 }
                             }
                         } else {
@@ -117,7 +119,11 @@ pub(super) async fn api_proxy(
                                     let _ = proxy::send_error(tcp_stream, code, &msg).await;
                                 }
                                 Err(_) => {
-                                    let _ = proxy::send_503(tcp_stream).await;
+                                    let _ = proxy::send_503(
+                                        tcp_stream,
+                                        "runtime unload channel closed",
+                                    )
+                                    .await;
                                 }
                             }
                         } else {
@@ -281,7 +287,13 @@ pub(super) async fn api_proxy(
                                         )
                                         .await;
                                         if !routed {
-                                            let _ = proxy::send_503(tcp_stream).await;
+                                            let _ = proxy::send_503(
+                                                tcp_stream,
+                                                &format!(
+                                                    "plugin endpoint for model '{name}' failed"
+                                                ),
+                                            )
+                                            .await;
                                         }
                                         return;
                                     }

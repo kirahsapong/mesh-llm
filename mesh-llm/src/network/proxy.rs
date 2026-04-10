@@ -949,13 +949,14 @@ pub async fn release_request_objects(node: &mesh::Node, request_ids: &[String]) 
     }
 }
 
+/// Remote first-byte timeout: 5 minutes. This covers the full round trip
+/// through the QUIC tunnel including remote prefill. Concurrent requests
+/// on a loaded host can legitimately take minutes. A truly dead QUIC
+/// connection will reset/error much faster than this (QUIC idle timeout,
+/// connection loss detection). The old 60s default caused spurious 503s
+/// when the remote host was alive but busy.
 fn response_first_byte_timeout() -> Duration {
-    std::env::var("MESH_LLM_TUNNEL_FIRST_BYTE_TIMEOUT_SECS")
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
-        .filter(|secs| *secs > 0)
-        .map(Duration::from_secs)
-        .unwrap_or_else(|| Duration::from_secs(60))
+    Duration::from_secs(5 * 60)
 }
 
 fn saturating_u32(value: usize) -> u32 {
@@ -1515,24 +1516,14 @@ fn try_parse_response_headers(buf: &[u8]) -> Result<Option<ParsedResponseHeaders
     }
 }
 
+/// Read the next chunk of HTTP response data without any timeout.
+/// Used for continuation reads after the first byte has already arrived.
 async fn read_response_chunk<R: AsyncRead + Unpin>(
     reader: &mut R,
     buf: &mut Vec<u8>,
-    with_timeout: bool,
 ) -> Result<usize> {
     let mut chunk = [0u8; 8192];
-    let read_result = if with_timeout {
-        tokio::time::timeout(response_first_byte_timeout(), reader.read(&mut chunk))
-            .await
-            .map_err(|_| {
-                anyhow!(
-                    "upstream sent no response within {:.3}s",
-                    response_first_byte_timeout().as_secs_f64()
-                )
-            })?
-    } else {
-        reader.read(&mut chunk).await
-    }?;
+    let read_result = reader.read(&mut chunk).await?;
     if read_result == 0 {
         bail!("unexpected EOF while reading HTTP response");
     }
@@ -1541,13 +1532,53 @@ async fn read_response_chunk<R: AsyncRead + Unpin>(
 }
 
 async fn probe_http_response<R: AsyncRead + Unpin>(reader: &mut R) -> Result<ResponseProbe> {
+    probe_http_response_with_timeout(reader, response_first_byte_timeout()).await
+}
+
+/// Like `probe_http_response` but with a much longer timeout suitable for
+/// local llama-server connections. Prefill on a busy or slow machine can
+/// legitimately take minutes (large prompts, concurrent slot contention,
+/// slower hardware). We still bound the wait to catch a truly wedged
+/// llama-server process.
+async fn probe_http_response_local<R: AsyncRead + Unpin>(reader: &mut R) -> Result<ResponseProbe> {
+    probe_http_response_with_timeout(reader, local_response_first_byte_timeout()).await
+}
+
+/// Local llama-server timeout: 10 minutes. This is a safety net for a
+/// wedged process, not a latency budget. Normal prefill even on slow
+/// hardware with large prompts and concurrent slots completes well
+/// within this window.
+fn local_response_first_byte_timeout() -> Duration {
+    Duration::from_secs(10 * 60)
+}
+
+async fn probe_http_response_with_timeout<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    timeout: Duration,
+) -> Result<ResponseProbe> {
     let mut buffered = Vec::with_capacity(8192);
     let parsed = loop {
         if let Some(parsed) = try_parse_response_headers(&buffered)? {
             break parsed;
         }
         let first_read = buffered.is_empty();
-        read_response_chunk(reader, &mut buffered, first_read).await?;
+        if first_read {
+            let mut chunk = [0u8; 8192];
+            let read_result = tokio::time::timeout(timeout, reader.read(&mut chunk))
+                .await
+                .map_err(|_| {
+                    anyhow!(
+                        "upstream sent no response within {:.3}s",
+                        timeout.as_secs_f64()
+                    )
+                })??;
+            if read_result == 0 {
+                bail!("unexpected EOF while reading HTTP response");
+            }
+            buffered.extend_from_slice(&chunk[..read_result]);
+        } else {
+            read_response_chunk(reader, &mut buffered).await?;
+        }
         if buffered.len() > MAX_HEADER_BYTES {
             bail!("HTTP response headers exceed {MAX_HEADER_BYTES} bytes");
         }
@@ -1562,7 +1593,7 @@ async fn probe_http_response<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Res
         0
     };
     while buffered.len() < parsed.header_end + preview_len {
-        read_response_chunk(reader, &mut buffered, false).await?;
+        read_response_chunk(reader, &mut buffered).await?;
     }
 
     let retryable_context_overflow = parsed.status_code == 400
@@ -1631,7 +1662,7 @@ async fn route_local_attempt(
                 );
                 return RouteAttemptResult::RetryableUnavailable;
             }
-            match probe_http_response(&mut upstream).await {
+            match probe_http_response_local(&mut upstream).await {
                 Ok(probe) => {
                     let status_code = probe.status_code;
                     match relay_probed_response(
@@ -1976,17 +2007,34 @@ pub async fn handle_mesh_request(
         }
     }
 
-    // Resolve target hosts by model name, fall back to any host
+    // Resolve target hosts by model name
     let target_hosts = if let Some(ref name) = effective_model {
         node.hosts_for_model(name).await
     } else {
         vec![]
     };
-    let target_hosts = if target_hosts.is_empty() {
+    let target_hosts = if target_hosts.is_empty() && effective_model.is_some() {
+        // Named model requested but no host serves it — tell the agent to retry.
+        let model = effective_model.as_deref().unwrap();
+        tracing::warn!("API proxy: model {model:?} not available, no hosts serving it");
+        let _ = send_error(
+            tcp_stream,
+            429,
+            &format!("model {model:?} not currently available — retry later"),
+        )
+        .await;
+        release_request_objects(&node, &request.request_object_request_ids).await;
+        return;
+    } else if target_hosts.is_empty() {
+        // No model specified and no hosts at all
         match node.any_host().await {
             Some(p) => vec![p.id],
             None => {
-                let _ = send_503(tcp_stream).await;
+                let _ = send_503(
+                    tcp_stream,
+                    "no peers serving any model (mesh empty or gossip stale)",
+                )
+                .await;
                 release_request_objects(&node, &request.request_object_request_ids).await;
                 return;
             }
@@ -2113,7 +2161,11 @@ pub async fn handle_mesh_request(
     if last_retryable {
         tracing::warn!("All hosts failed for model {:?}", effective_model);
     }
-    let _ = send_503(tcp_stream).await;
+    let reason = format!(
+        "all {} tunnel(s) to hosts for {:?} failed (mesh request)",
+        total_targets, effective_model,
+    );
+    let _ = send_503(tcp_stream, &reason).await;
     release_request_objects(&node, &request.request_object_request_ids).await;
 }
 
@@ -2178,7 +2230,13 @@ pub async fn route_model_request(
         affinity,
     );
     if matches!(selection.target, election::InferenceTarget::None) {
-        let _ = send_503(tcp_stream).await;
+        let _ = send_503(
+            tcp_stream,
+            &format!(
+                "target for model '{model}' resolved to None (election in progress or host down)"
+            ),
+        )
+        .await;
         return true;
     }
 
@@ -2261,7 +2319,11 @@ pub async fn route_model_request(
         }
     }
 
-    let _ = send_503(tcp_stream).await;
+    let _ = send_503(
+        tcp_stream,
+        &format!("all {} target(s) for model '{model}' failed", total_targets),
+    )
+    .await;
     true
 }
 
@@ -2276,7 +2338,11 @@ pub async fn route_moe_request(
 ) -> bool {
     let mut tcp_stream = tcp_stream;
     let Some(primary_target) = targets.get_moe_target(session_hint) else {
-        let _ = send_503(tcp_stream).await;
+        let _ = send_503(
+            tcp_stream,
+            &format!("no MoE target for model '{model}' session '{session_hint}'"),
+        )
+        .await;
         return false;
     };
     let mut ordered = order_targets_by_context(
@@ -2287,7 +2353,11 @@ pub async fn route_moe_request(
     )
     .await;
     if ordered.is_empty() {
-        let _ = send_503(tcp_stream).await;
+        let _ = send_503(
+            tcp_stream,
+            &format!("no MoE failover targets for model '{model}'"),
+        )
+        .await;
         return false;
     }
     move_target_first(&mut ordered, &primary_target);
@@ -2326,7 +2396,11 @@ pub async fn route_moe_request(
         }
     }
 
-    let _ = send_503(tcp_stream).await;
+    let _ = send_503(
+        tcp_stream,
+        &format!("all MoE targets for model '{model}' failed"),
+    )
+    .await;
     true
 }
 
@@ -2361,7 +2435,11 @@ pub async fn route_to_target(
             if let Some(moe_host_id) = moe_remote_id {
                 node.handle_peer_death(moe_host_id).await;
             }
-            let _ = send_503(tcp_stream).await;
+            let _ = send_503(
+                tcp_stream,
+                &format!("single target {target:?} unavailable (route_to_target)"),
+            )
+            .await;
             false
         }
     }
@@ -2466,11 +2544,17 @@ pub async fn send_error(mut stream: TcpStream, code: u16, msg: &str) -> std::io:
         404 => "Not Found",
         409 => "Conflict",
         422 => "Unprocessable Content",
+        429 => "Too Many Requests",
         _ => "Bad Request",
     };
     let body = serde_json::json!({"error": msg}).to_string();
+    let retry_after = if code == 429 {
+        "Retry-After: 5\r\n"
+    } else {
+        ""
+    };
     let resp = format!(
-        "HTTP/1.1 {code} {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        "HTTP/1.1 {code} {status}\r\nContent-Type: application/json\r\n{retry_after}Content-Length: {}\r\n\r\n{}",
         body.len(), body
     );
     stream.write_all(resp.as_bytes()).await?;
@@ -2478,8 +2562,13 @@ pub async fn send_error(mut stream: TcpStream, code: u16, msg: &str) -> std::io:
     Ok(())
 }
 
-pub async fn send_503(mut stream: TcpStream) -> std::io::Result<()> {
-    let body = r#"{"error":"No inference server available — election in progress"}"#;
+pub async fn send_503(stream: TcpStream, reason: &str) -> std::io::Result<()> {
+    tracing::warn!("503 → client: {reason}");
+    send_503_inner(stream, reason).await
+}
+
+async fn send_503_inner(mut stream: TcpStream, reason: &str) -> std::io::Result<()> {
+    let body = serde_json::json!({"error": reason}).to_string();
     let resp = format!(
         "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
         body.len(), body
@@ -3050,5 +3139,67 @@ mod tests {
         assert!(raw.starts_with("GET /v1/models HTTP/1.1\r\n"));
         assert!(!raw.contains("/mesh/drop"));
         assert!(raw.contains("Connection: close\r\n\r\n"));
+    }
+
+    /// `probe_http_response_local` uses a much longer timeout (10 min)
+    /// than `probe_http_response` (5 min), because local llama-server
+    /// prefill can legitimately take minutes under load.
+    ///
+    /// This test sends a response after a 2s delay and verifies that
+    /// `probe_http_response_local` waits for it (well within its 10-min
+    /// window) rather than failing at the shorter remote timeout.
+    #[tokio::test]
+    async fn test_probe_http_response_local_tolerates_slow_first_byte() {
+        use tokio::io::AsyncWriteExt;
+
+        let (client, mut server) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            let _ = server
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+                .await;
+        });
+
+        let mut reader = client;
+        let result = super::probe_http_response_local(&mut reader).await;
+        assert!(
+            result.is_ok(),
+            "probe_http_response_local should NOT timeout for slow local responses"
+        );
+        assert_eq!(result.unwrap().status_code, 200);
+    }
+
+    #[tokio::test]
+    async fn test_send_error_429_includes_retry_after() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            super::send_error(stream, 429, "model not available")
+                .await
+                .unwrap();
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut buf = vec![0u8; 4096];
+        let mut total = 0;
+        loop {
+            let n = client.read(&mut buf[total..]).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            total += n;
+        }
+        let response = String::from_utf8_lossy(&buf[..total]);
+
+        assert!(response.starts_with("HTTP/1.1 429 Too Many Requests\r\n"));
+        assert!(response.contains("Retry-After: 5\r\n"));
+        assert!(response.contains("model not available"));
+
+        server.await.unwrap();
     }
 }

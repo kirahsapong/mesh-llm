@@ -236,19 +236,65 @@ case "$BACKEND" in
         ;;
 esac
 
+# MESH_LLM_LLAMA_PIN_SHA pins the llama.cpp checkout to a specific commit and
+# disables the `git pull` that would otherwise move the working tree forward.
+# This is required by the cross-PR llama.cpp / CUDA artifact cache in
+# .github/workflows/ci.yml: the cache key embeds the resolved upstream SHA, so
+# the actual checkout MUST match that SHA byte-for-byte or the restored
+# `llama.cpp/build/` directory will be inconsistent with the source tree and
+# cmake will silently rebuild things.
+#
+# When unset (the default for local `just build`), behaviour is unchanged:
+# clone-or-pull `upstream-latest` HEAD as before.
+LLAMA_PIN_SHA="${MESH_LLM_LLAMA_PIN_SHA:-}"
+
 if [[ ! -d "$LLAMA_DIR" ]]; then
-    echo "Cloning michaelneale/llama.cpp (upstream-latest)..."
-    git clone -b upstream-latest \
-        https://github.com/michaelneale/llama.cpp.git "$LLAMA_DIR"
+    if [[ -n "$LLAMA_PIN_SHA" ]]; then
+        echo "Cloning michaelneale/llama.cpp pinned to $LLAMA_PIN_SHA..."
+        # Shallow clone of upstream-latest first (the common case is that
+        # $LLAMA_PIN_SHA == upstream-latest HEAD because ci.yml resolves it
+        # via `git ls-remote ... refs/heads/upstream-latest`). If the branch
+        # has moved between resolve and clone, fall back to fetching the
+        # specific commit.
+        git clone -b upstream-latest --depth 1 \
+            https://github.com/michaelneale/llama.cpp.git "$LLAMA_DIR"
+        if ! (cd "$LLAMA_DIR" && git cat-file -e "${LLAMA_PIN_SHA}^{commit}" 2>/dev/null); then
+            echo "Pinned SHA not on upstream-latest tip, fetching explicitly..."
+            (cd "$LLAMA_DIR" && git fetch --depth 1 origin "$LLAMA_PIN_SHA")
+        fi
+        (cd "$LLAMA_DIR" && git checkout --detach "$LLAMA_PIN_SHA")
+    else
+        echo "Cloning michaelneale/llama.cpp (upstream-latest)..."
+        git clone -b upstream-latest \
+            https://github.com/michaelneale/llama.cpp.git "$LLAMA_DIR"
+    fi
 else
     cd "$LLAMA_DIR"
-    CURRENT_BRANCH=$(git branch --show-current)
-    if [[ "$CURRENT_BRANCH" != "upstream-latest" ]]; then
-        echo "⚠️  llama.cpp is on branch '$CURRENT_BRANCH', switching to upstream-latest..."
-        git checkout upstream-latest
+    if [[ -n "$LLAMA_PIN_SHA" ]]; then
+        # Pinned mode: do NOT pull. Fetch the requested SHA if missing and
+        # check it out in detached HEAD. Skipping `git pull` is the whole
+        # point — it keeps the working tree byte-identical to what the cache
+        # key promises.
+        if ! git cat-file -e "${LLAMA_PIN_SHA}^{commit}" 2>/dev/null; then
+            echo "Fetching pinned llama.cpp SHA $LLAMA_PIN_SHA..."
+            git fetch --depth 1 origin "$LLAMA_PIN_SHA"
+        fi
+        CURRENT_SHA="$(git rev-parse HEAD)"
+        if [[ "$CURRENT_SHA" != "$LLAMA_PIN_SHA" ]]; then
+            echo "Checking out pinned llama.cpp SHA $LLAMA_PIN_SHA (was $CURRENT_SHA)..."
+            git checkout --detach "$LLAMA_PIN_SHA"
+        else
+            echo "llama.cpp already at pinned SHA $LLAMA_PIN_SHA, no checkout needed"
+        fi
+    else
+        CURRENT_BRANCH=$(git branch --show-current)
+        if [[ "$CURRENT_BRANCH" != "upstream-latest" ]]; then
+            echo "⚠️  llama.cpp is on branch '$CURRENT_BRANCH', switching to upstream-latest..."
+            git checkout upstream-latest
+        fi
+        echo "Pulling latest upstream-latest from origin..."
+        git pull --ff-only origin upstream-latest
     fi
-    echo "Pulling latest upstream-latest from origin..."
-    git pull --ff-only origin upstream-latest
     cd "$REPO_ROOT"
 fi
 
@@ -275,8 +321,27 @@ if [[ "$BACKEND" == "cpu" ]]; then
         -DGGML_METAL=OFF
     )
 elif [[ "$BACKEND" == "cuda" ]]; then
+    # GGML_CUDA_FA_ALL_QUANTS compiles the full matrix of FlashAttention
+    # kernels so mismatched K/V cache quantization types (e.g. K=q8_0, V=q4_0)
+    # don't hit BEST_FATTN_KERNEL_NONE and crash the rpc-server.
+    # Required for any asymmetric KV cache; the default (ON) is what user-
+    # facing release artifacts must ship. Tracking:
+    # https://github.com/ggml-org/llama.cpp/issues/20866
+    #
+    # CI may opt out via MESH_LLM_CUDA_FA_ALL_QUANTS=off because ci.yml does
+    # only a --version smoke test on the CUDA binary and never exercises the
+    # asymmetric KV cache path. Dropping the flag shrinks the FlashAttention
+    # kernel matrix drastically (~177 fattn .cu instantiations \u2192 a fraction)
+    # and cuts llama.cpp CUDA compile time significantly. NEVER use this
+    # opt-out for release builds.
+    CUDA_FA_ALL_QUANTS_FLAG="-DGGML_CUDA_FA_ALL_QUANTS=ON"
+    if [[ "${MESH_LLM_CUDA_FA_ALL_QUANTS:-on}" == "off" ]]; then
+        CUDA_FA_ALL_QUANTS_FLAG="-DGGML_CUDA_FA_ALL_QUANTS=OFF"
+        echo "GGML_CUDA_FA_ALL_QUANTS disabled via MESH_LLM_CUDA_FA_ALL_QUANTS=off (CI opt-out)"
+    fi
     cmake_flags+=(
         -DGGML_CUDA=ON
+        "$CUDA_FA_ALL_QUANTS_FLAG"
         -DGGML_HIP=OFF
         -DGGML_VULKAN=OFF
         -DGGML_METAL=OFF
@@ -307,6 +372,25 @@ fi
 cmake_flags+=("${compiler_launcher_flags[@]}")
 
 cmake "${cmake_flags[@]}"
+
+# Post-configure assertion: guarantee the CUDA cmake cache reflects the
+# intended GGML_CUDA_FA_ALL_QUANTS state. The default path must ship ON; the
+# CI opt-out must explicitly pass MESH_LLM_CUDA_FA_ALL_QUANTS=off. Tracking:
+# https://github.com/ggml-org/llama.cpp/issues/20866
+if [[ "$BACKEND" == "cuda" ]]; then
+    EXPECTED_FA_ALL_QUANTS="ON"
+    if [[ "${MESH_LLM_CUDA_FA_ALL_QUANTS:-on}" == "off" ]]; then
+        EXPECTED_FA_ALL_QUANTS="OFF"
+    fi
+    if ! grep -q "^GGML_CUDA_FA_ALL_QUANTS:BOOL=${EXPECTED_FA_ALL_QUANTS}" "$BUILD_DIR/CMakeCache.txt"; then
+        echo "ERROR: GGML_CUDA_FA_ALL_QUANTS is not ${EXPECTED_FA_ALL_QUANTS} in $BUILD_DIR/CMakeCache.txt" >&2
+        echo "       Expected state derived from MESH_LLM_CUDA_FA_ALL_QUANTS=${MESH_LLM_CUDA_FA_ALL_QUANTS:-on}." >&2
+        echo "       Release builds MUST ship ON (asymmetric K/V cache crash risk)." >&2
+        echo "       See scripts/build-linux.sh and ggml-org/llama.cpp#20866." >&2
+        exit 1
+    fi
+fi
+
 cmake --build "$BUILD_DIR" --config Release -j"$(nproc)"
 echo "llama.cpp build complete: $BUILD_DIR/bin/"
 
@@ -314,7 +398,17 @@ if [[ -d "$MESH_DIR" ]]; then
     if [[ -d "$UI_DIR" ]]; then
         "$SCRIPT_DIR/build-ui.sh" "$UI_DIR"
     fi
-    echo "Building mesh-llm..."
-    (cd "$MESH_DIR" && cargo build --release)
-    echo "Mesh binary: target/release/mesh-llm"
+
+    # MESH_LLM_BUILD_PROFILE=dev|debug lets CI opt into dev profile (single
+    # target subdir, only the bin target — same shape as linux+macos jobs).
+    # Default stays release so local `just build` is unchanged.
+    if [[ "${MESH_LLM_BUILD_PROFILE:-release}" == "dev" || "${MESH_LLM_BUILD_PROFILE:-release}" == "debug" ]]; then
+        echo "Building mesh-llm (profile: dev, bin only)..."
+        (cd "$REPO_ROOT" && cargo build -p mesh-llm --bin mesh-llm)
+        echo "Mesh binary: target/debug/mesh-llm"
+    else
+        echo "Building mesh-llm (profile: release)..."
+        (cd "$MESH_DIR" && cargo build --release)
+        echo "Mesh binary: target/release/mesh-llm"
+    fi
 fi

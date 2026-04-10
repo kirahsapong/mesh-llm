@@ -26,12 +26,7 @@ use tokio::sync::Mutex;
 static BYTES_TRANSFERRED: AtomicU64 = AtomicU64::new(0);
 
 fn quic_response_first_byte_timeout() -> Duration {
-    std::env::var("MESH_LLM_TUNNEL_FIRST_BYTE_TIMEOUT_SECS")
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
-        .filter(|secs| *secs > 0)
-        .map(Duration::from_secs)
-        .unwrap_or_else(|| Duration::from_secs(60))
+    Duration::from_secs(5 * 60)
 }
 
 /// Get total bytes transferred through all tunnels
@@ -54,7 +49,8 @@ pub struct Manager {
 impl Manager {
     /// Start the tunnel manager.
     /// `rpc_port` is the local rpc-server port (for inbound RPC tunnel streams).
-    /// HTTP port for inbound tunnels is set dynamically via `set_http_port()`.
+    /// The llama-server port for inbound HTTP tunnels is set dynamically via
+    /// `set_http_port()` when the election loop starts/stops llama-server.
     pub async fn start(
         node: Node,
         rpc_port: u16,
@@ -102,7 +98,9 @@ impl Manager {
         });
 
         // Handle inbound HTTP tunnel streams.
-        // These terminate at the stable mesh HTTP ingress, which is the API proxy.
+        // These connect directly to llama-server, bypassing the API proxy.
+        // The client proxy has already normalized the request — the host
+        // doesn't need to re-parse or re-route.
         let http_port_ref = mgr.http_port.clone();
         let http_node = mgr.node.clone();
         tokio::spawn(async move {
@@ -124,8 +122,9 @@ impl Manager {
         Ok(mgr)
     }
 
-    /// Update the local HTTP ingress port for inbound HTTP tunnel streams.
-    /// This should be the stable API proxy port, not a per-model llama-server port.
+    /// Update the local serving port for inbound HTTP tunnel streams.
+    /// This should be the llama-server port (not the API proxy port) so
+    /// tunneled requests bypass the proxy and go directly to the backend.
     /// Set to 0 to disable.
     pub fn set_http_port(&self, port: u16) {
         self.http_port.store(port, Ordering::Relaxed);
@@ -287,15 +286,15 @@ async fn handle_inbound_stream(
     Ok(())
 }
 
-/// Handle an inbound HTTP tunnel bi-stream: connect to the local API proxy and relay.
-/// Plain byte relay — the proxy handles model-aware routing behind this ingress.
+/// Handle an inbound HTTP tunnel bi-stream: connect directly to the local llama-server and relay.
+/// Plain byte relay — the client proxy already normalized the request before tunneling.
 async fn handle_inbound_http_stream(
     node: Node,
     quic_send: iroh::endpoint::SendStream,
     quic_recv: iroh::endpoint::RecvStream,
     http_port: u16,
 ) -> Result<()> {
-    tracing::info!("Inbound HTTP tunnel stream → API proxy :{http_port}");
+    tracing::info!("Inbound HTTP tunnel stream → llama-server :{http_port}");
     let tcp_stream = TcpStream::connect(format!("127.0.0.1:{http_port}")).await?;
     tcp_stream.set_nodelay(true)?;
     let _inflight = node.begin_inflight_request();
