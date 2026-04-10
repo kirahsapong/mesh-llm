@@ -239,15 +239,11 @@ message NodePluginEntry {
 message ConfigSubscribe {
   uint32 gen = 1;                         // must equal NODE_PROTOCOL_GENERATION
   bytes subscriber_id = 2;               // 32 bytes — subscribing node's endpoint id
-  reserved 3;
-  reserved "owner_id";                   // removed: authorization now uses attested peer identity
 }
 
 message ConfigSnapshotResponse {
   uint32 gen = 1;                         // must equal NODE_PROTOCOL_GENERATION
   bytes node_id = 2;                      // 32 bytes — the node this config belongs to
-  reserved 3;
-  reserved "owner_id";                   // removed: subscriber learns owner from gossip attestation
   uint64 revision = 4;
   bytes config_hash = 5;                  // SHA-256 of canonical proto bytes (32 bytes)
   NodeConfigSnapshot config = 6;
@@ -258,8 +254,6 @@ message ConfigSnapshotResponse {
 message ConfigUpdateNotification {
   uint32 gen = 1;
   bytes node_id = 2;
-  reserved 3;
-  reserved "owner_id";                   // removed: subscriber learns owner from gossip attestation
   uint64 revision = 4;
   bytes config_hash = 5;
   NodeConfigSnapshot config = 6;
@@ -269,12 +263,17 @@ message ConfigPush {
   uint32 gen = 1;
   bytes requester_id = 2;
   bytes target_node_id = 3;
-  reserved 4;
-  reserved "owner_id";                   // removed: authorization uses attested requester identity
   uint64 expected_revision = 5;
   NodeConfigSnapshot config = 6;
   bytes owner_signing_public_key = 7;
   bytes signature = 8;
+}
+
+enum ConfigApplyMode {
+  CONFIG_APPLY_MODE_UNSPECIFIED = 0;
+  CONFIG_APPLY_MODE_STAGED = 1;
+  CONFIG_APPLY_MODE_LIVE = 2;
+  CONFIG_APPLY_MODE_NOOP = 3;
 }
 
 message ConfigPushResponse {
@@ -283,8 +282,5 @@ message ConfigPushResponse {
   uint64 current_revision = 3;
   bytes config_hash = 4;
   optional string error = 5;
-  bool saved_to_disk = 6;
-  bool applied_live = 7;
-  reserved 8;
-  reserved "apply_mode";
+  ConfigApplyMode apply_mode = 8;
 }

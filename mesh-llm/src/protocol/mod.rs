@@ -739,8 +739,7 @@ mod tests {
             current_revision: 9,
             config_hash: config_hash.clone(),
             error: None,
-            saved_to_disk: true,
-            applied_live: true,
+            apply_mode: 1,
         };
         let encoded = encode_control_frame(STREAM_CONFIG_PUSH, &push_response);
         let decoded: ConfigPushResponse = decode_control_frame(STREAM_CONFIG_PUSH, &encoded)
@@ -842,8 +841,7 @@ mod tests {
             current_revision: 2,
             config_hash: vec![0x07; 32],
             error: Some("fail".to_string()),
-            saved_to_disk: false,
-            applied_live: false,
+            apply_mode: 0,
         };
         let encoded = encode_control_frame(STREAM_CONFIG_PUSH, &push_response);
         let err = decode_control_frame::<ConfigPushResponse>(STREAM_CONFIG_PUSH, &encoded)
@@ -878,8 +876,7 @@ mod tests {
             current_revision: 0,
             config_hash: vec![],
             error: Some("not the owner of this node".to_string()),
-            saved_to_disk: false,
-            applied_live: false,
+            apply_mode: 0,
         };
         let encoded = encode_control_frame(STREAM_CONFIG_PUSH, &error_response);
         decode_control_frame::<crate::proto::node::ConfigPushResponse>(
