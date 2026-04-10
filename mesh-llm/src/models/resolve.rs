@@ -1278,6 +1278,9 @@ fn select_default_hf_file_from_siblings(siblings: &[String]) -> Option<String> {
             } else if is_split_mlx_first_shard(&lower) {
                 1
             } else if lower.ends_with(".gguf") {
+                if is_known_gguf_sidecar(file) {
+                    return None;
+                }
                 if lower.contains("-000") && !lower.contains("-00001-of-") {
                     return None;
                 }
