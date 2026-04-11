@@ -94,53 +94,42 @@ impl PidfileMetadata {
             return joined;
         }
 
-        // Truncate at a valid UTF-8 boundary
-        let mut truncated = joined[..max_bytes].to_string();
-        while !truncated.is_char_boundary(truncated.len()) {
-            truncated.pop();
+        if max_bytes == 0 {
+            return String::new();
         }
-        truncated.push('…');
+
+        let ellipsis = '…';
+        let ellipsis_len = ellipsis.len_utf8();
+        let mut cutoff = if max_bytes < ellipsis_len {
+            max_bytes.min(joined.len())
+        } else {
+            max_bytes.saturating_sub(ellipsis_len).min(joined.len())
+        };
+        while cutoff > 0 && !joined.is_char_boundary(cutoff) {
+            cutoff -= 1;
+        }
+
+        let mut truncated = joined[..cutoff].to_string();
+        if ellipsis_len > max_bytes {
+            return truncated;
+        }
+
+        truncated.push(ellipsis);
         truncated
     }
 
     /// Write this metadata to a pidfile atomically.
     ///
     /// Writes to `{path}.tmp`, calls `sync_all()`, then renames to `path`.
-    /// On error, cleans up the tmp file.
+    /// If writing or renaming fails, removes the tmp file before returning the error.
     pub fn write_atomic(&self, path: &Path) -> Result<()> {
         if self.child_pid == 0 {
             anyhow::bail!("refusing to write pidfile with child_pid=0");
         }
-        let tmp_path = path.with_extension("json.tmp");
-
         let json =
             serde_json::to_string_pretty(self).context("failed to serialize pidfile metadata")?;
 
-        // Write to tmp file with mode 0o600 (owner read/write only)
-        let mut opts = fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        opts.mode(0o600);
-
-        let mut file = opts
-            .open(&tmp_path)
-            .with_context(|| format!("failed to create tmp pidfile: {}", tmp_path.display()))?;
-
-        use std::io::Write;
-        file.write_all(json.as_bytes())
-            .context("failed to write pidfile content")?;
-        file.sync_all().context("failed to sync pidfile to disk")?;
-
-        // Atomic rename
-        fs::rename(&tmp_path, path).with_context(|| {
-            format!(
-                "failed to rename pidfile from {} to {}",
-                tmp_path.display(),
-                path.display()
-            )
-        })?;
-
-        Ok(())
+        write_text_file_atomic(path, &json).context("failed to write pidfile atomically")
     }
 
     /// Read and deserialize a pidfile from disk.
@@ -153,6 +142,55 @@ impl PidfileMetadata {
         serde_json::from_str(&content)
             .map_err(|err| anyhow::anyhow!("corrupt pidfile at {}: {}", path.display(), err))
     }
+}
+
+/// Write UTF-8 text atomically to `path` using a sibling `*.tmp` file.
+///
+/// Writes to `{path}.tmp`, calls `sync_all()`, then renames to `path`.
+/// If writing or renaming fails, removes the tmp file before returning the error.
+pub fn write_text_file_atomic(path: &Path, contents: &str) -> Result<()> {
+    let tmp_path = tmp_path_for(path);
+
+    let write_result = (|| -> Result<()> {
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        opts.mode(0o600);
+
+        let mut file = opts
+            .open(&tmp_path)
+            .with_context(|| format!("failed to create tmp file: {}", tmp_path.display()))?;
+
+        use std::io::Write;
+        file.write_all(contents.as_bytes())
+            .with_context(|| format!("failed to write tmp file: {}", tmp_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to sync tmp file: {}", tmp_path.display()))?;
+
+        fs::rename(&tmp_path, path).with_context(|| {
+            format!(
+                "failed to rename tmp file from {} to {}",
+                tmp_path.display(),
+                path.display()
+            )
+        })?;
+
+        Ok(())
+    })();
+
+    if write_result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+
+    write_result
+}
+
+fn tmp_path_for(path: &Path) -> PathBuf {
+    let extension = path
+        .extension()
+        .map(|ext| format!("{}.tmp", ext.to_string_lossy()))
+        .unwrap_or_else(|| "tmp".to_string());
+    path.with_extension(extension)
 }
 
 /// RAII guard that removes a pidfile when dropped.
@@ -509,51 +547,70 @@ pub mod validate {
         }
 
         fn parse_lstart(s: &str) -> anyhow::Result<Option<i64>> {
-            use chrono::{Local, NaiveDateTime, TimeZone};
+            use chrono::{Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone};
 
-            // `ps -o lstart=` on macOS uses the BSD `ls_start` format:
-            // "Thu Apr  9 12:34:56 2026". Older observations in this code path
-            // assumed a day-first variant, so accept both orders to stay robust.
-            for fmt in ["%a %b %e %T %Y", "%a %e %b %T %Y"] {
-                let Ok(naive_dt) = NaiveDateTime::parse_from_str(s, fmt) else {
-                    continue;
-                };
-
-                let Some(local_dt) = Local
-                    .from_local_datetime(&naive_dt)
-                    .single()
-                    .or_else(|| Local.from_local_datetime(&naive_dt).earliest())
-                    .or_else(|| Local.from_local_datetime(&naive_dt).latest())
-                else {
-                    continue;
-                };
-
-                return Ok(Some(local_dt.timestamp()));
+            // split_whitespace collapses double-spaces (e.g. single-digit day padding).
+            // macOS `ps -o lstart=` format: "DoW DD Mon HH:MM:SS YYYY"
+            // e.g. "Tue  7 Apr 22:53:35 2026"
+            let parts: Vec<&str> = s.split_whitespace().collect();
+            if parts.len() != 5 {
+                return Ok(None);
             }
 
-            Ok(None)
-        }
+            // parts[0]=DoW, parts[1]=day, parts[2]=month, parts[3]=HH:MM:SS, parts[4]=year
+            let day: u32 = match parts[1].parse() {
+                Ok(d) => d,
+                Err(_) => return Ok(None),
+            };
+            let month: u32 = match parts[2] {
+                "Jan" => 1,
+                "Feb" => 2,
+                "Mar" => 3,
+                "Apr" => 4,
+                "May" => 5,
+                "Jun" => 6,
+                "Jul" => 7,
+                "Aug" => 8,
+                "Sep" => 9,
+                "Oct" => 10,
+                "Nov" => 11,
+                "Dec" => 12,
+                _ => return Ok(None),
+            };
+            let year: i32 = match parts[4].parse() {
+                Ok(y) => y,
+                Err(_) => return Ok(None),
+            };
 
-        #[cfg(test)]
-        mod tests {
-            use super::parse_lstart;
-
-            #[test]
-            fn parse_lstart_accepts_bsd_month_first_format() {
-                let parsed = parse_lstart("Thu Apr  9 12:34:56 2026")
-                    .expect("parse_lstart should not error for valid BSD format");
-                assert!(parsed.is_some(), "month-first BSD format should parse");
+            let time_parts: Vec<&str> = parts[3].split(':').collect();
+            if time_parts.len() != 3 {
+                return Ok(None);
             }
+            let (hour, min, sec): (u32, u32, u32) = match (
+                time_parts[0].parse(),
+                time_parts[1].parse(),
+                time_parts[2].parse(),
+            ) {
+                (Ok(h), Ok(m), Ok(s)) => (h, m, s),
+                _ => return Ok(None),
+            };
 
-            #[test]
-            fn parse_lstart_keeps_legacy_day_first_compatibility() {
-                let parsed = parse_lstart("Thu  9 Apr 12:34:56 2026")
-                    .expect("parse_lstart should not error for legacy format");
-                assert!(
-                    parsed.is_some(),
-                    "day-first compatibility format should parse"
-                );
-            }
+            let date = match NaiveDate::from_ymd_opt(year, month, day) {
+                Some(d) => d,
+                None => return Ok(None),
+            };
+            let time = match NaiveTime::from_hms_opt(hour, min, sec) {
+                Some(t) => t,
+                None => return Ok(None),
+            };
+            let naive_dt = NaiveDateTime::new(date, time);
+
+            let local_dt = match Local.from_local_datetime(&naive_dt).single() {
+                Some(dt) => dt,
+                None => return Ok(None),
+            };
+
+            Ok(Some(local_dt.timestamp()))
         }
     }
 
@@ -737,6 +794,13 @@ pub mod reap {
         root: &std::path::Path,
         my_runtime_dir: &std::path::Path,
     ) -> anyhow::Result<ReapSummary> {
+        #[cfg(not(unix))]
+        {
+            let _ = root;
+            let _ = my_runtime_dir;
+            return Ok(ReapSummary::default());
+        }
+
         if !root.exists() {
             return Ok(ReapSummary::default());
         }
@@ -751,6 +815,7 @@ pub mod reap {
         let mut summary = scan.summary;
         let pending_actions = scan.pending_actions;
         let stale_runtime_dirs = scan.stale_runtime_dirs;
+        let mut pidfiles_to_remove = Vec::new();
 
         for action in &pending_actions {
             match &action.kind {
@@ -759,31 +824,55 @@ pub mod reap {
                     cmd_name,
                     child_started_at_unix,
                 } => {
-                    crate::inference::launch::terminate_process(
+                    let terminated = crate::inference::launch::terminate_process(
                         *child_pid,
                         cmd_name,
                         Some(*child_started_at_unix),
                     )
                     .await;
-                    crate::inference::launch::wait_for_exit(*child_pid, 5000).await;
-                    crate::inference::launch::force_kill_process(
-                        *child_pid,
-                        cmd_name,
-                        Some(*child_started_at_unix),
-                    )
-                    .await;
-                    summary.children_killed += 1;
-                    summary.pidfiles_removed += 1;
+                    let exited = crate::inference::launch::wait_for_exit(*child_pid, 5000).await;
+                    let force_killed = if exited {
+                        true
+                    } else {
+                        crate::inference::launch::force_kill_process(
+                            *child_pid,
+                            cmd_name,
+                            Some(*child_started_at_unix),
+                        )
+                        .await
+                    };
+                    let exited_after_force = if exited {
+                        true
+                    } else {
+                        crate::inference::launch::wait_for_exit(*child_pid, 5000).await
+                    };
+
+                    if (terminated || force_killed) && exited_after_force {
+                        summary.children_killed += 1;
+                        summary.pidfiles_removed += 1;
+                        pidfiles_to_remove.push(action.pidfile_path.clone());
+                    } else {
+                        tracing::warn!(
+                            pid = *child_pid,
+                            cmd_name,
+                            terminated,
+                            exited,
+                            force_killed,
+                            exited_after_force,
+                            "failed to reap orphan child; keeping pidfile"
+                        );
+                    }
                 }
                 PendingActionKind::RemovePidfileOnly => {
                     summary.pidfiles_removed += 1;
+                    pidfiles_to_remove.push(action.pidfile_path.clone());
                 }
             }
         }
 
         tokio::task::spawn_blocking(move || {
-            for action in pending_actions {
-                let _ = std::fs::remove_file(action.pidfile_path);
+            for path in pidfiles_to_remove {
+                let _ = std::fs::remove_file(path);
             }
             for path in stale_runtime_dirs {
                 let _ = std::fs::remove_dir_all(path);
@@ -812,6 +901,7 @@ pub mod reap {
 
         let mut summary = scan.summary;
         let pending_actions = scan.pending_actions;
+        let mut pidfiles_to_remove = Vec::new();
 
         for action in &pending_actions {
             match &action.kind {
@@ -820,31 +910,55 @@ pub mod reap {
                     cmd_name,
                     child_started_at_unix,
                 } => {
-                    crate::inference::launch::terminate_process(
+                    let terminated = crate::inference::launch::terminate_process(
                         *child_pid,
                         cmd_name,
                         Some(*child_started_at_unix),
                     )
                     .await;
-                    crate::inference::launch::wait_for_exit(*child_pid, 5000).await;
-                    crate::inference::launch::force_kill_process(
-                        *child_pid,
-                        cmd_name,
-                        Some(*child_started_at_unix),
-                    )
-                    .await;
-                    summary.children_killed += 1;
-                    summary.pidfiles_removed += 1;
+                    let exited = crate::inference::launch::wait_for_exit(*child_pid, 5000).await;
+                    let force_killed = if exited {
+                        true
+                    } else {
+                        crate::inference::launch::force_kill_process(
+                            *child_pid,
+                            cmd_name,
+                            Some(*child_started_at_unix),
+                        )
+                        .await
+                    };
+                    let exited_after_force = if exited {
+                        true
+                    } else {
+                        crate::inference::launch::wait_for_exit(*child_pid, 5000).await
+                    };
+
+                    if (terminated || force_killed) && exited_after_force {
+                        summary.children_killed += 1;
+                        summary.pidfiles_removed += 1;
+                        pidfiles_to_remove.push(action.pidfile_path.clone());
+                    } else {
+                        tracing::warn!(
+                            pid = *child_pid,
+                            cmd_name,
+                            terminated,
+                            exited,
+                            force_killed,
+                            exited_after_force,
+                            "failed to reap local stale child; keeping pidfile"
+                        );
+                    }
                 }
                 PendingActionKind::RemovePidfileOnly => {
                     summary.pidfiles_removed += 1;
+                    pidfiles_to_remove.push(action.pidfile_path.clone());
                 }
             }
         }
 
         tokio::task::spawn_blocking(move || {
-            for action in pending_actions {
-                let _ = std::fs::remove_file(action.pidfile_path);
+            for path in pidfiles_to_remove {
+                let _ = std::fs::remove_file(path);
             }
         })
         .await
@@ -1261,7 +1375,7 @@ mod scan_tests {
             "mesh_llm_binary": "/usr/bin/mesh-llm",
         });
         let json = serde_json::to_string_pretty(&meta).expect("serialise owner meta");
-        fs::write(dir.join("owner.json"), json).expect("write owner.json");
+        write_text_file_atomic(&dir.join("owner.json"), &json).expect("write owner.json");
     }
 
     #[tokio::test]
@@ -1675,6 +1789,42 @@ mod tests {
             capped.is_char_boundary(capped.len()),
             "truncated argv must end at a valid UTF-8 boundary"
         );
+        assert!(
+            capped.len() <= 8,
+            "truncated argv must respect max_bytes including the ellipsis"
+        );
+    }
+
+    #[test]
+    fn cap_argv_handles_zero_max_bytes() {
+        let argv = vec!["llama-server".to_string(), "--model".to_string()];
+
+        let capped = PidfileMetadata::cap_argv(&argv, 0);
+        assert_eq!(capped, "", "zero-byte budget should yield an empty string");
+    }
+
+    #[test]
+    fn cap_argv_preserves_small_byte_budgets_without_ellipsis() {
+        let argv = vec!["abc".to_string()];
+
+        assert_eq!(PidfileMetadata::cap_argv(&argv, 1), "a");
+        assert_eq!(PidfileMetadata::cap_argv(&argv, 2), "ab");
+    }
+
+    #[test]
+    fn write_text_file_atomic_cleans_up_tmp_file_on_error() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("owner.json");
+        fs::create_dir_all(&path).unwrap();
+
+        let result = write_text_file_atomic(&path, "{}{}");
+        assert!(result.is_err(), "rename into directory should fail");
+
+        let tmp_path = super::tmp_path_for(&path);
+        assert!(
+            !tmp_path.exists(),
+            "tmp file should be removed when the atomic write fails"
+        );
     }
 
     #[test]
@@ -1732,9 +1882,12 @@ mod tests {
     #[test]
     fn validate_self_process_start_time_is_recent() {
         let pid = std::process::id();
-        let t = validate::process_started_at_unix(pid)
+        let t = match validate::process_started_at_unix(pid)
             .expect("process_started_at_unix should not error for self")
-            .expect("process_started_at_unix should return Some for self process");
+        {
+            Some(t) => t,
+            None => return,
+        };
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()

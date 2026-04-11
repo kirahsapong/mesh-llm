@@ -177,6 +177,10 @@ Testing matters more than usual in this project because:
 
 When making changes that touch gossip, routing, proxy, election, or capability advertisement, test against at least two nodes before merging. The deploy checklist above is not optional.
 
+### Cargo Concurrency
+
+Run `cargo` commands serially. Do not run multiple `cargo` commands in parallel (including parallel test runs), because this repo frequently hits Cargo lock conflicts (`package cache` / `artifact directory`) under concurrent invocation.
+
 ## Formatting
 
 Before committing Rust changes, format only the changed Rust files from the repo root, for example with `cargo fmt --all -- path/to/file.rs`, and include those formatting changes in the commit.
@@ -210,7 +214,16 @@ just bundle
 
 ### Cleanup
 
-Clean shutdown removes the instance's runtime directory automatically. For emergency cleanup when processes need to be killed:
+Clean shutdown removes the instance's runtime directory automatically. Prefer the scoped runtime-aware commands first:
+
+```bash
+mesh-llm stop
+just stop
+```
+
+Those paths use the runtime metadata under `~/.mesh-llm/runtime/` to stop the tracked mesh-llm instance and its child servers cleanly.
+
+If an instance is wedged badly enough that the scoped stop path cannot reach it, fall back to an emergency kill:
 
 ```bash
 pkill -f mesh-llm; pkill -f rpc-server; pkill -f llama-server

@@ -839,22 +839,30 @@ pub(crate) enum ProcessSignal {
     Kill,
 }
 
-pub(crate) fn send_signal_if_matches(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SignalOutcome {
+    Sent,
+    AlreadyDead,
+    Skipped,
+    Failed,
+}
+
+fn send_signal_if_matches(
     pid: u32,
     expected_comm: &str,
     expected_start_time: Option<i64>,
     signal: ProcessSignal,
-) -> bool {
+) -> SignalOutcome {
     if !is_safe_kill_target(pid) {
         tracing::error!("BUG: attempted to signal unsafe pid {pid} — refusing");
-        return false;
+        return SignalOutcome::Failed;
     }
 
     if let Some(expected_t) = expected_start_time {
         if !crate::runtime::instance::validate::validate_pid_matches(pid, expected_comm, expected_t)
         {
             tracing::warn!("pid {pid} no longer matches expected identity, skipping signal");
-            return false;
+            return SignalOutcome::Skipped;
         }
     } else {
         let comm_ok = crate::runtime::instance::validate::process_comm(pid)
@@ -864,19 +872,30 @@ pub(crate) fn send_signal_if_matches(
             .unwrap_or(false);
         if !comm_ok {
             tracing::warn!("pid {pid} no longer matches {expected_comm}, skipping signal");
-            return false;
+            return SignalOutcome::Skipped;
         }
     }
 
     #[cfg(unix)]
     unsafe {
-        libc::kill(
+        let ret = libc::kill(
             pid as libc::pid_t,
             match signal {
                 ProcessSignal::Terminate => libc::SIGTERM,
                 ProcessSignal::Kill => libc::SIGKILL,
             },
         );
+        if ret == 0 {
+            return SignalOutcome::Sent;
+        }
+
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            return SignalOutcome::AlreadyDead;
+        }
+
+        tracing::warn!(pid, error = %err, ?signal, "failed to signal process");
+        return SignalOutcome::Failed;
     }
 
     #[cfg(windows)]
@@ -887,13 +906,22 @@ pub(crate) fn send_signal_if_matches(
         if signal == ProcessSignal::Kill {
             command.arg("/F");
         }
-        let _ = command
+        match command
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .status();
+            .status()
+        {
+            Ok(status) if status.success() => SignalOutcome::Sent,
+            Ok(status) => {
+                tracing::warn!(pid, exit_code = status.code(), ?signal, "taskkill failed");
+                SignalOutcome::Failed
+            }
+            Err(err) => {
+                tracing::warn!(pid, error = %err, ?signal, "failed to run taskkill");
+                SignalOutcome::Failed
+            }
+        }
     }
-
-    true
 }
 
 pub(crate) fn terminate_process_blocking(
@@ -901,13 +929,15 @@ pub(crate) fn terminate_process_blocking(
     expected_comm: &str,
     expected_start_time: Option<i64>,
 ) -> bool {
-    if !send_signal_if_matches(
+    match send_signal_if_matches(
         pid,
         expected_comm,
         expected_start_time,
         ProcessSignal::Terminate,
     ) {
-        return false;
+        SignalOutcome::Sent => {}
+        SignalOutcome::AlreadyDead | SignalOutcome::Skipped => return true,
+        SignalOutcome::Failed => return false,
     }
 
     for _ in 0..20 {
@@ -919,8 +949,10 @@ pub(crate) fn terminate_process_blocking(
         }
     }
 
-    let _ = send_signal_if_matches(pid, expected_comm, expected_start_time, ProcessSignal::Kill);
-    true
+    !matches!(
+        send_signal_if_matches(pid, expected_comm, expected_start_time, ProcessSignal::Kill),
+        SignalOutcome::Failed
+    )
 }
 
 async fn terminate_process_with_wait(
@@ -930,13 +962,14 @@ async fn terminate_process_with_wait(
     attempts: usize,
     interval: std::time::Duration,
 ) {
-    if !send_signal_if_matches(
+    match send_signal_if_matches(
         pid,
         expected_comm,
         expected_start_time,
         ProcessSignal::Terminate,
     ) {
-        return;
+        SignalOutcome::Sent => {}
+        SignalOutcome::AlreadyDead | SignalOutcome::Skipped | SignalOutcome::Failed => return,
     }
 
     for _ in 0..attempts {
@@ -1326,15 +1359,17 @@ pub async fn terminate_process(
 ) -> bool {
     if !is_safe_kill_target(pid) {
         tracing::error!("BUG: attempted to signal unsafe pid {pid} — refusing");
-        return true;
+        return false;
     }
-    let _ = send_signal_if_matches(
-        pid,
-        expected_comm,
-        expected_start_time,
-        ProcessSignal::Terminate,
-    );
-    true
+    !matches!(
+        send_signal_if_matches(
+            pid,
+            expected_comm,
+            expected_start_time,
+            ProcessSignal::Terminate
+        ),
+        SignalOutcome::Failed
+    )
 }
 
 /// Force-kill a process by PID, validating comm before signaling.
@@ -1345,10 +1380,12 @@ pub async fn force_kill_process(
 ) -> bool {
     if !is_safe_kill_target(pid) {
         tracing::error!("BUG: attempted to signal unsafe pid {pid} — refusing");
-        return true;
+        return false;
     }
-    let _ = send_signal_if_matches(pid, expected_comm, expected_start_time, ProcessSignal::Kill);
-    true
+    !matches!(
+        send_signal_if_matches(pid, expected_comm, expected_start_time, ProcessSignal::Kill),
+        SignalOutcome::Failed
+    )
 }
 
 /// Poll until process exits or timeout_ms elapses. Returns true if dead within timeout.
@@ -1846,6 +1883,12 @@ No devices found
             result,
             "mismatched comm should return true (skipped, treated as not our process)"
         );
+    }
+
+    #[tokio::test]
+    async fn terminate_unsafe_pid_returns_false() {
+        let result = terminate_process(1, "mesh-llm", None).await;
+        assert!(!result, "unsafe PID should return false");
     }
 
     #[tokio::test]
