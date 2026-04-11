@@ -291,25 +291,28 @@ def download_release_asset(url: str, destination: Path) -> None:
 
 
 def extract_release_binary(archive_path: Path, extract_dir: Path, binary_name: str) -> Path:
-    extract_dir.mkdir(parents=True, exist_ok=True)
-    extract_dir_resolved = extract_dir.resolve()
+    final_path = extract_dir / binary_name
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = extract_dir / f".{binary_name}.tmp"
     with tarfile.open(archive_path, "r:gz") as tar:
         members = tar.getmembers()
         matches = [member for member in members if Path(member.name).name == binary_name]
         if not matches:
             raise SystemExit(f"{binary_name} not found in release archive {archive_path}")
         member = matches[0]
-        # Guard against path traversal: ensure the extracted path stays under extract_dir
-        dest = (extract_dir_resolved / member.name).resolve()
-        if not str(dest).startswith(str(extract_dir_resolved) + os.sep):
-            raise SystemExit(f"Refusing to extract unsafe path from archive: {member.name}")
-        tar.extract(member, path=extract_dir)
-        extracted = extract_dir / member.name
-    final_path = extract_dir / binary_name
-    final_path.parent.mkdir(parents=True, exist_ok=True)
-    if extracted != final_path:
-        extracted.replace(final_path)
-    final_path.chmod(0o755)
+        if not member.isreg():
+            raise SystemExit(f"Refusing to extract non-regular file from archive: {member.name}")
+        source = tar.extractfile(member)
+        if source is None:
+            raise SystemExit(f"Failed to read {member.name} from release archive {archive_path}")
+        try:
+            with source, tmp_path.open("wb") as handle:
+                shutil.copyfileobj(source, handle)
+        except Exception:
+            tmp_path.unlink(missing_ok=True)
+            raise
+    tmp_path.chmod(0o755)
+    tmp_path.replace(final_path)
     return final_path
 
 
@@ -566,7 +569,10 @@ def run_analysis(
             )
         )
         if proc.returncode != 0:
-            raise SystemExit(f"llama-moe-analyze failed with exit code {proc.returncode}")
+            raise SystemExit(
+                f"llama-moe-analyze failed with exit code {proc.returncode} "
+                f"(see {log_path} for details)"
+            )
     else:
         prompts = load_prompts(args.prompt_file)
         temp_outputs: list[Path] = []
@@ -593,7 +599,8 @@ def run_analysis(
                 if proc.returncode != 0:
                     log_path.write_text("\n".join(log_chunks))
                     raise SystemExit(
-                        f"llama-moe-analyze failed for prompt {idx} with exit code {proc.returncode}"
+                        f"llama-moe-analyze failed for prompt {idx} with exit code {proc.returncode} "
+                        f"(see {log_path} for details)"
                     )
                 temp_outputs.append(partial)
             combine_rankings(temp_outputs, ranking_path)
