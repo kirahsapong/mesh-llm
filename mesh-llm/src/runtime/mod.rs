@@ -233,6 +233,8 @@ pub(crate) async fn run() -> Result<()> {
         mesh::clear_public_identity();
     }
 
+    let mut auto_join_candidates: Vec<(String, Option<String>)> = Vec::new();
+
     // --- Auto-discover ---
     if cli.auto && cli.join.is_empty() {
         cli.nostr_discovery = true;
@@ -310,25 +312,8 @@ pub(crate) async fn run() -> Result<()> {
                                 String::new()
                             }
                         );
-                        if cli.mesh_name.is_none() {
-                            if let Some(ref name) = mesh.listing.name {
-                                cli.mesh_name = Some(name.clone());
-                            }
-                        }
-                        eprintln!(
-                            "✅ Joining: {} ({} nodes, {} models{})",
-                            mesh.listing.name.as_deref().unwrap_or("unnamed"),
-                            mesh.listing.node_count,
-                            mesh.listing.serving.len(),
-                            mesh.listing
-                                .region
-                                .as_ref()
-                                .map(|r| format!(", region: {r}"))
-                                .unwrap_or_default()
-                        );
-                        cli.join.push(token.clone());
+                        auto_join_candidates.push((token.clone(), mesh.listing.name.clone()));
                         joined = true;
-                        break;
                     }
                     if !joined {
                         eprintln!("⚠️  No meshes found — starting new");
@@ -423,7 +408,7 @@ pub(crate) async fn run() -> Result<()> {
         .filter_map(|m| {
             m.file_stem()
                 .and_then(|s| s.to_str())
-                .map(|s| router::strip_split_suffix_owned(s))
+                .map(router::strip_split_suffix_owned)
         })
         .collect();
 
@@ -432,7 +417,15 @@ pub(crate) async fn run() -> Result<()> {
         None => detect_bin_dir()?,
     };
 
-    run_auto(cli, config, startup_models, requested_model_names, bin_dir).await
+    run_auto(
+        cli,
+        config,
+        startup_models,
+        requested_model_names,
+        bin_dir,
+        auto_join_candidates,
+    )
+    .await
 }
 
 /// Resolve a model path: local file, catalog name, or HuggingFace URL.
@@ -563,6 +556,7 @@ pub async fn ensure_draft(model: &std::path::Path) -> Option<PathBuf> {
 /// Priority:
 /// 1. Models the mesh needs that we already have on disk
 /// 2. Models in the mesh catalog that nobody is serving yet (on disk preferred)
+///
 /// Parse a catalog size string like "18.3GB" or "491MB" into bytes.
 fn parse_size_str(s: &str) -> u64 {
     let s = s.trim();
@@ -957,7 +951,7 @@ pub(crate) async fn run_plugin_mcp(cli: &Cli) -> Result<()> {
 
     let (plugin_mesh_tx, plugin_mesh_rx) = tokio::sync::mpsc::channel(256);
     let plugin_manager =
-        plugin::PluginManager::start(&resolved_plugins, plugin_host_mode(&cli), plugin_mesh_tx)
+        plugin::PluginManager::start(&resolved_plugins, plugin_host_mode(cli), plugin_mesh_tx)
             .await?;
     node.set_plugin_manager(plugin_manager.clone()).await;
     node.start_plugin_channel_forwarder(plugin_mesh_rx);
@@ -971,6 +965,17 @@ pub(crate) async fn run_plugin_mcp(cli: &Cli) -> Result<()> {
 
 pub(crate) use self::discovery::{check_mesh, nostr_relays};
 
+async fn store_benchmark_metrics(
+    mem_arc: std::sync::Arc<tokio::sync::Mutex<Option<Vec<f64>>>>,
+    fp32_arc: std::sync::Arc<tokio::sync::Mutex<Option<Vec<f64>>>>,
+    fp16_arc: std::sync::Arc<tokio::sync::Mutex<Option<Vec<f64>>>>,
+    result: Option<&benchmark::BenchmarkResult>,
+) {
+    *mem_arc.lock().await = result.map(|r| r.mem_bandwidth_gbps.clone());
+    *fp32_arc.lock().await = result.and_then(|r| r.compute_tflops_fp32.clone());
+    *fp16_arc.lock().await = result.and_then(|r| r.compute_tflops_fp16.clone());
+}
+
 /// Auto-election mode: start rpc-server, join mesh, auto-elect host.
 async fn run_auto(
     mut cli: Cli,
@@ -978,6 +983,7 @@ async fn run_auto(
     startup_models: Vec<StartupModelPlan>,
     requested_model_names: Vec<String>,
     bin_dir: PathBuf,
+    auto_join_candidates: Vec<(String, Option<String>)>,
 ) -> Result<()> {
     let resolved_plugins = resolve_plugins_from_config(&config, &cli)?;
     let api_port = cli.port;
@@ -1036,7 +1042,9 @@ async fn run_auto(
     // Launch memory bandwidth benchmark in background (non-blocking)
     // Skip for client nodes — they have no GPU to benchmark
     if !is_client {
-        let bw_arc = node.gpu_bandwidth_gbps.clone();
+        let mem_arc = node.gpu_mem_bandwidth_gbps.clone();
+        let compute_fp32_arc = node.gpu_compute_tflops_fp32.clone();
+        let compute_fp16_arc = node.gpu_compute_tflops_fp16.clone();
         let bin_dir_clone = bin_dir.clone();
         tokio::spawn(async move {
             let result = tokio::time::timeout(
@@ -1047,7 +1055,7 @@ async fn run_auto(
                         tracing::debug!("no GPUs detected — skipping memory bandwidth benchmark");
                         return None;
                     }
-                    benchmark::run_or_load(&hw, &bin_dir_clone, std::time::Duration::from_secs(25))
+                    benchmark::run_or_load(&hw, &bin_dir_clone, benchmark::BENCHMARK_TIMEOUT)
                 }),
             )
             .await
@@ -1058,36 +1066,89 @@ async fn run_auto(
             .and_then(|r| r.ok())
             .flatten();
 
-            if let Some(ref per_gpu) = result {
-                let total: f64 = per_gpu.iter().sum();
+            if let Some(ref run) = result {
+                let total: f64 = run.mem_bandwidth_gbps.iter().sum();
                 tracing::info!(
                     "Memory bandwidth fingerprint: {} GPUs, {:.1} GB/s total",
-                    per_gpu.len(),
+                    run.mem_bandwidth_gbps.len(),
                     total
                 );
-                for (i, gbps) in per_gpu.iter().enumerate() {
+                for (i, gbps) in run.mem_bandwidth_gbps.iter().enumerate() {
                     tracing::debug!("  GPU {}: {:.1} GB/s", i, gbps);
                 }
+                if let Some(fp32s) = &run.compute_tflops_fp32 {
+                    let total_fp32: f64 = fp32s.iter().sum();
+                    tracing::info!(
+                        "Compute FP32 TFLOPS: {} GPUs, {:.1} TFLOPS total",
+                        fp32s.len(),
+                        total_fp32
+                    );
+                    for (i, tf) in fp32s.iter().enumerate() {
+                        tracing::debug!("  GPU {}: {:.1} TF32", i, tf);
+                    }
+                }
+                if let Some(fp16s) = &run.compute_tflops_fp16 {
+                    let total_fp16: f64 = fp16s.iter().sum();
+                    tracing::info!(
+                        "Compute FP16 TFLOPS: {} GPUs, {:.1} TFLOPS total",
+                        fp16s.len(),
+                        total_fp16
+                    );
+                    for (i, tf) in fp16s.iter().enumerate() {
+                        tracing::debug!("  GPU {}: {:.1} TF16", i, tf);
+                    }
+                }
             }
-            *bw_arc.lock().await = result;
+            store_benchmark_metrics(
+                mem_arc.clone(),
+                compute_fp32_arc.clone(),
+                compute_fp16_arc.clone(),
+                result.as_ref(),
+            )
+            .await;
         });
     } else {
         tracing::debug!("client node — skipping memory bandwidth benchmark");
     }
 
-    // Join mesh if --join was given
-    if !cli.join.is_empty() {
+    // Join mesh if --join was given or auto-discovery queued fallback candidates.
+    if !cli.join.is_empty() || !auto_join_candidates.is_empty() {
         let mut joined = false;
-        for t in &cli.join {
+        let join_attempts: Vec<(String, Option<String>)> = if !cli.join.is_empty() {
+            cli.join
+                .iter()
+                .cloned()
+                .map(|token| (token, None))
+                .collect()
+        } else {
+            auto_join_candidates.clone()
+        };
+        let mut successful_join: Option<(String, Option<String>)> = None;
+
+        for (t, mesh_name) in &join_attempts {
             match node.join(t).await {
                 Ok(()) => {
                     eprintln!("Joined mesh");
                     joined = true;
+                    successful_join = Some((t.clone(), mesh_name.clone()));
                     break;
                 }
                 Err(e) => tracing::warn!("Failed to join via token: {e}"),
             }
         }
+
+        if cli.join.is_empty() {
+            cli.join.clear();
+            if let Some((token, mesh_name)) = successful_join {
+                cli.join.push(token);
+                if cli.mesh_name.is_none() {
+                    if let Some(name) = mesh_name {
+                        cli.mesh_name = Some(name);
+                    }
+                }
+            }
+        }
+
         if !joined {
             eprintln!("Failed to join any peer — running standalone");
         }
@@ -1256,12 +1317,7 @@ async fn run_auto(
             match run_passive(&cli, node.clone(), is_client, plugin_manager.clone()).await? {
                 Some(model_name) => {
                     // Promoted! Resolve the model path and continue to serving
-                    let model_path = models::find_model_path(&model_name);
-                    if model_path.exists() {
-                        model_path
-                    } else {
-                        model_path
-                    }
+                    models::find_model_path(&model_name)
                 }
                 None => return Ok(()), // clean shutdown
             }
@@ -1442,10 +1498,24 @@ async fn run_auto(
     let (primary_stop_tx, primary_stop_rx) = tokio::sync::watch::channel(false);
     let primary_task = tokio::spawn(async move {
         election::election_loop(
-            node2, tunnel_mgr2, api_port, rpc_port, bin_dir2, model2, model_name_for_election,
-            primary_mmproj,
-            draft2, draft_max, force_split, llama_flavor, primary_ctx_size, moe_runtime_options, primary_target_tx,
-            primary_stop_rx,
+            election::ElectionLoopParams {
+                node: node2,
+                tunnel_mgr: tunnel_mgr2,
+                ingress_http_port: api_port,
+                rpc_port,
+                bin_dir: bin_dir2,
+                model: model2,
+                model_name: model_name_for_election,
+                explicit_mmproj: primary_mmproj,
+                draft: draft2,
+                draft_max,
+                force_split,
+                binary_flavor: llama_flavor,
+                ctx_size_override: primary_ctx_size,
+                moe_runtime_options,
+                target_tx: primary_target_tx,
+                stop_rx: primary_stop_rx,
+            },
             move |is_host, llama_ready| {
                 let advertise_node = node_for_cb.clone();
                 let advertise_model = primary_model_name_for_advertise.clone();
@@ -1580,10 +1650,24 @@ async fn run_auto(
             let (extra_stop_tx, extra_stop_rx) = tokio::sync::watch::channel(false);
             let extra_task = tokio::spawn(async move {
                 election::election_loop(
-                    extra_node, extra_tunnel, api_port_extra, 0, extra_bin, extra_path, extra_model_name.clone(),
-                    extra_mmproj,
-                    None, 8, false, extra_llama_flavor, extra_ctx_size, extra_moe_runtime_options, extra_target_tx,
-                    extra_stop_rx,
+                    election::ElectionLoopParams {
+                        node: extra_node,
+                        tunnel_mgr: extra_tunnel,
+                        ingress_http_port: api_port_extra,
+                        rpc_port: 0,
+                        bin_dir: extra_bin,
+                        model: extra_path,
+                        model_name: extra_model_name.clone(),
+                        explicit_mmproj: extra_mmproj,
+                        draft: None,
+                        draft_max: 8,
+                        force_split: false,
+                        binary_flavor: extra_llama_flavor,
+                        ctx_size_override: extra_ctx_size,
+                        moe_runtime_options: extra_moe_runtime_options,
+                        target_tx: extra_target_tx,
+                        stop_rx: extra_stop_rx,
+                    },
                     move |is_host, llama_ready| {
                         let advertise_node = extra_node_for_advertise.clone();
                         let model_name = extra_model_name_for_advertise.clone();
@@ -2560,5 +2644,29 @@ mod tests {
             draft = None;
         }
         assert!(draft.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_benchmark_result_bandwidth_still_works() {
+        let mem_arc = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        let fp32_arc = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        let fp16_arc = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        let result = benchmark::BenchmarkResult {
+            mem_bandwidth_gbps: vec![10.5, 20.0],
+            compute_tflops_fp32: None,
+            compute_tflops_fp16: None,
+        };
+
+        store_benchmark_metrics(
+            mem_arc.clone(),
+            fp32_arc.clone(),
+            fp16_arc.clone(),
+            Some(&result),
+        )
+        .await;
+
+        assert_eq!(*mem_arc.lock().await, Some(vec![10.5, 20.0]));
+        assert!(fp32_arc.lock().await.is_none());
+        assert!(fp16_arc.lock().await.is_none());
     }
 }
