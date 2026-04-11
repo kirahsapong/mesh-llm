@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shlex
 from pathlib import Path
 
@@ -23,6 +24,7 @@ DEFAULT_RELEASE_REPO = "michaelneale/mesh-llm"
 DEFAULT_JOB_FLAVOR = "cpu-xl"
 DEFAULT_TIMEOUT = "1h"
 RELEASE_TARGET_CHOICES = ["auto", "cpu", "cuda", "rocm", "vulkan", "metal"]
+LABEL_SAFE_RE = re.compile(r"[^a-zA-Z0-9_=-]+")
 
 
 def parse_args() -> argparse.Namespace:
@@ -206,17 +208,21 @@ def build_script_args(args: argparse.Namespace) -> list[str]:
 
 
 def build_labels(args: argparse.Namespace) -> dict[str, str]:
+    def sanitize(value: str) -> str:
+        sanitized = LABEL_SAFE_RE.sub("-", value).strip("-")
+        return sanitized or "unknown"
+
     labels = {
         "app": "mesh-llm",
         "workflow": "moe-analyze",
         "analyzer_id": args.analyzer_id,
-        "source_repo": args.source_repo,
-        "dataset_repo": args.dataset_repo,
+        "source_repo": sanitize(args.source_repo),
+        "dataset_repo": sanitize(args.dataset_repo),
     }
     if args.distribution_id:
-        labels["distribution_id"] = args.distribution_id
+        labels["distribution_id"] = sanitize(args.distribution_id)
     if args.filename:
-        labels["filename"] = args.filename
+        labels["filename"] = sanitize(args.filename)
     return labels
 
 
@@ -224,7 +230,6 @@ def main() -> int:
     args = parse_args()
 
     script_path = Path(__file__).with_name("analyze_and_publish.py")
-    script_text = script_path.read_text()
     script_args = build_script_args(args)
     labels = build_labels(args)
     job_request = {
@@ -248,7 +253,7 @@ def main() -> int:
     token = require_hf_token()
     api = HfApi(token=token)
     job = api.run_uv_job(
-        script=script_text,
+        script=str(script_path),
         script_args=script_args,
         python=args.python_version,
         image=args.image,
