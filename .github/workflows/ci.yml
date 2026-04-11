@@ -466,6 +466,7 @@ jobs:
           MESH_LLM_BUILD_PROFILE: dev
           MESH_LLM_CUDA_FA_ALL_QUANTS: off
           MESH_LLM_LLAMA_PIN_SHA: ${{ steps.llama_sha.outputs.sha }}
+          MESH_LLM_LLAMA_TARGETS: "rpc-server llama-server llama-moe-analyze llama-moe-split"
         run: |
           just --shell bash --shell-arg -lc release-build-cuda 89
 
