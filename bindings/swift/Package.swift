@@ -2,7 +2,9 @@
 import PackageDescription
 import Foundation
 
-let ffiXCFrameworkPath = "Generated/mesh_ffiFFI.xcframework"
+let packageRoot = URL(fileURLWithPath: #filePath).deletingLastPathComponent().path
+let ffiXCFrameworkRelativePath = "Generated/mesh_ffiFFI.xcframework"
+let ffiXCFrameworkPath = "\(packageRoot)/\(ffiXCFrameworkRelativePath)"
 let hasFFIXCFramework = FileManager.default.fileExists(atPath: ffiXCFrameworkPath)
 
 var meshLLMDependencies: [Target.Dependency] = []
@@ -13,7 +15,7 @@ if hasFFIXCFramework {
     packageTargets.append(
         .binaryTarget(
             name: "mesh_ffiFFI",
-            path: ffiXCFrameworkPath
+            path: ffiXCFrameworkRelativePath
         )
     )
 }
@@ -35,7 +37,10 @@ let package = Package(
             name: "MeshLLM",
             dependencies: meshLLMDependencies,
             path: "Sources/MeshLLM",
-            exclude: hasFFIXCFramework ? [] : ["Generated"]
+            exclude: hasFFIXCFramework ? [] : ["Generated"],
+            linkerSettings: [
+                .linkedFramework("SystemConfiguration"),
+            ]
         ),
         .testTarget(
             name: "MeshLLMTests",

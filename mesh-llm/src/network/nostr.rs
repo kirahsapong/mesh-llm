@@ -1,4 +1,4 @@
-pub use mesh_client_core::network::nostr::{
+pub use mesh_client::network::nostr::{
     auto_model_pack, default_models_for_vram, discover, score_mesh, smart_auto, AutoDecision,
     DiscoveryClient, MeshFilter, MeshListing, Publisher, DEFAULT_RELAYS,
 };

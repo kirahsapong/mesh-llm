@@ -1,4 +1,4 @@
-pub use mesh_client_core::models::catalog::*;
+pub use mesh_client::models::catalog::*;
 
 use anyhow::{Context, Result};
 use hf_hub::api::Progress as HfProgress;

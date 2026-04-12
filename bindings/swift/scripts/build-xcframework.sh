@@ -7,12 +7,13 @@ FFI_DIR="$SWIFT_DIR/Generated/FFI"
 TARGET_DIR="$REPO_ROOT/target"
 XCFRAMEWORK_DIR="$SWIFT_DIR/Generated"
 FRAMEWORK_NAME="mesh_ffiFFI"
+GENERATED_SWIFT="$SWIFT_DIR/Sources/MeshLLM/Generated/mesh_ffi.swift"
 
 echo "Building $FRAMEWORK_NAME XCFramework..."
 echo "Repo root: $REPO_ROOT"
 
-if ! cargo metadata --no-deps --format-version 1 2>/dev/null | grep -q '"name":"mesh-ffi"'; then
-  echo "ERROR: mesh-ffi crate not found. Ensure bindings/Cargo.toml is configured."
+if ! cargo metadata --no-deps --format-version 1 2>/dev/null | grep -q '"name":"mesh-api-ffi"'; then
+  echo "ERROR: mesh-api-ffi crate not found. Ensure bindings/Cargo.toml is configured."
   exit 1
 fi
 
@@ -31,19 +32,55 @@ echo "Using rustc: $RUSTUP_RUSTC"
 
 echo "Building for aarch64-apple-ios..."
 RUSTC="$RUSTUP_RUSTC" \
-  cargo build --release -p mesh-ffi --target aarch64-apple-ios --no-default-features
+  cargo build --release -p mesh-api-ffi --target aarch64-apple-ios --no-default-features
 
 echo "Building for aarch64-apple-ios-sim..."
 RUSTC="$RUSTUP_RUSTC" \
-  cargo build --release -p mesh-ffi --target aarch64-apple-ios-sim --no-default-features
+  cargo build --release -p mesh-api-ffi --target aarch64-apple-ios-sim --no-default-features
 
 echo "Building for x86_64-apple-ios..."
 RUSTC="$RUSTUP_RUSTC" \
-  cargo build --release -p mesh-ffi --target x86_64-apple-ios --no-default-features
+  cargo build --release -p mesh-api-ffi --target x86_64-apple-ios --no-default-features
 
 echo "Building for aarch64-apple-darwin (macOS)..."
 RUSTC="$RUSTUP_RUSTC" \
-  cargo build --release -p mesh-ffi --target aarch64-apple-darwin --no-default-features
+  cargo build --release -p mesh-api-ffi --target aarch64-apple-darwin --no-default-features
+
+echo "Syncing UniFFI API checksums into generated Swift bindings..."
+python3 - "$TARGET_DIR/aarch64-apple-darwin/release/libmesh_ffi.a" "$GENERATED_SWIFT" <<'PY'
+import pathlib
+import re
+import subprocess
+import sys
+
+lib_path = pathlib.Path(sys.argv[1])
+swift_path = pathlib.Path(sys.argv[2])
+
+disassembly = subprocess.run(
+    ["otool", "-tvV", str(lib_path)],
+    check=True,
+    capture_output=True,
+    text=True,
+).stdout
+
+pattern = re.compile(
+    r"_uniffi_mesh_ffi_(checksum_[A-Za-z0-9_]+):\n[0-9a-f]+\s+mov\s+w0, #0x([0-9a-f]+)\n[0-9a-f]+\s+ret",
+    re.MULTILINE,
+)
+checksums = {name: int(value, 16) for name, value in pattern.findall(disassembly)}
+
+swift = swift_path.read_text()
+
+for name, value in checksums.items():
+    call = f"{name}()"
+    swift = re.sub(
+        rf"({re.escape(call)} != )\d+",
+        rf"\g<1>{value}",
+        swift,
+    )
+
+swift_path.write_text(swift)
+PY
 
 echo "Creating fat library for iOS simulator..."
 mkdir -p "$TARGET_DIR/ios-sim-fat"

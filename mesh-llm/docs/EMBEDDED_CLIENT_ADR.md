@@ -30,9 +30,9 @@ The passive client role already exists in the mesh-llm codebase as `NodeRole::Cl
 
 Wave 1 splits the workspace into four new crates immediately:
 
-- `mesh-client-core` — pure Rust client logic, no FFI, no host code
+- `mesh-client` — pure Rust client logic, no FFI, no host code
 - `mesh-host-core` — host-side orchestration, macOS-only, behind a feature flag
-- `mesh-ffi` — uniffi-rs bridge, depends on `mesh-client-core` and optionally `mesh-host-core`
+- `mesh-api-ffi` — uniffi-rs bridge, depends on `mesh-client` and optionally `mesh-host-core`
 - `mesh-llm-test-harness` — shared test infrastructure, `FixtureMesh` lives here
 
 ### Phases
@@ -41,7 +41,7 @@ The work is organized into seven phases:
 
 - **Phase 1**: Workspace skeleton, ADR, and toolchain POC
 - **Phase 2**: Extract protocol types and wire format from `mesh-llm`
-- **Phase 3**: Extract client networking (QUIC, gossip, routing) into `mesh-client-core`
+- **Phase 3**: Extract client networking (QUIC, gossip, routing) into `mesh-client`
 - **Phase 4**: Implement `MeshClient` and `MeshHost` against the extracted core
 - **Phase 5**: uniffi-rs bindings, Swift package, Kotlin artifact
 - **Phase 6**: Integration tests, platform CI, and wave-end gates
@@ -55,20 +55,20 @@ TDD across all surfaces. Every extraction follows the recipe: write a failing te
 
 ## Cargo Feature Topology
 
-`mesh-ffi` has a `host` feature that is **off by default**.
+`mesh-api-ffi` has a `host` feature that is **off by default**.
 
 | Build target | Cargo flags |
 |---|---|
 | iOS / Android | `--no-default-features` |
 | macOS host | `--features host` |
 
-`mesh-client-core` has a strict dependency allowlist. Only these 18 crates are permitted:
+`mesh-client` has a strict dependency allowlist. Only these 18 crates are permitted:
 
 `iroh`, `tokio`, `prost`, `bytes`, `rustls`, `quinn`, `serde`, `serde_json`, `thiserror`, `anyhow`, `tracing`, `sha2`, `ed25519-dalek`, `hex`, `uuid`, `url`, `http`, `base64`
 
-No crate outside this list may appear in `mesh-client-core`'s dependency tree. This keeps the mobile binary size predictable and prevents accidental inclusion of desktop-only dependencies.
+No crate outside this list may appear in `mesh-client`'s dependency tree. This keeps the mobile binary size predictable and prevents accidental inclusion of desktop-only dependencies.
 
-`mesh-ffi` must not directly depend on `iroh`, `tokio`, or `prost`. It reaches those through `mesh-client-core` only.
+`mesh-api-ffi` must not directly depend on `iroh`, `tokio`, or `prost`. It reaches those through `mesh-client` only.
 
 ---
 
@@ -191,7 +191,7 @@ Any change to `src/protocol/` requires a backward-compatibility test before merg
 
 All extraction work follows TDD:
 
-1. **RED**: Write a failing test in the destination crate (`mesh-client-core`, `mesh-ffi`, etc.)
+1. **RED**: Write a failing test in the destination crate (`mesh-client`, `mesh-api-ffi`, etc.)
 2. **GREEN**: Copy the minimal implementation to make it pass
 3. **REFACTOR**: Clean up, remove duplication, add the transitional re-export shim in the source crate
 

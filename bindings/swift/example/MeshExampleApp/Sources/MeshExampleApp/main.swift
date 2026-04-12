@@ -1,40 +1,43 @@
 import Foundation
 import MeshLLM
 
-let args = Array(CommandLine.arguments.dropFirst())
-let isMock = args.contains("--mock")
-let inviteTokenArg = args.first { !$0.hasPrefix("--") }
-
-if isMock {
-    print("[connected]")
-    print("[models] N=3")
-    let chatStartMs = Int(Date().timeIntervalSince1970 * 1000)
-    Thread.sleep(forTimeInterval: 0.005)
-    let firstTokenMs = Int(Date().timeIntervalSince1970 * 1000) - chatStartMs
-    print("[chat] first_token_ms=\(firstTokenMs)")
-    print("Hello world")
-    print("[chat] done")
-    print("[disconnect] ok")
-    exit(0)
+enum ExampleError: Error {
+    case noModels
+    case noTokenDelta
+    case didNotComplete
+    case chatFailed(String)
 }
 
-let token = inviteTokenArg ?? "example-test-token"
-let client = MeshClient(inviteToken: InviteToken(token))
+let args = Array(CommandLine.arguments.dropFirst())
+let inviteTokenArg = args.first { !$0.hasPrefix("--") }
+guard let token = inviteTokenArg else {
+    fputs("Usage: MeshExampleApp <invite_token>\n", stderr)
+    exit(1)
+}
 
-print("[connected]")
+let client = MeshClient(inviteToken: InviteToken(token))
 
 Task {
     do {
-        let models = try await client.listModels()
+        try await client.join()
+        print("[connected]")
+
+        let models = try await waitForModels(client)
         print("[models] N=\(models.count)")
-        
+        guard !models.isEmpty else {
+            throw ExampleError.noModels
+        }
+
+        let selectedModel = ProcessInfo.processInfo.environment["MESH_SDK_MODEL_ID"] ?? models[0].id
         let request = ChatRequest(
-            model: models.first?.id ?? "default",
+            model: selectedModel,
             messages: [ChatMessage(role: "user", content: "hello")]
         )
-        
+
         let startTime = Date()
         var firstToken = true
+        var sawToken = false
+        var completed = false
         for try await event in client.chatStream(request) {
             switch event {
             case .tokenDelta(_, let delta):
@@ -43,22 +46,44 @@ Task {
                     print("[chat] first_token_ms=\(ms)")
                     firstToken = false
                 }
+                sawToken = true
                 print(delta, terminator: "")
             case .completed:
+                completed = true
                 print("\n[chat] done")
             case .failed(_, let error):
-                print("[chat] error: \(error)")
+                throw ExampleError.chatFailed(error)
             default:
                 break
             }
         }
-        
+
+        guard sawToken else {
+            throw ExampleError.noTokenDelta
+        }
+        guard completed else {
+            throw ExampleError.didNotComplete
+        }
+
         await client.disconnect()
         print("[disconnect] ok")
     } catch {
-        print("[error] \(error)")
+        FileHandle.standardError.write(Data("[error] \(error)\n".utf8))
+        exit(1)
     }
     exit(0)
 }
 
 RunLoop.main.run()
+
+func waitForModels(_ client: MeshClient) async throws -> [Model] {
+    let deadline = Date().addingTimeInterval(30)
+    while Date() < deadline {
+        let models = try await client.listModels()
+        if !models.isEmpty {
+            return models
+        }
+        try await Task.sleep(for: .milliseconds(250))
+    }
+    return []
+}

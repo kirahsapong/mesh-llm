@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use tokio::sync::watch;
 
-pub use mesh_client_core::inference::election::{
+pub use mesh_client::inference::election::{
     total_model_bytes, InferenceTarget, LocalProcessInfo, ModelTargets, MoeState,
 };
 

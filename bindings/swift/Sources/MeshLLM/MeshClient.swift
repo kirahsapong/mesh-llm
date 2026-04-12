@@ -183,7 +183,7 @@ public final class MeshClient: @unchecked Sendable {
         Model(id: dto.id, name: dto.name)
     }
 
-    fileprivate static func mapEvent(_ dto: EventDto) -> MeshEvent {
+    static func mapEvent(_ dto: EventDto) -> MeshEvent {
         switch dto {
         case .connecting:
             return .connecting
@@ -279,6 +279,14 @@ private func runBlocking<T>(_ work: @escaping () throws -> T) async throws -> T 
             } catch {
                 continuation.resume(throwing: error)
             }
+        }
+    }
+}
+
+private func runBlocking<T>(_ work: @escaping () -> T) async -> T {
+    await withCheckedContinuation { continuation in
+        DispatchQueue.global(qos: .userInitiated).async {
+            continuation.resume(returning: work())
         }
     }
 }

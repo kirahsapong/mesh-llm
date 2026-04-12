@@ -1,4 +1,4 @@
-pub use mesh_client_core::models::capabilities::*;
+pub use mesh_client::models::capabilities::*;
 
 use super::build_hf_tokio_api;
 use hf_hub::{Repo, RepoType};

@@ -2810,7 +2810,27 @@ dependencies = [
 ]
 
 [[package]]
-name = "mesh-client-core"
+name = "mesh-api"
+version = "0.1.0"
+dependencies = [
+ "mesh-client",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "mesh-api-ffi"
+version = "0.1.0"
+dependencies = [
+ "mesh-api",
+ "mesh-host-core",
+ "pollster",
+ "thiserror 2.0.18",
+ "uniffi",
+]
+
+[[package]]
+name = "mesh-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -2834,17 +2854,6 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
-]
-
-[[package]]
-name = "mesh-ffi"
-version = "0.1.0"
-dependencies = [
- "mesh-client-core",
- "mesh-host-core",
- "pollster",
- "thiserror 2.0.18",
- "uniffi",
 ]
 
 [[package]]
@@ -2873,7 +2882,7 @@ dependencies = [
  "iroh",
  "keyring",
  "libc",
- "mesh-client-core",
+ "mesh-client",
  "mesh-llm-plugin",
  "nostr-sdk",
  "prost",

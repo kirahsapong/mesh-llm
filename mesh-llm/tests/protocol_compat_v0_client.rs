@@ -2,9 +2,9 @@
 //!
 //! Proves the dual-support scheme: ALPN negotiation routes v0 and v1 peers to
 //! the correct codec, and the wire-format ALPN byte sequences are stable.
-//! All assertions run against the public API of `mesh-client-core::protocol`.
+//! All assertions run against the public API of `mesh-client::protocol`.
 
-use mesh_client_core::protocol::{protocol_from_alpn, ControlProtocol, ALPN_V0, ALPN_V1};
+use mesh_client::protocol::{protocol_from_alpn, ControlProtocol, ALPN_V0, ALPN_V1};
 
 #[test]
 fn alpn_v0_byte_sequence_is_stable() {

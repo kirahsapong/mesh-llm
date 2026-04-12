@@ -39,7 +39,7 @@ fn main() -> Result<()> {
         generate_swift_sources: true,
         generate_headers: true,
         generate_modulemap: true,
-        source: Utf8PathBuf::from("$REPO_ROOT/mesh-ffi/src/mesh_ffi.udl"),
+        source: Utf8PathBuf::from("$REPO_ROOT/mesh-api-ffi/src/mesh_ffi.udl"),
         out_dir,
         xcframework: false,
         module_name: None,
@@ -56,7 +56,7 @@ cargo run --manifest-path "$RUNNER_DIR/Cargo.toml"
 cp "$OUT_DIR/mesh_ffi.swift" "$SWIFT_SOURCE_DIR/mesh_ffi.swift"
 cp "$OUT_DIR/mesh_ffiFFI.h" "$FFI_DIR/mesh_ffiFFI.h"
 cat > "$FFI_DIR/mesh_ffiFFI.modulemap" <<'EOF'
-module mesh_ffiFFI {
+framework module mesh_ffiFFI {
   header "mesh_ffiFFI.h"
   export *
   use "Darwin"

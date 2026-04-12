@@ -19,7 +19,7 @@ dependencies {
 
 // Task to build native libraries for all Android ABIs
 val buildNativeLibs by tasks.registering(Exec::class) {
-    description = "Build mesh-ffi shared libraries for all Android ABIs"
+    description = "Build mesh-api-ffi shared libraries for all Android ABIs"
     group = "build"
 
     val repoRoot = rootProject.projectDir.parentFile.parentFile
@@ -41,15 +41,15 @@ val buildNativeLibs by tasks.registering(Exec::class) {
 
         # Build for arm64-v8a (RUSTC override needed: Homebrew rustc shadows rustup)
         ANDROID_NDK_HOME=${ndkHome} \
-        cargo ndk -t arm64-v8a build --release -p mesh-ffi --no-default-features
+        cargo ndk -t arm64-v8a build --release -p mesh-api-ffi --no-default-features
 
         # Build for armeabi-v7a
         ANDROID_NDK_HOME=${ndkHome} \
-        cargo ndk -t armeabi-v7a build --release -p mesh-ffi --no-default-features
+        cargo ndk -t armeabi-v7a build --release -p mesh-api-ffi --no-default-features
 
         # Build for x86_64
         ANDROID_NDK_HOME=${ndkHome} \
-        cargo ndk -t x86_64 build --release -p mesh-ffi --no-default-features
+        cargo ndk -t x86_64 build --release -p mesh-api-ffi --no-default-features
 
         # Copy to jniLibs
         cp target/aarch64-linux-android/release/libmesh_ffi.so bindings/kotlin/src/main/jniLibs/arm64-v8a/

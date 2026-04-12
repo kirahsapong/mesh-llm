@@ -4,7 +4,7 @@ use hf_hub::Repo;
 use serde_json::Value;
 use std::path::Path;
 
-pub use mesh_client_core::models::topology::{ModelMoeInfo, ModelTopology};
+pub use mesh_client::models::topology::{ModelMoeInfo, ModelTopology};
 
 #[allow(dead_code)]
 pub fn infer_catalog_topology(model: &catalog::CatalogModel) -> Option<ModelTopology> {

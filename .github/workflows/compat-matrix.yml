@@ -4,9 +4,9 @@ on:
   pull_request:
     paths:
       - 'mesh-llm/src/protocol/**'
-      - 'mesh-client-core/src/protocol/**'
+      - 'mesh-client/src/protocol/**'
       - 'mesh-llm/tests/protocol_*.rs'
-      - 'mesh-client-core/tests/protocol_*.rs'
+      - 'mesh-client/tests/protocol_*.rs'
       - 'Cargo.toml'
       - 'Cargo.lock'
   push:

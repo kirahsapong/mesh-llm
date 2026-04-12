@@ -1,0 +1,14 @@
+[package]
+name = "mesh-api"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+host-io = ["mesh-client/host-io"]
+
+[dependencies]
+mesh-client = { path = "../mesh-client" }
+thiserror = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }

@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 mesh-llm-plugin = { path = "plugin" }
-mesh-client-core = { path = "../mesh-client-core", features = ["host-io"] }
+mesh-client = { path = "../mesh-client", features = ["host-io"] }
 iroh = "0.97"
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
@@ -50,7 +50,7 @@ unicode-width = "0.2"
 [dev-dependencies]
 axum = "0.8"
 serial_test = "3"
-mesh-client-core = { path = "../mesh-client-core" }
+mesh-client = { path = "../mesh-client" }
 
 [build-dependencies]
 prost-build = "0.14"

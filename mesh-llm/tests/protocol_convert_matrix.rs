@@ -1,14 +1,14 @@
 //! Protocol Conversion Matrix Tests
 //!
-//! Covers the v0↔v1 conversion paths exposed by `mesh-client-core::protocol`:
+//! Covers the v0↔v1 conversion paths exposed by `mesh-client::protocol`:
 //! `canonical_config_hash`, frame encode/decode round-trips, frame validation,
 //! and the v0 legacy tunnel-map decode path.
 
-use mesh_client_core::proto::node::{
+use mesh_client::proto::node::{
     GossipFrame, NodeConfigSnapshot, NodeGpuConfig, NodeModelEntry, PeerAnnouncement,
 };
-use mesh_client_core::protocol::convert::canonical_config_hash;
-use mesh_client_core::protocol::{
+use mesh_client::protocol::convert::canonical_config_hash;
+use mesh_client::protocol::{
     decode_control_frame, decode_legacy_tunnel_map_frame, encode_control_frame, ControlFrameError,
     MAX_CONTROL_FRAME_BYTES, NODE_PROTOCOL_GENERATION, STREAM_GOSSIP, STREAM_TUNNEL_MAP,
 };
@@ -17,7 +17,7 @@ fn minimal_config() -> NodeConfigSnapshot {
     NodeConfigSnapshot {
         version: 1,
         gpu: Some(NodeGpuConfig {
-            assignment: mesh_client_core::proto::node::GpuAssignment::Auto as i32,
+            assignment: mesh_client::proto::node::GpuAssignment::Auto as i32,
         }),
         models: vec![NodeModelEntry {
             model: "Qwen3-8B".to_string(),
@@ -34,7 +34,7 @@ fn valid_gossip_frame() -> GossipFrame {
         sender_id: vec![0xAB; 32],
         peers: vec![PeerAnnouncement {
             endpoint_id: vec![0u8; 32],
-            role: mesh_client_core::proto::node::NodeRole::Worker as i32,
+            role: mesh_client::proto::node::NodeRole::Worker as i32,
             ..Default::default()
         }],
     }

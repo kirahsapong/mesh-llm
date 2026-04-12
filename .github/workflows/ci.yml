@@ -184,9 +184,177 @@ jobs:
       cache_key_prefix: ''
       workflow_cache_file: .github/workflows/ci.yml
 
+  native_sdk_smoke:
+    needs: [changes, linux, inference_smoke_tests]
+    if: ${{ needs.inference_smoke_tests.result == 'success' && (github.event_name == 'workflow_dispatch' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.ui == 'true') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+          prefix-key: ${{ env.CACHE_NAMESPACE }}-rust-${{ hashFiles('.github/cache-version.txt') }}
+
+      - name: Download Linux inference binaries
+        uses: actions/download-artifact@v7
+        with:
+          name: ci-linux-inference-binaries
+          path: ci-artifacts/linux
+
+      - name: Stage binaries for native SDK smoke
+        run: |
+          mkdir -p target/debug llama.cpp/build/bin
+          cp ci-artifacts/linux/target/debug/mesh-llm target/debug/mesh-llm
+          cp ci-artifacts/linux/llama.cpp/build/bin/rpc-server llama.cpp/build/bin/rpc-server
+          cp ci-artifacts/linux/llama.cpp/build/bin/llama-server llama.cpp/build/bin/llama-server
+          chmod +x target/debug/mesh-llm llama.cpp/build/bin/rpc-server llama.cpp/build/bin/llama-server
+
+      - name: Cache integration model
+        id: cache-model-native-sdk
+        uses: actions/cache@v5
+        with:
+          path: ~/.models/${{ env.MODEL_FILE }}
+          key: ${{ env.CACHE_NAMESPACE }}-${{ runner.os }}-model-${{ env.MODEL_FILE }}-${{ hashFiles('.github/cache-version.txt', '.github/workflows/ci.yml') }}
+
+      - name: Download integration model
+        if: steps.cache-model-native-sdk.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/.models
+          curl -fSL "$MODEL_URL" -o ~/.models/$MODEL_FILE
+          ls -lh ~/.models/$MODEL_FILE
+
+      - name: Native SDK smoke test
+        run: |
+          scripts/ci-native-sdk-smoke.sh \
+            target/debug/mesh-llm \
+            llama.cpp/build/bin \
+            ~/.models/$MODEL_FILE
+
+  kotlin_sdk_smoke:
+    needs: [changes, linux, inference_smoke_tests]
+    if: ${{ needs.inference_smoke_tests.result == 'success' && (github.event_name == 'workflow_dispatch' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.ui == 'true') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+          prefix-key: ${{ env.CACHE_NAMESPACE }}-rust-${{ hashFiles('.github/cache-version.txt') }}
+
+      - name: Download Linux inference binaries
+        uses: actions/download-artifact@v7
+        with:
+          name: ci-linux-inference-binaries
+          path: ci-artifacts/linux
+
+      - name: Stage binaries for Kotlin SDK smoke
+        run: |
+          mkdir -p target/debug llama.cpp/build/bin
+          cp ci-artifacts/linux/target/debug/mesh-llm target/debug/mesh-llm
+          cp ci-artifacts/linux/llama.cpp/build/bin/rpc-server llama.cpp/build/bin/rpc-server
+          cp ci-artifacts/linux/llama.cpp/build/bin/llama-server llama.cpp/build/bin/llama-server
+          chmod +x target/debug/mesh-llm llama.cpp/build/bin/rpc-server llama.cpp/build/bin/llama-server
+
+      - name: Cache integration model
+        id: cache-model-kotlin-sdk
+        uses: actions/cache@v5
+        with:
+          path: ~/.models/${{ env.MODEL_FILE }}
+          key: ${{ env.CACHE_NAMESPACE }}-${{ runner.os }}-model-${{ env.MODEL_FILE }}-${{ hashFiles('.github/cache-version.txt', '.github/workflows/ci.yml') }}
+
+      - name: Download integration model
+        if: steps.cache-model-kotlin-sdk.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/.models
+          curl -fSL "$MODEL_URL" -o ~/.models/$MODEL_FILE
+          ls -lh ~/.models/$MODEL_FILE
+
+      - name: Kotlin SDK smoke test
+        run: |
+          scripts/ci-kotlin-sdk-smoke.sh \
+            target/debug/mesh-llm \
+            llama.cpp/build/bin \
+            ~/.models/$MODEL_FILE
+
+  swift_sdk_smoke:
+    needs: [changes, inference_smoke_tests]
+    # Disabled until Swift SDK smoke execution has a runner. Apple artifact
+    # build/package work should move to Linux cross-build instead.
+    if: ${{ false }}
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: mozilla-actions/sccache-action@v0.0.9
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+          prefix-key: ${{ env.CACHE_NAMESPACE }}-rust-${{ hashFiles('.github/cache-version.txt') }}
+
+      - name: Build mesh-llm binary (debug)
+        run: cargo build -p mesh-llm --bin mesh-llm
+
+      - name: Clone llama.cpp fork
+        run: git clone -b upstream-latest --depth 1 https://github.com/michaelneale/llama.cpp.git llama.cpp
+
+      - name: Build llama.cpp (CPU + RPC)
+        run: |
+          CACHE_FLAGS=()
+          if command -v sccache >/dev/null 2>&1; then
+            CACHE_FLAGS+=(
+              -DCMAKE_C_COMPILER_LAUNCHER=sccache
+              -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+            )
+          fi
+          cmake -B llama.cpp/build -S llama.cpp \
+            -DGGML_METAL=OFF \
+            -DGGML_NATIVE=OFF \
+            -DGGML_RPC=ON \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DLLAMA_OPENSSL=OFF \
+            "${CACHE_FLAGS[@]}"
+          cmake --build llama.cpp/build --config Release -j$(sysctl -n hw.ncpu) --target rpc-server llama-server
+
+      - name: Cache integration model
+        id: cache-model-swift-sdk
+        uses: actions/cache@v5
+        with:
+          path: ~/.models/${{ env.MODEL_FILE }}
+          key: ${{ env.CACHE_NAMESPACE }}-${{ runner.os }}-model-${{ env.MODEL_FILE }}-${{ hashFiles('.github/cache-version.txt', '.github/workflows/ci.yml') }}
+
+      - name: Download integration model
+        if: steps.cache-model-swift-sdk.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/.models
+          curl -fSL "$MODEL_URL" -o ~/.models/$MODEL_FILE
+          ls -lh ~/.models/$MODEL_FILE
+
+      - name: Swift SDK smoke test
+        run: |
+          scripts/ci-swift-sdk-smoke.sh \
+            target/debug/mesh-llm \
+            llama.cpp/build/bin \
+            ~/.models/$MODEL_FILE
+
   macos:
     needs: changes
-    if: ${{ github.event_name == 'workflow_dispatch' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.ui == 'true' }}
+    # Disabled until macOS CI runners are available. Apple build/package work
+    # should move to Linux cross-build instead.
+    if: ${{ false }}
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v5

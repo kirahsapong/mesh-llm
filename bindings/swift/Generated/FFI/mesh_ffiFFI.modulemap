@@ -1,4 +1,4 @@
-module mesh_ffiFFI {
+framework module mesh_ffiFFI {
   header "mesh_ffiFFI.h"
   export *
   use "Darwin"

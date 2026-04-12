@@ -7,7 +7,7 @@
 //! No cross-node traffic during inference — each node runs independently.
 
 use clap::ValueEnum;
-pub use mesh_client_core::inference::moe::{
+pub use mesh_client::inference::moe::{
     compute_assignments_with_overlap, compute_snake_draft_assignments, expert_list_arg,
     load_cached_ranking, NodeAssignment,
 };

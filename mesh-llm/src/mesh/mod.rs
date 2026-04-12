@@ -4,7 +4,7 @@
 //! one QUIC connection per peer. Bi-streams are multiplexed by first byte:
 //! 0x01 = gossip, 0x02 = tunnel (RPC), 0x03 = tunnel map, 0x04 = tunnel (HTTP).
 
-pub use mesh_client_core::mesh::{
+pub use mesh_client::mesh::{
     infer_available_model_descriptors, infer_local_served_model_descriptor,
     infer_served_model_descriptors, merge_demand, ModelDemand, ModelRuntimeDescriptor,
     ModelSourceKind, ServedModelDescriptor, ServedModelIdentity, DEMAND_TTL_SECS, MAX_SPLIT_RTT_MS,
