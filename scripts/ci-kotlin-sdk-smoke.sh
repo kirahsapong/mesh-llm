@@ -29,6 +29,6 @@ scripts/ci-sdk-fixture.sh "$1" "$2" "$3" -- \
             ln -sf libmesh_ffi.so '"$REPO_ROOT"'/target/debug/libuniffi_mesh_ffi.so
         fi
         export JAVA_TOOL_OPTIONS="-Djna.library.path='"$REPO_ROOT"'/target/debug"
-        cd '"$REPO_ROOT"'/bindings/kotlin/example/example-jvm
+        cd '"$REPO_ROOT"'/sdk/kotlin/example/example-jvm
         ./gradlew --no-daemon run --args="$MESH_SDK_INVITE_TOKEN"
     '

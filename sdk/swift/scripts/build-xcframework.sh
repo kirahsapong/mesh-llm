@@ -2,7 +2,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-SWIFT_DIR="$REPO_ROOT/bindings/swift"
+SWIFT_DIR="$REPO_ROOT/sdk/swift"
 FFI_DIR="$SWIFT_DIR/Generated/FFI"
 TARGET_DIR="$REPO_ROOT/target"
 XCFRAMEWORK_DIR="$SWIFT_DIR/Generated"
@@ -13,7 +13,7 @@ echo "Building $FRAMEWORK_NAME XCFramework..."
 echo "Repo root: $REPO_ROOT"
 
 if ! cargo metadata --no-deps --format-version 1 2>/dev/null | grep -q '"name":"mesh-api-ffi"'; then
-  echo "ERROR: mesh-api-ffi crate not found. Ensure bindings/Cargo.toml is configured."
+  echo "ERROR: mesh-api-ffi crate not found. Ensure the workspace is configured."
   exit 1
 fi
 

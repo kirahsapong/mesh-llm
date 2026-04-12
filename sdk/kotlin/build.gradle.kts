@@ -52,9 +52,9 @@ val buildNativeLibs by tasks.registering(Exec::class) {
         cargo ndk -t x86_64 build --release -p mesh-api-ffi --no-default-features
 
         # Copy to jniLibs
-        cp target/aarch64-linux-android/release/libmesh_ffi.so bindings/kotlin/src/main/jniLibs/arm64-v8a/
-        cp target/armv7-linux-androideabi/release/libmesh_ffi.so bindings/kotlin/src/main/jniLibs/armeabi-v7a/
-        cp target/x86_64-linux-android/release/libmesh_ffi.so bindings/kotlin/src/main/jniLibs/x86_64/
+        cp target/aarch64-linux-android/release/libmesh_ffi.so sdk/kotlin/src/main/jniLibs/arm64-v8a/
+        cp target/armv7-linux-androideabi/release/libmesh_ffi.so sdk/kotlin/src/main/jniLibs/armeabi-v7a/
+        cp target/x86_64-linux-android/release/libmesh_ffi.so sdk/kotlin/src/main/jniLibs/x86_64/
         """.trimIndent()
     )
 

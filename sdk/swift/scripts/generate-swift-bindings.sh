@@ -5,8 +5,8 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 TMP_DIR="$(mktemp -d)"
 OUT_DIR="$TMP_DIR/out"
 RUNNER_DIR="$TMP_DIR/runner"
-SWIFT_SOURCE_DIR="$REPO_ROOT/bindings/swift/Sources/MeshLLM/Generated"
-FFI_DIR="$REPO_ROOT/bindings/swift/Generated/FFI"
+SWIFT_SOURCE_DIR="$REPO_ROOT/sdk/swift/Sources/MeshLLM/Generated"
+FFI_DIR="$REPO_ROOT/sdk/swift/Generated/FFI"
 
 cleanup() {
   rm -rf "$TMP_DIR"

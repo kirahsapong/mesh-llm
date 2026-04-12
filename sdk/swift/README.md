@@ -23,10 +23,10 @@ targets: [
 For development from a local checkout, build the native artifact first:
 
 ```bash
-./bindings/swift/scripts/build-xcframework.sh
+./sdk/swift/scripts/build-xcframework.sh
 ```
 
-That generates `bindings/swift/Generated/mesh_ffiFFI.xcframework`, which the Swift package picks up automatically for the real UniFFI-backed implementation.
+That generates `sdk/swift/Generated/mesh_ffiFFI.xcframework`, which the Swift package picks up automatically for the real UniFFI-backed implementation.
 
 ## Usage
 

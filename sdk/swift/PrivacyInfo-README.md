@@ -34,7 +34,7 @@ MeshLLM.xcframework/
         └── PrivacyInfo.xcprivacy  ← MUST be here
 ```
 
-The Wave 5D build script (`bindings/swift/build-xcframework.sh`) is responsible for copying this template into each `.framework` bundle during XCFramework construction.
+The Wave 5D build script (`sdk/swift/build-xcframework.sh`) is responsible for copying this template into each `.framework` bundle during XCFramework construction.
 
 ### Verification
 

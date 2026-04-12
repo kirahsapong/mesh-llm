@@ -8,7 +8,7 @@
 # Defaults to arm64-v8a if no path is given.
 set -euo pipefail
 
-SO_PATH="${1:-bindings/kotlin/src/main/jniLibs/arm64-v8a/libmesh_ffi.so}"
+SO_PATH="${1:-sdk/kotlin/src/main/jniLibs/arm64-v8a/libmesh_ffi.so}"
 
 if [ ! -f "$SO_PATH" ]; then
     echo "ERROR: .so not found at: $SO_PATH"
