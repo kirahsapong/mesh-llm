@@ -15,6 +15,11 @@ use std::sync::Arc;
 
 use tokio::sync::{watch, Mutex};
 
+use crate::crypto::{
+    default_node_ownership_path, save_node_ownership, sign_node_ownership, verify_node_ownership,
+    OwnershipStatus, OwnershipSummary, SignedNodeOwnership, TrustPolicy, TrustStore,
+    DEFAULT_NODE_CERT_LIFETIME_SECS,
+};
 use crate::inference::moe;
 use crate::protocol::*;
 
@@ -46,6 +51,13 @@ fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn current_time_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 fn endpoint_id_hex(id: EndpointId) -> String {
@@ -905,6 +917,38 @@ fn peer_meaningfully_changed(old: &PeerInfo, new: &PeerInfo) -> bool {
         || old.served_model_descriptors != new.served_model_descriptors
         || old.served_model_runtime != new.served_model_runtime
         || old.version != new.version
+        || old.owner_summary != new.owner_summary
+        || old.gpu_reserved_bytes != new.gpu_reserved_bytes
+}
+
+fn policy_accepts_peer(policy: TrustPolicy, owner_summary: &OwnershipSummary) -> bool {
+    match policy {
+        TrustPolicy::Off | TrustPolicy::PreferOwned => true,
+        TrustPolicy::RequireOwned | TrustPolicy::Allowlist => {
+            owner_summary.status == OwnershipStatus::Verified
+        }
+    }
+}
+
+fn load_or_refresh_owner_attestation(
+    owner_keypair: &crate::crypto::OwnerKeypair,
+    endpoint_id: EndpointId,
+    node_label: Option<String>,
+    hostname_hint: Option<String>,
+) -> Result<SignedNodeOwnership> {
+    // Always sign a fresh attestation on startup when the owner key is available.
+    // This ensures that key rotation is always reflected immediately and no stale
+    // certificate can persist across restarts.
+    let path = default_node_ownership_path()?;
+    let ownership = sign_node_ownership(
+        owner_keypair,
+        endpoint_id.as_bytes(),
+        current_time_unix_ms() + DEFAULT_NODE_CERT_LIFETIME_SECS * 1000,
+        node_label,
+        hostname_hint,
+    )?;
+    save_node_ownership(&path, &ownership)?;
+    Ok(ownership)
 }
 
 fn model_identity_score(identity: &ServedModelIdentity) -> u8 {
@@ -992,15 +1036,23 @@ pub(crate) struct PeerAnnouncementV0 {
     #[serde(default)]
     gpu_vram: Option<String>,
     #[serde(default)]
-    gpu_bandwidth_gbps: Option<String>,
+    gpu_reserved_bytes: Option<String>,
+    #[serde(
+        default,
+        rename = "gpu_bandwidth_gbps",
+        alias = "gpu_mem_bandwidth_gbps"
+    )]
+    gpu_mem_bandwidth_gbps: Option<String>,
+    #[serde(default)]
+    gpu_compute_tflops_fp32: Option<String>,
+    #[serde(default)]
+    gpu_compute_tflops_fp16: Option<String>,
     #[serde(default)]
     available_model_sizes: HashMap<String, u64>,
     #[serde(skip_serializing, skip_deserializing, default)]
     served_model_descriptors: Vec<ServedModelDescriptor>,
     #[serde(skip_serializing, skip_deserializing, default)]
     served_model_runtime: Vec<ModelRuntimeDescriptor>,
-    #[serde(default)]
-    owner_id: Option<String>,
 }
 
 impl PeerAnnouncementV0 {
@@ -1027,13 +1079,16 @@ impl PeerAnnouncementV0 {
             hostname: self.hostname,
             is_soc: self.is_soc,
             gpu_vram: self.gpu_vram,
-            gpu_bandwidth_gbps: self.gpu_bandwidth_gbps,
+            gpu_reserved_bytes: self.gpu_reserved_bytes,
+            gpu_mem_bandwidth_gbps: self.gpu_mem_bandwidth_gbps,
+            gpu_compute_tflops_fp32: self.gpu_compute_tflops_fp32,
+            gpu_compute_tflops_fp16: self.gpu_compute_tflops_fp16,
             available_model_metadata: vec![],
             experts_summary: None,
             available_model_sizes: self.available_model_sizes,
             served_model_descriptors: self.served_model_descriptors,
             served_model_runtime: self.served_model_runtime,
-            owner_id: self.owner_id,
+            owner_attestation: None,
         }
     }
 }
@@ -1057,11 +1112,13 @@ impl From<&PeerAnnouncement> for PeerAnnouncementV0 {
             hostname: ann.hostname.clone(),
             is_soc: ann.is_soc,
             gpu_vram: ann.gpu_vram.clone(),
-            gpu_bandwidth_gbps: ann.gpu_bandwidth_gbps.clone(),
+            gpu_reserved_bytes: ann.gpu_reserved_bytes.clone(),
+            gpu_mem_bandwidth_gbps: ann.gpu_mem_bandwidth_gbps.clone(),
+            gpu_compute_tflops_fp32: ann.gpu_compute_tflops_fp32.clone(),
+            gpu_compute_tflops_fp16: ann.gpu_compute_tflops_fp16.clone(),
             available_model_sizes: ann.available_model_sizes.clone(),
             served_model_descriptors: ann.served_model_descriptors.clone(),
             served_model_runtime: ann.served_model_runtime.clone(),
-            owner_id: ann.owner_id.clone(),
         }
     }
 }
@@ -1100,12 +1157,22 @@ fn apply_transitive_ann(
     if ann.gpu_vram.is_some() {
         existing.gpu_vram = ann.gpu_vram.clone();
     }
-    if ann.gpu_bandwidth_gbps.is_some() {
-        existing.gpu_bandwidth_gbps = ann.gpu_bandwidth_gbps.clone();
+    if ann.gpu_reserved_bytes.is_some() {
+        existing.gpu_reserved_bytes = ann.gpu_reserved_bytes.clone();
+    }
+    if ann.gpu_mem_bandwidth_gbps.is_some() {
+        existing.gpu_mem_bandwidth_gbps = ann.gpu_mem_bandwidth_gbps.clone();
+    }
+    if ann.gpu_compute_tflops_fp32.is_some() {
+        existing.gpu_compute_tflops_fp32 = ann.gpu_compute_tflops_fp32.clone();
+    }
+    if ann.gpu_compute_tflops_fp16.is_some() {
+        existing.gpu_compute_tflops_fp16 = ann.gpu_compute_tflops_fp16.clone();
     }
     existing.models = ann.models.clone();
     existing.available_models.clear();
     existing.requested_models = ann.requested_models.clone();
+    existing.owner_attestation = ann.owner_attestation.clone();
     if ann.model_source.is_some() {
         existing.model_source = ann.model_source.clone();
     }
@@ -1130,20 +1197,15 @@ pub fn merge_demand(
 }
 
 /// Role a node plays in the mesh.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub enum NodeRole {
     /// Provides GPU compute via rpc-server for a specific model.
+    #[default]
     Worker,
     /// Runs llama-server for a specific model, orchestrates inference, provides HTTP API.
     Host { http_port: u16 },
     /// Lite client — no compute, accesses the API via tunnel.
     Client,
-}
-
-impl Default for NodeRole {
-    fn default() -> Self {
-        NodeRole::Worker
-    }
 }
 
 /// Gossip payload — extends EndpointAddr with role metadata.
@@ -1167,13 +1229,16 @@ pub(crate) struct PeerAnnouncement {
     pub(crate) hostname: Option<String>,
     pub(crate) is_soc: Option<bool>,
     pub(crate) gpu_vram: Option<String>,
-    pub(crate) gpu_bandwidth_gbps: Option<String>,
+    pub(crate) gpu_reserved_bytes: Option<String>,
+    pub(crate) gpu_mem_bandwidth_gbps: Option<String>,
+    pub(crate) gpu_compute_tflops_fp32: Option<String>,
+    pub(crate) gpu_compute_tflops_fp16: Option<String>,
     pub(crate) available_model_metadata: Vec<crate::proto::node::CompactModelMetadata>,
     pub(crate) experts_summary: Option<crate::proto::node::ExpertsSummary>,
     pub(crate) available_model_sizes: HashMap<String, u64>,
     pub(crate) served_model_descriptors: Vec<ServedModelDescriptor>,
     pub(crate) served_model_runtime: Vec<ModelRuntimeDescriptor>,
-    pub(crate) owner_id: Option<String>,
+    pub(crate) owner_attestation: Option<SignedNodeOwnership>,
 }
 
 #[derive(Debug, Clone)]
@@ -1210,13 +1275,25 @@ pub struct PeerInfo {
     pub hostname: Option<String>,
     pub is_soc: Option<bool>,
     pub gpu_vram: Option<String>,
-    pub gpu_bandwidth_gbps: Option<String>,
+    pub gpu_reserved_bytes: Option<String>,
+    pub gpu_mem_bandwidth_gbps: Option<String>,
+    pub gpu_compute_tflops_fp32: Option<String>,
+    pub gpu_compute_tflops_fp16: Option<String>,
     pub available_model_metadata: Vec<crate::proto::node::CompactModelMetadata>,
     pub experts_summary: Option<crate::proto::node::ExpertsSummary>,
     pub available_model_sizes: HashMap<String, u64>,
     pub served_model_descriptors: Vec<ServedModelDescriptor>,
     pub served_model_runtime: Vec<ModelRuntimeDescriptor>,
-    pub owner_id: Option<String>,
+    pub owner_attestation: Option<SignedNodeOwnership>,
+    pub owner_summary: OwnershipSummary,
+}
+
+#[derive(Debug)]
+pub struct OwnerRuntimeConfig {
+    pub keypair: Option<crate::crypto::OwnerKeypair>,
+    pub node_label: Option<String>,
+    pub trust_store: TrustStore,
+    pub trust_policy: TrustPolicy,
 }
 
 #[derive(Debug, Clone)]
@@ -1226,7 +1303,12 @@ pub struct MeshCatalogEntry {
 }
 
 impl PeerInfo {
-    fn from_announcement(id: EndpointId, addr: EndpointAddr, ann: &PeerAnnouncement) -> Self {
+    fn from_announcement(
+        id: EndpointId,
+        addr: EndpointAddr,
+        ann: &PeerAnnouncement,
+        owner_summary: OwnershipSummary,
+    ) -> Self {
         Self {
             id,
             addr,
@@ -1248,13 +1330,17 @@ impl PeerInfo {
             hostname: ann.hostname.clone(),
             is_soc: ann.is_soc,
             gpu_vram: ann.gpu_vram.clone(),
-            gpu_bandwidth_gbps: ann.gpu_bandwidth_gbps.clone(),
+            gpu_reserved_bytes: ann.gpu_reserved_bytes.clone(),
+            gpu_mem_bandwidth_gbps: ann.gpu_mem_bandwidth_gbps.clone(),
+            gpu_compute_tflops_fp32: ann.gpu_compute_tflops_fp32.clone(),
+            gpu_compute_tflops_fp16: ann.gpu_compute_tflops_fp16.clone(),
             available_model_metadata: ann.available_model_metadata.clone(),
             experts_summary: ann.experts_summary.clone(),
             available_model_sizes: ann.available_model_sizes.clone(),
             served_model_descriptors: ann.served_model_descriptors.clone(),
             served_model_runtime: ann.served_model_runtime.clone(),
-            owner_id: ann.owner_id.clone(),
+            owner_attestation: ann.owner_attestation.clone(),
+            owner_summary,
         }
     }
 
@@ -1276,6 +1362,22 @@ impl PeerInfo {
         } else {
             self.is_assigned_model(model)
         }
+    }
+
+    pub fn accepts_http_inference(&self) -> bool {
+        matches!(self.role, NodeRole::Host { .. })
+    }
+
+    pub fn http_routable_models(&self) -> Vec<String> {
+        if self.accepts_http_inference() {
+            self.routable_models()
+        } else {
+            Vec::new()
+        }
+    }
+
+    pub fn routes_http_model(&self, model: &str) -> bool {
+        self.accepts_http_inference() && self.routes_model(model)
     }
 
     pub fn moe_recovery_ready(&self) -> bool {
@@ -1405,7 +1507,7 @@ async fn stun_public_addr(advertised_port: u16) -> Option<std::net::SocketAddr> 
                     }
 
                     // Attributes are padded to 4-byte boundary
-                    i += 4 + (attr_len + 3) & !3;
+                    i += (4 + (attr_len + 3)) & !3;
                 }
             }
             _ => continue,
@@ -1446,15 +1548,21 @@ pub struct Node {
         tokio::sync::mpsc::Sender<(iroh::endpoint::SendStream, iroh::endpoint::RecvStream)>,
     plugin_manager: Arc<Mutex<Option<crate::plugin::PluginManager>>>,
     display_name: Arc<Mutex<Option<String>>>,
+    owner_attestation: Arc<Mutex<Option<SignedNodeOwnership>>>,
+    owner_summary: Arc<Mutex<OwnershipSummary>>,
+    trust_store: Arc<Mutex<TrustStore>>,
+    trust_policy: TrustPolicy,
     pub enumerate_host: bool,
     pub gpu_name: Option<String>,
     pub hostname: Option<String>,
     pub is_soc: Option<bool>,
     pub gpu_vram: Option<String>,
-    pub gpu_bandwidth_gbps: Arc<tokio::sync::Mutex<Option<Vec<f64>>>>,
+    pub gpu_reserved_bytes: Option<String>,
+    pub gpu_mem_bandwidth_gbps: Arc<tokio::sync::Mutex<Option<Vec<f64>>>>,
+    pub gpu_compute_tflops_fp32: Arc<tokio::sync::Mutex<Option<Vec<f64>>>>,
+    pub gpu_compute_tflops_fp16: Arc<tokio::sync::Mutex<Option<Vec<f64>>>>,
     config_state: Arc<tokio::sync::Mutex<crate::runtime::config_state::ConfigState>>,
     config_revision_tx: Arc<tokio::sync::watch::Sender<u64>>,
-    cached_owner_id: Option<String>,
 }
 
 struct MeshState {
@@ -1467,6 +1575,9 @@ struct MeshState {
     dead_peers: std::collections::HashSet<EndpointId>,
     seen_plugin_messages: HashSet<String>,
     seen_plugin_message_order: VecDeque<String>,
+    /// Last policy-rejection status per peer — used to suppress duplicate log lines.
+    /// Only logs when the status transitions (first rejection or status change).
+    policy_rejected_peers: HashMap<EndpointId, OwnershipStatus>,
 }
 
 /// Returns `true` if the given peer has completed gossip validation and is
@@ -1622,12 +1733,18 @@ impl Node {
         self.inflight_change_tx.subscribe()
     }
 
+    pub async fn owner_summary(&self) -> OwnershipSummary {
+        self.owner_summary.lock().await.clone()
+    }
+
     pub async fn start(
         role: NodeRole,
         relay_urls: &[String],
         bind_port: Option<u16>,
         max_vram_gb: Option<f64>,
         enumerate_host: bool,
+        owner_config: Option<OwnerRuntimeConfig>,
+        config_path: Option<&std::path::Path>,
     ) -> Result<(Self, TunnelChannels)> {
         // Clients use an ephemeral key so they get a unique identity even
         // when running on the same machine as a GPU node.
@@ -1718,28 +1835,68 @@ impl Node {
                     .join(","),
             )
         };
+        let gpu_reserved_bytes = if hw.gpu_reserved.iter().all(Option::is_none) {
+            None
+        } else {
+            Some(
+                hw.gpu_reserved
+                    .iter()
+                    .map(|value| value.map(|v| v.to_string()).unwrap_or_default())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            )
+        };
         if let Some(max_gb) = max_vram_gb {
             let max_bytes = (max_gb * 1e9) as u64;
             if max_bytes < vram {
                 tracing::info!(
-                    "Detected capacity: {:.1} GB, capped to {:.1} GB (--max-vram)",
+                    "Detected VRAM: {:.1} GB, capped to {:.1} GB (--max-vram)",
                     vram as f64 / 1e9,
                     max_gb
                 );
                 vram = max_bytes;
             } else {
                 tracing::info!(
-                    "Detected capacity: {:.1} GB (--max-vram {:.1} has no effect)",
+                    "Detected VRAM: {:.1} GB (--max-vram {:.1} has no effect)",
                     vram as f64 / 1e9,
                     max_gb
                 );
             }
         } else {
-            tracing::info!("Detected capacity: {:.1} GB", vram as f64 / 1e9);
+            tracing::info!("Detected VRAM: {:.1} GB", vram as f64 / 1e9);
         }
 
+        let trust_store = owner_config
+            .as_ref()
+            .map(|config| config.trust_store.clone())
+            .unwrap_or_default();
+        let trust_policy = owner_config
+            .as_ref()
+            .map(|config| config.trust_policy)
+            .unwrap_or_default();
+        let owner_attestation = match owner_config
+            .as_ref()
+            .and_then(|config| config.keypair.as_ref())
+        {
+            Some(keypair) => Some(load_or_refresh_owner_attestation(
+                keypair,
+                endpoint.id(),
+                owner_config
+                    .as_ref()
+                    .and_then(|config| config.node_label.clone()),
+                hostname.clone(),
+            )?),
+            None => None,
+        };
+        let owner_summary = verify_node_ownership(
+            owner_attestation.as_ref(),
+            endpoint.id().as_bytes(),
+            &trust_store,
+            TrustPolicy::Off,
+            current_time_unix_ms(),
+        );
         let config_state_init = {
-            let path = crate::plugin::config_path(None)
+            let path = crate::plugin::config_path(config_path)
                 .unwrap_or_else(|_| std::path::PathBuf::from("config.toml"));
             crate::runtime::config_state::ConfigState::load(&path)?
         };
@@ -1755,6 +1912,7 @@ impl Node {
                 dead_peers: std::collections::HashSet::new(),
                 seen_plugin_messages: HashSet::new(),
                 seen_plugin_message_order: VecDeque::new(),
+                policy_rejected_peers: HashMap::new(),
             })),
             role: Arc::new(Mutex::new(role)),
             models: Arc::new(Mutex::new(Vec::new())),
@@ -1781,23 +1939,23 @@ impl Node {
             tunnel_http_tx,
             plugin_manager: Arc::new(Mutex::new(None)),
             display_name: Arc::new(Mutex::new(None)),
+            owner_attestation: Arc::new(Mutex::new(owner_attestation)),
+            owner_summary: Arc::new(Mutex::new(owner_summary)),
+            trust_store: Arc::new(Mutex::new(trust_store)),
+            trust_policy,
             enumerate_host,
             gpu_name,
             hostname,
             is_soc,
             gpu_vram,
-            gpu_bandwidth_gbps: Arc::new(tokio::sync::Mutex::new(None)),
+            gpu_reserved_bytes,
+            gpu_mem_bandwidth_gbps: Arc::new(tokio::sync::Mutex::new(None)),
+            gpu_compute_tflops_fp32: Arc::new(tokio::sync::Mutex::new(None)),
+            gpu_compute_tflops_fp16: Arc::new(tokio::sync::Mutex::new(None)),
             config_state: Arc::new(tokio::sync::Mutex::new(config_state_init)),
             config_revision_tx: {
                 let (tx, _rx) = tokio::sync::watch::channel(config_revision_init);
                 Arc::new(tx)
-            },
-            cached_owner_id: {
-                use crate::crypto::{default_keystore_path, keystore_metadata};
-                default_keystore_path()
-                    .ok()
-                    .and_then(|p| keystore_metadata(&p).ok())
-                    .map(|info| info.owner_id)
             },
         };
 
@@ -1817,7 +1975,6 @@ impl Node {
         ))
     }
 
-    #[cfg(test)]
     #[cfg(test)]
     pub async fn new_for_tests(role: NodeRole) -> Result<Self> {
         use iroh::endpoint::QuicTransportConfig;
@@ -1853,6 +2010,7 @@ impl Node {
                 dead_peers: std::collections::HashSet::new(),
                 seen_plugin_messages: HashSet::new(),
                 seen_plugin_message_order: VecDeque::new(),
+                policy_rejected_peers: HashMap::new(),
             })),
             role: Arc::new(Mutex::new(role)),
             models: Arc::new(Mutex::new(Vec::new())),
@@ -1879,12 +2037,19 @@ impl Node {
             tunnel_http_tx,
             plugin_manager: Arc::new(Mutex::new(None)),
             display_name: Arc::new(Mutex::new(None)),
+            owner_attestation: Arc::new(Mutex::new(None)),
+            owner_summary: Arc::new(Mutex::new(OwnershipSummary::default())),
+            trust_store: Arc::new(Mutex::new(TrustStore::default())),
+            trust_policy: TrustPolicy::Off,
             enumerate_host: false,
             gpu_name: None,
             hostname: None,
             is_soc: Some(false),
             gpu_vram: None,
-            gpu_bandwidth_gbps: Arc::new(tokio::sync::Mutex::new(None)),
+            gpu_reserved_bytes: None,
+            gpu_mem_bandwidth_gbps: Arc::new(tokio::sync::Mutex::new(None)),
+            gpu_compute_tflops_fp32: Arc::new(tokio::sync::Mutex::new(None)),
+            gpu_compute_tflops_fp16: Arc::new(tokio::sync::Mutex::new(None)),
             config_state: Arc::new(tokio::sync::Mutex::new(
                 crate::runtime::config_state::ConfigState::default(),
             )),
@@ -1892,7 +2057,6 @@ impl Node {
                 let (tx, _rx) = tokio::sync::watch::channel(0u64);
                 Arc::new(tx)
             },
-            cached_owner_id: None,
         })
     }
 
@@ -2295,7 +2459,7 @@ impl Node {
             // If RTT dropped from above the split threshold (80ms) to below it
             // (e.g. relay → direct), trigger a re-election so the peer can now
             // be included in split mode.
-            let was_above = old_rtt.map_or(false, |r| r > MAX_SPLIT_RTT_MS);
+            let was_above = old_rtt.is_some_and(|r| r > MAX_SPLIT_RTT_MS);
             if was_above && rtt_ms <= MAX_SPLIT_RTT_MS {
                 eprintln!(
                     "📡 Peer {} RTT improved ({}ms → {}ms) — re-electing for split",
@@ -3240,7 +3404,11 @@ impl Node {
             .collect()
     }
 
-    /// Get all models currently being served in the mesh (loaded in VRAM somewhere).
+    /// Get all models currently reachable via the mesh HTTP/API ingress.
+    ///
+    /// This is intentionally stricter than "loaded in VRAM somewhere": split
+    /// workers may contribute compute for a model but cannot accept chat
+    /// requests directly.
     pub async fn models_being_served(&self) -> Vec<String> {
         let my_hosted_models = self.hosted_models.lock().await.clone();
         let peer_data: Vec<_> = {
@@ -3252,7 +3420,7 @@ impl Node {
             served.insert(s.clone());
         }
         for peer in &peer_data {
-            for m in peer.routable_models() {
+            for m in peer.http_routable_models() {
                 served.insert(m.clone());
             }
         }
@@ -3270,7 +3438,7 @@ impl Node {
         let mut hosts: Vec<EndpointId> = state
             .peers
             .values()
-            .filter(|p| p.routes_model(model))
+            .filter(|p| p.routes_http_model(model))
             .map(|p| p.id)
             .collect();
         hosts.sort();
@@ -3293,7 +3461,7 @@ impl Node {
         state
             .peers
             .values()
-            .find(|p| !p.routable_models().is_empty())
+            .find(|p| !p.http_routable_models().is_empty())
             .cloned()
     }
 
@@ -3321,7 +3489,7 @@ impl Node {
 
         // Include peers that are serving through their local API proxies
         for peer in &peer_data {
-            for model in peer.routable_models() {
+            for model in peer.http_routable_models() {
                 hosts.push(RouteEntry {
                     model,
                     node_id: format!("{}", peer.id.fmt_short()),
@@ -3741,7 +3909,6 @@ impl Node {
             match stream_type {
                 STREAM_GOSSIP => {
                     let node = self.clone();
-                    let protocol = protocol;
                     tokio::spawn(async move {
                         if let Err(e) = node
                             .handle_gossip_stream(remote, protocol, send, recv)
@@ -3759,7 +3926,6 @@ impl Node {
                 }
                 STREAM_TUNNEL_MAP => {
                     let node = self.clone();
-                    let protocol = protocol;
                     tokio::spawn(async move {
                         if let Err(e) = node.handle_tunnel_map_stream(remote, protocol, recv).await
                         {
@@ -3778,7 +3944,6 @@ impl Node {
                 }
                 STREAM_ROUTE_REQUEST => {
                     let node = self.clone();
-                    let protocol = protocol;
                     tokio::spawn(async move {
                         if protocol == ControlProtocol::ProtoV1 {
                             let proto_buf = match read_len_prefixed(&mut recv).await {
@@ -3828,7 +3993,6 @@ impl Node {
                 }
                 STREAM_PEER_DOWN => {
                     let node = self.clone();
-                    let protocol = protocol;
                     tokio::spawn(async move {
                         let peer_id_arr: [u8; 32] = match protocol {
                             ControlProtocol::ProtoV1 => {
@@ -3923,7 +4087,6 @@ impl Node {
                 }
                 STREAM_PEER_LEAVING => {
                     let node = self.clone();
-                    let protocol = protocol;
                     tokio::spawn(async move {
                         let leaving_id = match protocol {
                             ControlProtocol::ProtoV1 => {
@@ -4071,18 +4234,17 @@ impl Node {
             .validate_frame()
             .map_err(|e| anyhow::anyhow!("ConfigSubscribe validation error: {e}"))?;
 
-        let local_owner_id = match self.local_owner_id() {
+        let local_owner_id = match self.local_verified_owner_id().await {
             Some(id) => id,
             None => {
                 let error_snapshot = crate::proto::node::ConfigSnapshotResponse {
                     gen: NODE_PROTOCOL_GENERATION,
                     node_id: vec![],
-                    owner_id: String::new(),
                     revision: 0,
                     config_hash: vec![],
                     config: None,
                     hostname: None,
-                    error: Some("node has no local owner".to_string()),
+                    error: Some(self.local_owner_status_error().await),
                 };
                 write_len_prefixed(&mut send, &error_snapshot.encode_to_vec()).await?;
                 return Ok(());
@@ -4097,7 +4259,6 @@ impl Node {
             let error_snapshot = crate::proto::node::ConfigSnapshotResponse {
                 gen: NODE_PROTOCOL_GENERATION,
                 node_id: vec![],
-                owner_id: String::new(),
                 revision: 0,
                 config_hash: vec![],
                 config: None,
@@ -4108,17 +4269,33 @@ impl Node {
             return Ok(());
         }
 
-        if frame.owner_id != local_owner_id {
+        let (subscriber_owner_id, _) = match self.peer_verified_owner(remote).await {
+            Some(owner) => owner,
+            None => {
+                let error_snapshot = crate::proto::node::ConfigSnapshotResponse {
+                    gen: NODE_PROTOCOL_GENERATION,
+                    node_id: vec![],
+                    revision: 0,
+                    config_hash: vec![],
+                    config: None,
+                    hostname: None,
+                    error: Some("subscriber is not owner-attested".to_string()),
+                };
+                write_len_prefixed(&mut send, &error_snapshot.encode_to_vec()).await?;
+                return Ok(());
+            }
+        };
+
+        if subscriber_owner_id != local_owner_id {
             tracing::warn!(
-                "config subscribe from {}: owner_id mismatch (want {}, got {})",
+                "config subscribe from {}: owner_id mismatch (want {}, subscriber {})",
                 remote.fmt_short(),
                 local_owner_id,
-                frame.owner_id
+                subscriber_owner_id
             );
             let error_snapshot = crate::proto::node::ConfigSnapshotResponse {
                 gen: NODE_PROTOCOL_GENERATION,
                 node_id: vec![],
-                owner_id: String::new(),
                 revision: 0,
                 config_hash: vec![],
                 config: None,
@@ -4135,7 +4312,6 @@ impl Node {
             ConfigSnapshotResponse {
                 gen: NODE_PROTOCOL_GENERATION,
                 node_id: self.endpoint.id().as_bytes().to_vec(),
-                owner_id: local_owner_id.to_string(),
                 revision: state.revision(),
                 config_hash: state.config_hash().to_vec(),
                 config: Some(proto_cfg),
@@ -4145,37 +4321,88 @@ impl Node {
         };
         write_len_prefixed(&mut send, &snapshot.encode_to_vec()).await?;
 
-        let owner_id_owned = local_owner_id.to_string();
         let mut rev_rx = self.config_revision_tx.subscribe();
         loop {
-            if rev_rx.changed().await.is_err() {
-                break;
-            }
-            let notification = {
-                let state = self.config_state.lock().await;
-                let proto_cfg = mesh_config_to_proto(state.config());
-                ConfigUpdateNotification {
-                    gen: NODE_PROTOCOL_GENERATION,
-                    node_id: self.endpoint.id().as_bytes().to_vec(),
-                    owner_id: owner_id_owned.clone(),
-                    revision: state.revision(),
-                    config_hash: state.config_hash().to_vec(),
-                    config: Some(proto_cfg),
+            tokio::select! {
+                changed = rev_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    let notification = {
+                        let state = self.config_state.lock().await;
+                        let proto_cfg = mesh_config_to_proto(state.config());
+                        ConfigUpdateNotification {
+                            gen: NODE_PROTOCOL_GENERATION,
+                            node_id: self.endpoint.id().as_bytes().to_vec(),
+                            revision: state.revision(),
+                            config_hash: state.config_hash().to_vec(),
+                            config: Some(proto_cfg),
+                        }
+                    };
+                    if write_len_prefixed(&mut send, &notification.encode_to_vec()).await.is_err() {
+                        break;
+                    }
                 }
-            };
-            if write_len_prefixed(&mut send, &notification.encode_to_vec())
-                .await
-                .is_err()
-            {
-                break;
+                inbound = read_len_prefixed(&mut recv) => {
+                    if inbound.is_ok() {
+                        tracing::debug!(
+                            "config subscribe from {} sent unexpected extra frame; closing stream",
+                            remote.fmt_short()
+                        );
+                    }
+                    break;
+                }
             }
         }
 
         Ok(())
     }
 
-    fn local_owner_id(&self) -> Option<&str> {
-        self.cached_owner_id.as_deref()
+    async fn local_verified_owner_id(&self) -> Option<String> {
+        let summary = self.owner_summary.lock().await.clone();
+        if summary.status == OwnershipStatus::Verified {
+            summary.owner_id
+        } else {
+            None
+        }
+    }
+
+    async fn local_owner_status_error(&self) -> String {
+        let summary = self.owner_summary.lock().await.clone();
+        match summary.status {
+            OwnershipStatus::Verified => "node owner is verified".to_string(),
+            OwnershipStatus::Unsigned => "node has no local owner attestation".to_string(),
+            OwnershipStatus::Expired => "node owner attestation is expired".to_string(),
+            OwnershipStatus::InvalidSignature => {
+                "node owner attestation has invalid signature".to_string()
+            }
+            OwnershipStatus::MismatchedNodeId => {
+                "node owner attestation does not match local node id".to_string()
+            }
+            OwnershipStatus::RevokedOwner => "node owner is revoked".to_string(),
+            OwnershipStatus::RevokedCert => "node owner certificate is revoked".to_string(),
+            OwnershipStatus::RevokedNodeId => "node endpoint id is revoked".to_string(),
+            OwnershipStatus::UnsupportedProtocol => {
+                "node owner attestation uses unsupported protocol version".to_string()
+            }
+            OwnershipStatus::UntrustedOwner => {
+                "node owner is not trusted by local policy".to_string()
+            }
+        }
+    }
+
+    async fn peer_verified_owner(
+        &self,
+        peer_id: EndpointId,
+    ) -> Option<(String, SignedNodeOwnership)> {
+        let state = self.state.lock().await;
+        let peer = state.peers.get(&peer_id)?;
+        if peer.owner_summary.status != OwnershipStatus::Verified {
+            return None;
+        }
+        let owner_id = peer.owner_summary.owner_id.clone()?;
+        let attestation = peer.owner_attestation.clone()?;
+        Some((owner_id, attestation))
     }
 
     // --- Config Push ---
@@ -4204,31 +4431,55 @@ impl Node {
             return Ok(());
         }
 
-        // 2. Derive owner_id from the push's public key
-        let pk_bytes: [u8; 32] = push
-            .owner_signing_public_key
-            .as_slice()
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("invalid public key length"))?;
-        let vk = ed25519_dalek::VerifyingKey::from_bytes(&pk_bytes)?;
-        let derived_owner_id = crate::crypto::owner_id_from_verifying_key(&vk);
-
-        if derived_owner_id != push.owner_id {
-            send_push_error(&mut send, "owner_id mismatch").await?;
-            return Ok(());
-        }
-
-        let local_id = match self.local_owner_id() {
+        let local_id = match self.local_verified_owner_id().await {
             Some(id) => id,
             None => {
-                send_push_error(&mut send, "node has no local owner").await?;
+                let msg = self.local_owner_status_error().await;
+                send_push_error(&mut send, &msg).await?;
                 return Ok(());
             }
         };
-        if local_id != push.owner_id {
+
+        let (requester_owner_id, requester_attestation) =
+            match self.peer_verified_owner(remote).await {
+                Some(owner) => owner,
+                None => {
+                    send_push_error(&mut send, "requester is not owner-attested").await?;
+                    return Ok(());
+                }
+            };
+
+        if requester_owner_id != local_id {
             send_push_error(&mut send, "not the owner of this node").await?;
             return Ok(());
         }
+
+        let expected_public_key =
+            match hex::decode(&requester_attestation.claim.owner_sign_public_key) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    send_push_error(&mut send, "requester attestation has invalid public key")
+                        .await?;
+                    return Ok(());
+                }
+            };
+        if push.owner_signing_public_key != expected_public_key {
+            send_push_error(
+                &mut send,
+                "push signing key does not match requester attestation",
+            )
+            .await?;
+            return Ok(());
+        }
+
+        let pk_bytes: [u8; 32] = match expected_public_key.as_slice().try_into() {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                send_push_error(&mut send, "invalid public key length").await?;
+                return Ok(());
+            }
+        };
+        let vk = ed25519_dalek::VerifyingKey::from_bytes(&pk_bytes)?;
 
         let payload = config_push_signature_payload(&push);
         let sig_bytes: [u8; 64] = match push.signature.as_slice().try_into() {
@@ -4266,7 +4517,7 @@ impl Node {
         .map_err(|e| anyhow::anyhow!("config apply task panicked: {e}"))?;
 
         // 7. Build + send response
-        use crate::protocol::convert::local_apply_mode_to_proto;
+        use crate::proto::node::ConfigApplyMode as ProtoApplyMode;
         use crate::runtime::config_state::{ApplyResult, ConfigApplyMode};
         let response = match result {
             ApplyResult::Applied {
@@ -4274,7 +4525,7 @@ impl Node {
                 hash,
                 apply_mode,
             } => {
-                if apply_mode != ConfigApplyMode::Noop {
+                if apply_mode == ConfigApplyMode::Staged {
                     let _ = self.config_revision_tx.send(revision);
                 }
                 crate::proto::node::ConfigPushResponse {
@@ -4283,7 +4534,10 @@ impl Node {
                     current_revision: revision,
                     config_hash: hash.to_vec(),
                     error: None,
-                    apply_mode: local_apply_mode_to_proto(apply_mode),
+                    apply_mode: match apply_mode {
+                        ConfigApplyMode::Staged => ProtoApplyMode::Staged as i32,
+                        ConfigApplyMode::Noop => ProtoApplyMode::Noop as i32,
+                    },
                 }
             }
             ApplyResult::RevisionConflict { current_revision } => {
@@ -4295,7 +4549,22 @@ impl Node {
                     error: Some(
                         "revision conflict: expected_revision does not match current".to_string(),
                     ),
-                    apply_mode: local_apply_mode_to_proto(ConfigApplyMode::Noop),
+                    apply_mode: ProtoApplyMode::Unspecified as i32,
+                }
+            }
+            ApplyResult::PersistedWithRevisionTrackingError {
+                revision,
+                hash,
+                error,
+            } => {
+                let _ = self.config_revision_tx.send(revision);
+                crate::proto::node::ConfigPushResponse {
+                    gen: NODE_PROTOCOL_GENERATION,
+                    success: false,
+                    current_revision: revision,
+                    config_hash: hash.to_vec(),
+                    error: Some(error),
+                    apply_mode: ProtoApplyMode::Staged as i32,
                 }
             }
             ApplyResult::ValidationError(msg) | ApplyResult::PersistError(msg) => {
@@ -4305,7 +4574,7 @@ impl Node {
                     current_revision,
                     config_hash: current_hash.to_vec(),
                     error: Some(msg),
-                    apply_mode: local_apply_mode_to_proto(ConfigApplyMode::Noop),
+                    apply_mode: ProtoApplyMode::Unspecified as i32,
                 }
             }
         };
@@ -4323,7 +4592,6 @@ impl Node {
     pub(crate) async fn subscribe_to_config(
         &self,
         conn: &iroh::endpoint::Connection,
-        owner_id: &str,
     ) -> anyhow::Result<(
         crate::proto::node::ConfigSnapshotResponse,
         tokio::sync::watch::Receiver<crate::proto::node::ConfigUpdateNotification>,
@@ -4338,7 +4606,6 @@ impl Node {
         let req = ConfigSubscribe {
             gen: NODE_PROTOCOL_GENERATION,
             subscriber_id: self.endpoint.id().as_bytes().to_vec(),
-            owner_id: owner_id.to_string(),
         };
         write_len_prefixed(&mut send, &req.encode_to_vec()).await?;
 
@@ -4355,31 +4622,30 @@ impl Node {
         let empty_notif = ConfigUpdateNotification {
             gen: NODE_PROTOCOL_GENERATION,
             node_id: snapshot.node_id.clone(),
-            owner_id: snapshot.owner_id.clone(),
             revision: snapshot.revision,
             config_hash: snapshot.config_hash.clone(),
             config: snapshot.config.clone(),
         };
         let (notif_tx, notif_rx) = tokio::sync::watch::channel(empty_notif);
         tokio::spawn(async move {
-            loop {
-                match read_len_prefixed(&mut recv).await {
-                    Ok(buf) => match ConfigUpdateNotification::decode(buf.as_slice()) {
-                        Ok(notif) => {
-                            if let Err(e) = notif.validate_frame() {
-                                tracing::warn!("ConfigUpdateNotification validation error: {e}");
-                                break;
-                            }
-                            if notif_tx.send(notif).is_err() {
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("ConfigUpdateNotification decode error: {e}");
+            // Keep the request stream's send half alive while subscribed so the
+            // remote side does not treat immediate EOF as an unsubscribe.
+            let _send = send;
+            while let Ok(buf) = read_len_prefixed(&mut recv).await {
+                match ConfigUpdateNotification::decode(buf.as_slice()) {
+                    Ok(notif) => {
+                        if let Err(e) = notif.validate_frame() {
+                            tracing::warn!("ConfigUpdateNotification validation error: {e}");
                             break;
                         }
-                    },
-                    Err(_) => break,
+                        if notif_tx.send(notif).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("ConfigUpdateNotification decode error: {e}");
+                        break;
+                    }
                 }
             }
         });
@@ -4803,6 +5069,8 @@ impl Node {
 
     async fn remove_peer(&self, id: EndpointId) {
         let mut state = self.state.lock().await;
+        // Always clear any rejection-tracking entry so the map stays bounded.
+        state.policy_rejected_peers.remove(&id);
         if let Some(peer) = state.peers.remove(&id) {
             tracing::info!(
                 "Peer removed: {} (total: {})",
@@ -4823,7 +5091,35 @@ impl Node {
 
     async fn add_peer(&self, id: EndpointId, addr: EndpointAddr, ann: &PeerAnnouncement) {
         let imported_ranking = import_remote_moe_rankings(&ann.served_model_descriptors);
+        let trust_store = self.trust_store.lock().await.clone();
+        let owner_summary = verify_node_ownership(
+            ann.owner_attestation.as_ref(),
+            id.as_bytes(),
+            &trust_store,
+            self.trust_policy,
+            current_time_unix_ms(),
+        );
+        if !policy_accepts_peer(self.trust_policy, &owner_summary) {
+            let mut state = self.state.lock().await;
+            let last_status = state.policy_rejected_peers.get(&id).cloned();
+            if last_status.as_ref() != Some(&owner_summary.status) {
+                tracing::warn!(
+                    "Rejecting peer {} due to owner policy: {:?}",
+                    id.fmt_short(),
+                    owner_summary.status
+                );
+                state
+                    .policy_rejected_peers
+                    .insert(id, owner_summary.status.clone());
+            }
+            if state.peers.remove(&id).is_some() {
+                let _ = self.peer_change_tx.send(state.peers.len());
+            }
+            return;
+        }
         let mut state = self.state.lock().await;
+        // Peer accepted — clear any prior rejection record so future rejections log again.
+        state.policy_rejected_peers.remove(&id);
         if id == self.endpoint.id() {
             return;
         }
@@ -4871,6 +5167,8 @@ impl Node {
             if recovered {
                 existing.moe_recovered_at = Some(now);
             }
+            existing.owner_attestation = ann.owner_attestation.clone();
+            existing.owner_summary = owner_summary.clone();
             existing.served_model_descriptors = ann.served_model_descriptors.clone();
             existing.served_model_runtime = ann.served_model_runtime.clone();
             if ann.version.is_some() {
@@ -4880,7 +5178,10 @@ impl Node {
             existing.hostname = ann.hostname.clone();
             existing.is_soc = ann.is_soc;
             existing.gpu_vram = ann.gpu_vram.clone();
-            existing.gpu_bandwidth_gbps = ann.gpu_bandwidth_gbps.clone();
+            existing.gpu_reserved_bytes = ann.gpu_reserved_bytes.clone();
+            existing.gpu_mem_bandwidth_gbps = ann.gpu_mem_bandwidth_gbps.clone();
+            existing.gpu_compute_tflops_fp32 = ann.gpu_compute_tflops_fp32.clone();
+            existing.gpu_compute_tflops_fp16 = ann.gpu_compute_tflops_fp16.clone();
             if ann.experts_summary.is_some() {
                 existing.experts_summary = ann.experts_summary.clone();
             }
@@ -4890,7 +5191,10 @@ impl Node {
                 || old_peer.hostname != updated_peer.hostname
                 || old_peer.is_soc != updated_peer.is_soc
                 || old_peer.gpu_vram != updated_peer.gpu_vram
-                || old_peer.gpu_bandwidth_gbps != updated_peer.gpu_bandwidth_gbps;
+                || old_peer.gpu_reserved_bytes != updated_peer.gpu_reserved_bytes
+                || old_peer.gpu_mem_bandwidth_gbps != updated_peer.gpu_mem_bandwidth_gbps
+                || old_peer.gpu_compute_tflops_fp32 != updated_peer.gpu_compute_tflops_fp32
+                || old_peer.gpu_compute_tflops_fp16 != updated_peer.gpu_compute_tflops_fp16;
             if role_changed || serving_changed {
                 let count = state.peers.len();
                 drop(state);
@@ -4928,7 +5232,7 @@ impl Node {
             ann.available_models,
             state.peers.len() + 1
         );
-        let mut peer = PeerInfo::from_announcement(id, addr, ann);
+        let mut peer = PeerInfo::from_announcement(id, addr, ann, owner_summary);
         if recovered {
             peer.moe_recovered_at = Some(now);
         }
@@ -4959,6 +5263,21 @@ impl Node {
         ann: &PeerAnnouncement,
     ) {
         let imported_ranking = import_remote_moe_rankings(&ann.served_model_descriptors);
+        let trust_store = self.trust_store.lock().await.clone();
+        let owner_summary = verify_node_ownership(
+            ann.owner_attestation.as_ref(),
+            id.as_bytes(),
+            &trust_store,
+            self.trust_policy,
+            current_time_unix_ms(),
+        );
+        if !policy_accepts_peer(self.trust_policy, &owner_summary) {
+            let mut state = self.state.lock().await;
+            if state.peers.remove(&id).is_some() {
+                let _ = self.peer_change_tx.send(state.peers.len());
+            }
+            return;
+        }
         let mut state = self.state.lock().await;
         if id == self.endpoint.id() {
             return;
@@ -4969,6 +5288,7 @@ impl Node {
         if let Some(existing) = state.peers.get_mut(&id) {
             let old_peer = existing.clone();
             let serving_changed = apply_transitive_ann(existing, addr, ann);
+            existing.owner_summary = owner_summary;
             let updated_peer = existing.clone();
             let changed = peer_meaningfully_changed(&old_peer, &updated_peer);
             if serving_changed {
@@ -5000,7 +5320,7 @@ impl Node {
         } else {
             // New transitive peer — add with last_seen = now but no peer_change event.
             // It will get pruned after PEER_STALE_SECS*2 if never directly contacted.
-            let peer = PeerInfo::from_announcement(id, addr.clone(), ann);
+            let peer = PeerInfo::from_announcement(id, addr.clone(), ann, owner_summary);
             state.peers.insert(id, peer.clone());
             drop(state);
             self.emit_plugin_mesh_event(
@@ -5027,6 +5347,7 @@ impl Node {
         let my_available = self.available_models.lock().await.clone();
         let my_requested = self.requested_models.lock().await.clone();
         let my_mesh_id = self.mesh_id.lock().await.clone();
+        let my_owner_attestation = self.owner_attestation.lock().await.clone();
         let my_demand = self.get_demand();
         let stale_cutoff =
             std::time::Instant::now() - std::time::Duration::from_secs(PEER_STALE_SECS);
@@ -5058,13 +5379,16 @@ impl Node {
                     hostname: p.hostname.clone(),
                     is_soc: p.is_soc,
                     gpu_vram: p.gpu_vram.clone(),
-                    gpu_bandwidth_gbps: p.gpu_bandwidth_gbps.clone(),
+                    gpu_reserved_bytes: p.gpu_reserved_bytes.clone(),
+                    gpu_mem_bandwidth_gbps: p.gpu_mem_bandwidth_gbps.clone(),
+                    gpu_compute_tflops_fp32: p.gpu_compute_tflops_fp32.clone(),
+                    gpu_compute_tflops_fp16: p.gpu_compute_tflops_fp16.clone(),
                     available_model_metadata: p.available_model_metadata.clone(),
                     experts_summary: p.experts_summary.clone(),
                     available_model_sizes: p.available_model_sizes.clone(),
                     served_model_descriptors: p.served_model_descriptors.clone(),
                     served_model_runtime: p.served_model_runtime.clone(),
-                    owner_id: p.owner_id.clone(),
+                    owner_attestation: p.owner_attestation.clone(),
                 })
                 .collect()
         };
@@ -5097,7 +5421,24 @@ impl Node {
             } else {
                 None
             },
-            gpu_bandwidth_gbps: self.gpu_bandwidth_gbps.lock().await.as_ref().map(|v| {
+            gpu_reserved_bytes: if self.enumerate_host {
+                self.gpu_reserved_bytes.clone()
+            } else {
+                None
+            },
+            gpu_mem_bandwidth_gbps: self.gpu_mem_bandwidth_gbps.lock().await.as_ref().map(|v| {
+                v.iter()
+                    .map(|f| format!("{:.2}", f))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            }),
+            gpu_compute_tflops_fp32: self.gpu_compute_tflops_fp32.lock().await.as_ref().map(|v| {
+                v.iter()
+                    .map(|f| format!("{:.2}", f))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            }),
+            gpu_compute_tflops_fp16: self.gpu_compute_tflops_fp16.lock().await.as_ref().map(|v| {
                 v.iter()
                     .map(|f| format!("{:.2}", f))
                     .collect::<Vec<_>>()
@@ -5108,7 +5449,7 @@ impl Node {
             available_model_sizes: my_model_sizes,
             served_model_descriptors: my_served_model_descriptors,
             served_model_runtime: my_model_runtime_descriptors,
-            owner_id: self.local_owner_id().map(str::to_string),
+            owner_attestation: my_owner_attestation,
         });
         announcements
     }
@@ -5130,7 +5471,7 @@ async fn send_push_error(send: &mut iroh::endpoint::SendStream, msg: &str) -> an
         current_revision: 0,
         config_hash: vec![],
         error: Some(msg.to_string()),
-        apply_mode: crate::proto::node::ConfigApplyMode::Noop as i32,
+        apply_mode: crate::proto::node::ConfigApplyMode::Unspecified as i32,
     };
     write_len_prefixed(send, &response.encode_to_vec()).await?;
     Ok(())
@@ -5171,6 +5512,7 @@ mod tests {
                 dead_peers: HashSet::new(),
                 seen_plugin_messages: HashSet::new(),
                 seen_plugin_message_order: VecDeque::new(),
+                policy_rejected_peers: HashMap::new(),
             })),
             role: Arc::new(Mutex::new(role)),
             models: Arc::new(Mutex::new(Vec::new())),
@@ -5197,12 +5539,19 @@ mod tests {
             tunnel_http_tx,
             plugin_manager: Arc::new(Mutex::new(None)),
             display_name: Arc::new(Mutex::new(None)),
+            owner_attestation: Arc::new(Mutex::new(None)),
+            owner_summary: Arc::new(Mutex::new(OwnershipSummary::default())),
+            trust_store: Arc::new(Mutex::new(TrustStore::default())),
+            trust_policy: TrustPolicy::Off,
             enumerate_host: false,
             gpu_name: None,
             hostname: None,
             is_soc: None,
             gpu_vram: None,
-            gpu_bandwidth_gbps: Arc::new(tokio::sync::Mutex::new(None)),
+            gpu_reserved_bytes: None,
+            gpu_mem_bandwidth_gbps: Arc::new(tokio::sync::Mutex::new(None)),
+            gpu_compute_tflops_fp32: Arc::new(tokio::sync::Mutex::new(None)),
+            gpu_compute_tflops_fp16: Arc::new(tokio::sync::Mutex::new(None)),
             config_state: Arc::new(tokio::sync::Mutex::new(
                 crate::runtime::config_state::ConfigState::default(),
             )),
@@ -5210,7 +5559,6 @@ mod tests {
                 let (tx, _rx) = tokio::sync::watch::channel(0u64);
                 Arc::new(tx)
             },
-            cached_owner_id: None,
         };
 
         let accept_node = node.clone();
@@ -5586,35 +5934,214 @@ mod tests {
     }
 
     #[test]
-    fn test_peer_announcement_with_bandwidth_serde_roundtrip() {
-        #[derive(Serialize, Deserialize, Debug, PartialEq)]
+    fn test_peer_announcement_v0_gossip_wire_backward_compat() {
+        #[derive(Deserialize)]
         struct TestAnnouncement {
-            #[serde(default)]
-            gpu_bandwidth_gbps: Option<String>,
+            #[serde(
+                default,
+                rename = "gpu_bandwidth_gbps",
+                alias = "gpu_mem_bandwidth_gbps"
+            )]
+            gpu_mem_bandwidth_gbps: Option<String>,
         }
 
-        let test = TestAnnouncement {
-            gpu_bandwidth_gbps: Some("1671.7,722.2".to_string()),
+        let json = r#"{"gpu_bandwidth_gbps":"1671.7,722.2"}"#;
+        let decoded: TestAnnouncement = serde_json::from_str(json).unwrap();
+
+        assert_eq!(
+            decoded.gpu_mem_bandwidth_gbps,
+            Some("1671.7,722.2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_peer_announcement_v0_gossip_wire_new_alias() {
+        #[derive(Deserialize)]
+        struct TestAnnouncement {
+            #[serde(
+                default,
+                rename = "gpu_bandwidth_gbps",
+                alias = "gpu_mem_bandwidth_gbps"
+            )]
+            gpu_mem_bandwidth_gbps: Option<String>,
+        }
+
+        let json = r#"{"gpu_mem_bandwidth_gbps":"1671.7,722.2"}"#;
+        let decoded: TestAnnouncement = serde_json::from_str(json).unwrap();
+
+        assert_eq!(
+            decoded.gpu_mem_bandwidth_gbps,
+            Some("1671.7,722.2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_peer_announcement_v0_serializes_with_old_name() {
+        #[derive(Serialize)]
+        struct TestAnnouncement {
+            #[serde(
+                default,
+                rename = "gpu_bandwidth_gbps",
+                alias = "gpu_mem_bandwidth_gbps"
+            )]
+            gpu_mem_bandwidth_gbps: Option<String>,
+        }
+
+        let announcement = TestAnnouncement {
+            gpu_mem_bandwidth_gbps: Some("1671.7,722.2".to_string()),
         };
 
-        let json = serde_json::to_string(&test).unwrap();
-        let decoded: TestAnnouncement = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(decoded.gpu_bandwidth_gbps, Some("1671.7,722.2".to_string()));
+        let value = serde_json::to_value(&announcement).unwrap();
+        assert_eq!(
+            value.get("gpu_bandwidth_gbps").unwrap(),
+            &serde_json::json!("1671.7,722.2")
+        );
+        assert!(value.get("gpu_mem_bandwidth_gbps").is_none());
     }
 
     #[test]
     fn test_peer_announcement_backward_compat_no_bandwidth_field() {
-        #[derive(Deserialize, Debug)]
+        #[derive(Deserialize)]
         struct TestAnnouncement {
-            #[serde(default)]
-            gpu_bandwidth_gbps: Option<String>,
+            #[serde(
+                default,
+                rename = "gpu_bandwidth_gbps",
+                alias = "gpu_mem_bandwidth_gbps"
+            )]
+            gpu_mem_bandwidth_gbps: Option<String>,
         }
 
         let json = r#"{"other_field": "value"}"#;
         let decoded: TestAnnouncement = serde_json::from_str(json).unwrap();
 
-        assert_eq!(decoded.gpu_bandwidth_gbps, None);
+        assert_eq!(decoded.gpu_mem_bandwidth_gbps, None);
+    }
+
+    #[test]
+    fn test_peer_announcement_v0_gpu_compute_tflops_serde_roundtrip() {
+        let peer_id = EndpointId::from(SecretKey::from_bytes(&[0x21; 32]).public());
+        let ann = super::PeerAnnouncementV0 {
+            addr: EndpointAddr {
+                id: peer_id,
+                addrs: Default::default(),
+            },
+            role: super::NodeRole::Host { http_port: 9337 },
+            models: vec!["GLM".into()],
+            vram_bytes: 48_000_000_000,
+            model_source: Some("glm.gguf".into()),
+            serving: Some("GLM".into()),
+            serving_models: vec!["GLM".into()],
+            available_models: vec!["GLM".into()],
+            requested_models: vec![],
+            version: Some("0.54.0".into()),
+            model_demand: HashMap::new(),
+            mesh_id: Some("mesh-tflops".into()),
+            gpu_name: Some("NVIDIA A100".into()),
+            hostname: Some("worker-01".into()),
+            is_soc: Some(false),
+            gpu_vram: Some("51539607552".into()),
+            gpu_reserved_bytes: Some("1073741824".into()),
+            gpu_mem_bandwidth_gbps: Some("2039.4".into()),
+            gpu_compute_tflops_fp32: Some("19.49".into()),
+            gpu_compute_tflops_fp16: Some("38.98".into()),
+            available_model_sizes: HashMap::new(),
+            served_model_descriptors: vec![],
+            served_model_runtime: vec![],
+        };
+
+        let json = serde_json::to_string(&ann).unwrap();
+        let decoded: super::PeerAnnouncementV0 = serde_json::from_str(&json).unwrap();
+        let internal = decoded.into_internal();
+
+        assert_eq!(internal.gpu_reserved_bytes.as_deref(), Some("1073741824"));
+        assert_eq!(internal.gpu_compute_tflops_fp32.as_deref(), Some("19.49"));
+        assert_eq!(internal.gpu_compute_tflops_fp16.as_deref(), Some("38.98"));
+        assert_eq!(internal.gpu_mem_bandwidth_gbps.as_deref(), Some("2039.4"));
+    }
+
+    #[test]
+    fn test_peer_announcement_v0_backward_compat_no_tflops() {
+        let peer_id = EndpointId::from(SecretKey::from_bytes(&[0x22; 32]).public());
+        let mut value = serde_json::to_value(super::PeerAnnouncementV0 {
+            addr: EndpointAddr {
+                id: peer_id,
+                addrs: Default::default(),
+            },
+            role: super::NodeRole::Worker,
+            models: vec![],
+            vram_bytes: 0,
+            model_source: None,
+            serving: None,
+            serving_models: vec![],
+            available_models: vec![],
+            requested_models: vec![],
+            version: None,
+            model_demand: HashMap::new(),
+            mesh_id: None,
+            gpu_name: None,
+            hostname: None,
+            is_soc: None,
+            gpu_vram: None,
+            gpu_reserved_bytes: None,
+            gpu_mem_bandwidth_gbps: None,
+            gpu_compute_tflops_fp32: Some("15.75".into()),
+            gpu_compute_tflops_fp16: Some("31.50".into()),
+            available_model_sizes: HashMap::new(),
+            served_model_descriptors: vec![],
+            served_model_runtime: vec![],
+        })
+        .unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("gpu_compute_tflops_fp32");
+        object.remove("gpu_compute_tflops_fp16");
+
+        let decoded: super::PeerAnnouncementV0 = serde_json::from_value(value).unwrap();
+        let internal = decoded.into_internal();
+
+        assert_eq!(internal.gpu_compute_tflops_fp32, None);
+        assert_eq!(internal.gpu_compute_tflops_fp16, None);
+    }
+
+    #[test]
+    fn test_peer_announcement_v0_fp32_only_without_fp16() {
+        let peer_id = EndpointId::from(SecretKey::from_bytes(&[0x23; 32]).public());
+        let mut value = serde_json::to_value(super::PeerAnnouncementV0 {
+            addr: EndpointAddr {
+                id: peer_id,
+                addrs: Default::default(),
+            },
+            role: super::NodeRole::Worker,
+            models: vec![],
+            vram_bytes: 0,
+            model_source: None,
+            serving: None,
+            serving_models: vec![],
+            available_models: vec![],
+            requested_models: vec![],
+            version: None,
+            model_demand: HashMap::new(),
+            mesh_id: None,
+            gpu_name: None,
+            hostname: None,
+            is_soc: None,
+            gpu_vram: None,
+            gpu_reserved_bytes: None,
+            gpu_mem_bandwidth_gbps: None,
+            gpu_compute_tflops_fp32: Some("15.75".into()),
+            gpu_compute_tflops_fp16: Some("31.50".into()),
+            available_model_sizes: HashMap::new(),
+            served_model_descriptors: vec![],
+            served_model_runtime: vec![],
+        })
+        .unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("gpu_compute_tflops_fp16");
+
+        let decoded: super::PeerAnnouncementV0 = serde_json::from_value(value).unwrap();
+        let internal = decoded.into_internal();
+
+        assert_eq!(internal.gpu_compute_tflops_fp32.as_deref(), Some("15.75"));
+        assert_eq!(internal.gpu_compute_tflops_fp16, None);
     }
 
     fn make_valid_gossip_frame() -> GossipFrame {
@@ -5686,11 +6213,13 @@ mod tests {
             hostname: Some("legacy-peer".to_string()),
             is_soc: Some(false),
             gpu_vram: Some((48_u64 * 1024 * 1024 * 1024).to_string()),
-            gpu_bandwidth_gbps: None,
+            gpu_reserved_bytes: None,
+            gpu_mem_bandwidth_gbps: None,
+            gpu_compute_tflops_fp32: None,
+            gpu_compute_tflops_fp16: None,
             available_model_sizes: HashMap::new(),
             served_model_descriptors: vec![],
             served_model_runtime: vec![],
-            owner_id: None,
         };
         let legacy_route_table = RoutingTable {
             hosts: vec![RouteEntry {
@@ -5902,11 +6431,13 @@ mod tests {
             hostname: Some("worker-01".into()),
             is_soc: Some(false),
             gpu_vram: Some("51539607552".into()),
-            gpu_bandwidth_gbps: None,
+            gpu_reserved_bytes: None,
+            gpu_mem_bandwidth_gbps: None,
+            gpu_compute_tflops_fp32: None,
+            gpu_compute_tflops_fp16: None,
             available_model_sizes: HashMap::from([("Qwen".into(), 1234_u64)]),
             served_model_descriptors: vec![],
             served_model_runtime: vec![],
-            owner_id: None,
         };
         let json = serde_json::to_vec(&vec![ann.clone()]).unwrap();
 
@@ -5971,13 +6502,17 @@ mod tests {
             hostname: None,
             is_soc: None,
             gpu_vram: None,
-            gpu_bandwidth_gbps: None,
+            gpu_reserved_bytes: None,
+            gpu_mem_bandwidth_gbps: None,
+            gpu_compute_tflops_fp32: None,
+            gpu_compute_tflops_fp16: None,
             available_model_metadata: vec![],
             experts_summary: None,
             available_model_sizes: HashMap::new(),
             served_model_descriptors: vec![],
             served_model_runtime: vec![],
-            owner_id: None,
+            owner_attestation: None,
+            owner_summary: OwnershipSummary::default(),
         }
     }
 
@@ -6147,6 +6682,18 @@ mod tests {
             &peer,
             "Qwen3-Coder-Next-Q4_K_M"
         ));
+    }
+
+    #[test]
+    fn peer_meaningfully_changed_detects_reserved_bytes_updates() {
+        let peer_id = make_test_endpoint_id(12);
+        let mut old_peer = make_test_peer_info(peer_id);
+        let mut new_peer = old_peer.clone();
+
+        old_peer.gpu_reserved_bytes = Some("1000".to_string());
+        new_peer.gpu_reserved_bytes = Some("2000".to_string());
+
+        assert!(peer_meaningfully_changed(&old_peer, &new_peer));
     }
 
     #[test]
@@ -6441,7 +6988,10 @@ mod tests {
             hostname: Some("test-node".to_string()),
             is_soc: Some(true),
             gpu_vram: Some("128 GB".to_string()),
-            gpu_bandwidth_gbps: None,
+            gpu_reserved_bytes: None,
+            gpu_mem_bandwidth_gbps: None,
+            gpu_compute_tflops_fp32: None,
+            gpu_compute_tflops_fp16: None,
             available_model_metadata: vec![meta.clone()],
             experts_summary: Some(experts.clone()),
             available_model_sizes: model_sizes.clone(),
@@ -6466,7 +7016,7 @@ mod tests {
                 context_length: Some(32768),
                 ready: true,
             }],
-            owner_id: None,
+            owner_attestation: None,
         };
 
         let proto_pa = local_ann_to_proto_ann(&local_ann);
@@ -6677,13 +7227,16 @@ mod tests {
             hostname: None,
             is_soc: None,
             gpu_vram: None,
-            gpu_bandwidth_gbps: None,
+            gpu_reserved_bytes: None,
+            gpu_mem_bandwidth_gbps: None,
+            gpu_compute_tflops_fp32: None,
+            gpu_compute_tflops_fp16: None,
             available_model_metadata: vec![meta],
             experts_summary: None,
             available_model_sizes: new_sizes,
             served_model_descriptors: vec![],
             served_model_runtime: vec![],
-            owner_id: None,
+            owner_attestation: None,
         };
 
         apply_transitive_ann(&mut existing, &addr, &ann);
@@ -6745,13 +7298,16 @@ mod tests {
             hostname: None,
             is_soc: None,
             gpu_vram: None,
-            gpu_bandwidth_gbps: None,
+            gpu_reserved_bytes: None,
+            gpu_mem_bandwidth_gbps: None,
+            gpu_compute_tflops_fp32: None,
+            gpu_compute_tflops_fp16: None,
             available_model_metadata: vec![],
             experts_summary: None,
             available_model_sizes: HashMap::new(),
             served_model_descriptors: vec![],
             served_model_runtime: vec![],
-            owner_id: None,
+            owner_attestation: None,
         };
 
         apply_transitive_ann(&mut existing, &weak_addr, &ann);
@@ -6792,13 +7348,16 @@ mod tests {
             hostname: None,
             is_soc: None,
             gpu_vram: None,
-            gpu_bandwidth_gbps: None,
+            gpu_reserved_bytes: None,
+            gpu_mem_bandwidth_gbps: None,
+            gpu_compute_tflops_fp32: None,
+            gpu_compute_tflops_fp16: None,
             available_model_metadata: vec![],
             experts_summary: None,
             available_model_sizes: HashMap::new(),
             served_model_descriptors: vec![],
             served_model_runtime: vec![],
-            owner_id: None,
+            owner_attestation: None,
         };
         apply_transitive_ann(&mut existing, &richer_addr, &ann2);
 
@@ -7404,7 +7963,12 @@ mod tests {
 
         // Build PeerInfo as add_peer would, verify passive inventory metadata stays empty.
         let mut peers: HashMap<EndpointId, PeerInfo> = HashMap::new();
-        let peer_info = PeerInfo::from_announcement(peer_id, addr.clone(), &local_ann);
+        let peer_info = PeerInfo::from_announcement(
+            peer_id,
+            addr.clone(),
+            &local_ann,
+            OwnershipSummary::default(),
+        );
         peers.insert(peer_id, peer_info);
 
         let stored = peers.get(&peer_id).unwrap();
@@ -7509,6 +8073,32 @@ mod tests {
             "passive client must reject stale RouteTable: {:?}",
             err
         );
+    }
+
+    #[test]
+    fn worker_only_legacy_models_are_excluded_from_http_routes() {
+        let host_id = EndpointId::from(iroh::SecretKey::from_bytes(&[0xD2; 32]).public());
+        let worker_id = EndpointId::from(iroh::SecretKey::from_bytes(&[0xD3; 32]).public());
+
+        let mut legacy_host = make_test_peer_info(host_id);
+        legacy_host.role = super::NodeRole::Host { http_port: 9337 };
+        legacy_host.serving_models = vec!["legacy-host-model".to_string()];
+        legacy_host.hosted_models_known = false;
+
+        let mut legacy_worker = make_test_peer_info(worker_id);
+        legacy_worker.role = super::NodeRole::Worker;
+        legacy_worker.serving_models = vec!["worker-only-model".to_string()];
+        legacy_worker.hosted_models_known = false;
+
+        assert!(legacy_host.accepts_http_inference());
+        assert!(!legacy_worker.accepts_http_inference());
+        assert_eq!(
+            legacy_host.http_routable_models(),
+            vec!["legacy-host-model".to_string()]
+        );
+        assert!(legacy_host.routes_http_model("legacy-host-model"));
+        assert!(legacy_worker.http_routable_models().is_empty());
+        assert!(!legacy_worker.routes_http_model("worker-only-model"));
     }
 
     /// Verifies that dead-peer cleanup prevents re-admission: after a peer is cleaned
@@ -7777,11 +8367,13 @@ mod tests {
             hostname: None,
             is_soc: None,
             gpu_vram: None,
-            gpu_bandwidth_gbps: None,
+            gpu_reserved_bytes: None,
+            gpu_mem_bandwidth_gbps: None,
+            gpu_compute_tflops_fp32: None,
+            gpu_compute_tflops_fp16: None,
             available_model_sizes: HashMap::new(),
             served_model_descriptors: vec![],
             served_model_runtime: vec![],
-            owner_id: None,
         };
 
         let server = tokio::spawn(async move {
@@ -7964,11 +8556,13 @@ mod tests {
             hostname: None,
             is_soc: None,
             gpu_vram: None,
-            gpu_bandwidth_gbps: None,
+            gpu_reserved_bytes: None,
+            gpu_mem_bandwidth_gbps: None,
+            gpu_compute_tflops_fp32: None,
+            gpu_compute_tflops_fp16: None,
             available_model_sizes: HashMap::new(),
             served_model_descriptors: vec![],
             served_model_runtime: vec![],
-            owner_id: None,
         };
 
         let server = tokio::spawn(async move {
@@ -8173,11 +8767,13 @@ mod tests {
             hostname: None,
             is_soc: None,
             gpu_vram: None,
-            gpu_bandwidth_gbps: None,
+            gpu_reserved_bytes: None,
+            gpu_mem_bandwidth_gbps: None,
+            gpu_compute_tflops_fp32: None,
+            gpu_compute_tflops_fp16: None,
             available_model_sizes: HashMap::new(),
             served_model_descriptors: vec![],
             served_model_runtime: vec![],
-            owner_id: None,
         };
         let v0_gossip_json =
             serde_json::to_vec(&vec![v0_ann]).expect("v0 gossip JSON must serialize");
@@ -8390,14 +8986,18 @@ mod tests {
             hostname: None,
             is_soc: None,
             gpu_vram: None,
-            gpu_bandwidth_gbps: None,
+            gpu_reserved_bytes: None,
+            gpu_mem_bandwidth_gbps: None,
+            gpu_compute_tflops_fp32: None,
+            gpu_compute_tflops_fp16: None,
             available_model_metadata: vec![],
             experts_summary: None,
             tunnel_port: None,
             available_model_sizes: HashMap::new(),
             served_model_descriptors: vec![],
             served_model_runtime: vec![],
-            owner_id: None,
+            owner_attestation: None,
+            owner_summary: OwnershipSummary::default(),
         }
     }
 
@@ -8733,7 +9333,6 @@ mod tests {
         let snapshot = ConfigSnapshotResponse {
             gen: NODE_PROTOCOL_GENERATION,
             node_id: vec![0xAA; 32],
-            owner_id: "test-owner".to_string(),
             revision: 7,
             config_hash: vec![0xBB; 32],
             config: Some(NodeConfigSnapshot {
@@ -8755,7 +9354,6 @@ mod tests {
 
         assert_eq!(decoded.gen, NODE_PROTOCOL_GENERATION);
         assert_eq!(decoded.node_id, vec![0xAA; 32]);
-        assert_eq!(decoded.owner_id, "test-owner");
         assert_eq!(decoded.revision, 7);
         assert_eq!(decoded.config_hash, vec![0xBB; 32]);
         assert_eq!(decoded.hostname, Some("test-host".to_string()));
@@ -8787,12 +9385,10 @@ mod tests {
     fn config_sync_push_signature_payload_deterministic() {
         use crate::proto::node::{ConfigPush, NodeConfigSnapshot};
 
-        let (_, owner_id) = test_signing_key();
         let push = ConfigPush {
             gen: NODE_PROTOCOL_GENERATION,
             requester_id: vec![0xAA; 32],
             target_node_id: vec![0xBB; 32],
-            owner_id: owner_id.clone(),
             owner_signing_public_key: vec![0x42u8; 32],
             expected_revision: 3,
             config: Some(NodeConfigSnapshot {
@@ -8810,38 +9406,9 @@ mod tests {
         assert!(!p1.is_empty(), "payload must not be empty");
     }
 
-    #[test]
-    fn config_sync_push_wrong_owner_detected() {
-        use crate::proto::node::ConfigPush;
-
-        let (signing_key, real_owner_id) = test_signing_key();
-        let vk = signing_key.verifying_key();
-        let derived = crate::crypto::owner_id_from_verifying_key(&vk);
-
-        let push_owner_id = "some-other-owner-id".to_string();
-        assert_ne!(
-            push_owner_id, derived,
-            "test requires push.owner_id to differ from the derived owner_id"
-        );
-
-        let push = ConfigPush {
-            gen: NODE_PROTOCOL_GENERATION,
-            requester_id: vec![0xAA; 32],
-            target_node_id: vec![0xBB; 32],
-            owner_id: push_owner_id.clone(),
-            owner_signing_public_key: vk.to_bytes().to_vec(),
-            expected_revision: 0,
-            config: None,
-            signature: vec![0u8; 64],
-        };
-
-        let mismatch = derived != push.owner_id;
-        assert!(
-            mismatch,
-            "owner_id derived from public key ({derived}) must not match push.owner_id ({push_owner_id})"
-        );
-        let _ = real_owner_id;
-    }
+    // config_sync_push_wrong_owner_detected was removed: the `owner_id` field no longer
+    // exists in ConfigPush. Wrong-owner detection is now handled entirely through the
+    // gossip-attested peer identity check in handle_config_push.
 
     #[test]
     fn config_sync_push_bad_signature_bytes_length() {
@@ -8859,7 +9426,7 @@ mod tests {
 
     #[test]
     fn config_sync_push_roundtrip_encode_decode() {
-        use crate::proto::node::ConfigPushResponse;
+        use crate::proto::node::{ConfigApplyMode, ConfigPushResponse};
         use prost::Message as _;
 
         let response = ConfigPushResponse {
@@ -8868,7 +9435,7 @@ mod tests {
             current_revision: 42,
             config_hash: vec![0xCC; 32],
             error: None,
-            apply_mode: crate::proto::node::ConfigApplyMode::Staged as i32,
+            apply_mode: ConfigApplyMode::Staged as i32,
         };
 
         let encoded = response.encode_to_vec();
@@ -8880,10 +9447,7 @@ mod tests {
         assert_eq!(decoded.current_revision, 42);
         assert_eq!(decoded.config_hash, vec![0xCC; 32]);
         assert!(decoded.error.is_none());
-        assert_eq!(
-            decoded.apply_mode,
-            crate::proto::node::ConfigApplyMode::Staged as i32,
-        );
+        assert_eq!(decoded.apply_mode, ConfigApplyMode::Staged as i32);
     }
 
     #[test]
@@ -8898,7 +9462,6 @@ mod tests {
             gen: NODE_PROTOCOL_GENERATION,
             requester_id: vec![0xAA; 32],
             target_node_id: vec![0xBB; 32],
-            owner_id: owner_id.clone(),
             owner_signing_public_key: vk.to_bytes().to_vec(),
             expected_revision: 0,
             config: Some(NodeConfigSnapshot {
@@ -8932,13 +9495,10 @@ mod tests {
     fn config_sync_signature_payload_excludes_signature_field() {
         use crate::proto::node::{ConfigPush, NodeConfigSnapshot};
 
-        let (_, owner_id) = test_signing_key();
-
         let mut push = ConfigPush {
             gen: NODE_PROTOCOL_GENERATION,
             requester_id: vec![0xAA; 32],
             target_node_id: vec![0xBB; 32],
-            owner_id: owner_id.clone(),
             owner_signing_public_key: vec![0x42u8; 32],
             expected_revision: 0,
             config: Some(NodeConfigSnapshot {
@@ -8970,23 +9530,20 @@ mod tests {
         );
     }
 
-    /// Helper: create a test node that has a cached owner_id and a config_state
-    /// pointing to the given directory. The `signing_key` is used to derive the
-    /// owner fingerprint; it is NOT stored by the node (tests sign externally).
-    /// Create a test `Node` with a cached `owner_id` derived from `signing_key` and a
+    fn test_owner_keypair(signing_seed: u8, encryption_seed: u8) -> crate::crypto::OwnerKeypair {
+        crate::crypto::OwnerKeypair::from_bytes(&[signing_seed; 32], &[encryption_seed; 32])
+            .expect("test owner keypair must be valid")
+    }
+
+    /// Create a test `Node` with a verified local owner attestation and a
     /// `ConfigState` whose backing file lives in `config_dir`.
-    ///
-    /// The `signing_key` is used **only** to derive the owner fingerprint stored in
-    /// `cached_owner_id`; the node does not retain the key itself. Callers that need
-    /// to sign `ConfigPush` messages must hold on to `signing_key` themselves.
     async fn make_test_node_with_owner(
         role: super::NodeRole,
-        signing_key: &ed25519_dalek::SigningKey,
+        owner_keypair: &crate::crypto::OwnerKeypair,
         config_dir: &std::path::Path,
     ) -> Result<Node> {
         use iroh::endpoint::QuicTransportConfig;
 
-        let owner_id = crate::crypto::owner_id_from_verifying_key(&signing_key.verifying_key());
         let config_path = config_dir.join("config.toml");
         let config_state =
             crate::runtime::config_state::ConfigState::load(&config_path).unwrap_or_default();
@@ -9007,6 +9564,21 @@ mod tests {
         let (tunnel_tx, _tunnel_rx) = tokio::sync::mpsc::channel(8);
         let (tunnel_http_tx, _tunnel_http_rx) = tokio::sync::mpsc::channel(8);
         let revision = config_state.revision();
+        let owner_attestation = sign_node_ownership(
+            owner_keypair,
+            endpoint.id().as_bytes(),
+            current_time_unix_ms() + DEFAULT_NODE_CERT_LIFETIME_SECS * 1000,
+            None,
+            None,
+        )?;
+        let trust_store = TrustStore::default();
+        let owner_summary = verify_node_ownership(
+            Some(&owner_attestation),
+            endpoint.id().as_bytes(),
+            &trust_store,
+            TrustPolicy::Off,
+            current_time_unix_ms(),
+        );
 
         let node = Node {
             endpoint,
@@ -9018,6 +9590,7 @@ mod tests {
                 dead_peers: HashSet::new(),
                 seen_plugin_messages: HashSet::new(),
                 seen_plugin_message_order: VecDeque::new(),
+                policy_rejected_peers: HashMap::new(),
             })),
             role: Arc::new(Mutex::new(role)),
             models: Arc::new(Mutex::new(Vec::new())),
@@ -9044,18 +9617,24 @@ mod tests {
             tunnel_http_tx,
             plugin_manager: Arc::new(Mutex::new(None)),
             display_name: Arc::new(Mutex::new(None)),
+            owner_attestation: Arc::new(Mutex::new(Some(owner_attestation))),
+            owner_summary: Arc::new(Mutex::new(owner_summary)),
+            trust_store: Arc::new(Mutex::new(trust_store)),
+            trust_policy: TrustPolicy::Off,
             enumerate_host: false,
             gpu_name: None,
             hostname: None,
             is_soc: None,
             gpu_vram: None,
-            gpu_bandwidth_gbps: Arc::new(tokio::sync::Mutex::new(None)),
+            gpu_reserved_bytes: None,
+            gpu_mem_bandwidth_gbps: Arc::new(tokio::sync::Mutex::new(None)),
+            gpu_compute_tflops_fp32: Arc::new(tokio::sync::Mutex::new(None)),
+            gpu_compute_tflops_fp16: Arc::new(tokio::sync::Mutex::new(None)),
             config_state: Arc::new(tokio::sync::Mutex::new(config_state)),
             config_revision_tx: {
                 let (tx, _rx) = tokio::sync::watch::channel(revision);
                 Arc::new(tx)
             },
-            cached_owner_id: Some(owner_id),
         };
 
         let accept_node = node.clone();
@@ -9073,7 +9652,7 @@ mod tests {
     /// and carries `expected_revision` for CAS enforcement. The signature covers the
     /// canonical protobuf encoding of the push with the `signature` field cleared.
     fn build_signed_config_push(
-        signing_key: &ed25519_dalek::SigningKey,
+        owner_keypair: &crate::crypto::OwnerKeypair,
         requester_id: &EndpointId,
         target_node_id: &EndpointId,
         expected_revision: u64,
@@ -9081,21 +9660,19 @@ mod tests {
     ) -> crate::proto::node::ConfigPush {
         use ed25519_dalek::Signer as _;
 
-        let vk = signing_key.verifying_key();
-        let owner_id = crate::crypto::owner_id_from_verifying_key(&vk);
+        let vk = owner_keypair.signing.verifying_key();
 
         let mut push = crate::proto::node::ConfigPush {
             gen: NODE_PROTOCOL_GENERATION,
             requester_id: requester_id.as_bytes().to_vec(),
             target_node_id: target_node_id.as_bytes().to_vec(),
-            owner_id,
             owner_signing_public_key: vk.to_bytes().to_vec(),
             expected_revision,
             config: Some(config),
             signature: vec![0u8; 64],
         };
         let payload = config_push_signature_payload(&push);
-        let sig = signing_key.sign(&payload);
+        let sig = owner_keypair.signing.sign(&payload);
         push.signature = sig.to_bytes().to_vec();
         push
     }
@@ -9119,8 +9696,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn config_subscribe_matching_owner_receives_snapshot() -> Result<()> {
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x11u8; 32]);
-        let owner_id = crate::crypto::owner_id_from_verifying_key(&signing_key.verifying_key());
+        let owner_keypair = test_owner_keypair(0x11, 0x12);
 
         let tmp = std::env::temp_dir().join(format!("mesh-llm-cfg-sub-{}", rand::random::<u64>()));
         std::fs::create_dir_all(tmp.join("server")).ok();
@@ -9128,12 +9704,12 @@ mod tests {
 
         let server = make_test_node_with_owner(
             super::NodeRole::Host { http_port: 9337 },
-            &signing_key,
+            &owner_keypair,
             &tmp.join("server"),
         )
         .await?;
         let client =
-            make_test_node_with_owner(super::NodeRole::Worker, &signing_key, &tmp.join("client"))
+            make_test_node_with_owner(super::NodeRole::Worker, &owner_keypair, &tmp.join("client"))
                 .await?;
 
         server
@@ -9163,12 +9739,8 @@ mod tests {
                 .expect("connection to server must exist after join")
         };
 
-        let (snapshot, _notif_rx) = client.subscribe_to_config(&conn, &owner_id).await?;
+        let (snapshot, _notif_rx) = client.subscribe_to_config(&conn).await?;
 
-        assert_eq!(
-            snapshot.owner_id, owner_id,
-            "snapshot owner_id must match the server's owner"
-        );
         assert_eq!(
             snapshot.node_id,
             server_id.as_bytes().to_vec(),
@@ -9194,10 +9766,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn config_subscribe_wrong_owner_returns_error() -> Result<()> {
-        let server_key = ed25519_dalek::SigningKey::from_bytes(&[0x22u8; 32]);
-        let client_key = ed25519_dalek::SigningKey::from_bytes(&[0x33u8; 32]);
-        let client_owner_id =
-            crate::crypto::owner_id_from_verifying_key(&client_key.verifying_key());
+        let server_owner = test_owner_keypair(0x22, 0x23);
+        let client_owner = test_owner_keypair(0x33, 0x34);
 
         let tmp =
             std::env::temp_dir().join(format!("mesh-llm-cfg-wrong-{}", rand::random::<u64>()));
@@ -9206,12 +9776,12 @@ mod tests {
 
         let server = make_test_node_with_owner(
             super::NodeRole::Host { http_port: 9337 },
-            &server_key,
+            &server_owner,
             &tmp.join("server"),
         )
         .await?;
         let client =
-            make_test_node_with_owner(super::NodeRole::Worker, &client_key, &tmp.join("client"))
+            make_test_node_with_owner(super::NodeRole::Worker, &client_owner, &tmp.join("client"))
                 .await?;
 
         server
@@ -9241,8 +9811,8 @@ mod tests {
                 .expect("connection to server must exist after join")
         };
 
-        // Subscribe with client's own owner_id, which differs from the server's
-        let result = client.subscribe_to_config(&conn, &client_owner_id).await;
+        // Subscribe - the subscriber's attested owner doesn't match the server's owner
+        let result = client.subscribe_to_config(&conn).await;
         assert!(
             result.is_err(),
             "subscribing with wrong owner_id must return an error"
@@ -9259,9 +9829,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn config_subscribe_unowned_node_returns_error() -> Result<()> {
-        let client_key = ed25519_dalek::SigningKey::from_bytes(&[0x44u8; 32]);
-        let client_owner_id =
-            crate::crypto::owner_id_from_verifying_key(&client_key.verifying_key());
+        let client_owner = test_owner_keypair(0x44, 0x45);
 
         let tmp =
             std::env::temp_dir().join(format!("mesh-llm-cfg-unowned-{}", rand::random::<u64>()));
@@ -9270,7 +9838,7 @@ mod tests {
         // server has NO owner key (make_test_node, not make_test_node_with_owner)
         let server = make_test_node(super::NodeRole::Host { http_port: 9337 }).await?;
         let client =
-            make_test_node_with_owner(super::NodeRole::Worker, &client_key, &tmp.join("client"))
+            make_test_node_with_owner(super::NodeRole::Worker, &client_owner, &tmp.join("client"))
                 .await?;
 
         server.set_mesh_id("cfg-unowned-mesh-01".to_string()).await;
@@ -9296,7 +9864,7 @@ mod tests {
                 .expect("connection to server must exist after join")
         };
 
-        let result = client.subscribe_to_config(&conn, &client_owner_id).await;
+        let result = client.subscribe_to_config(&conn).await;
         assert!(
             result.is_err(),
             "subscribing to an unowned node must return an error"
@@ -9317,7 +9885,7 @@ mod tests {
         use crate::protocol::write_len_prefixed;
         use prost::Message as _;
 
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x55u8; 32]);
+        let owner_keypair = test_owner_keypair(0x55, 0x56);
 
         let tmp =
             std::env::temp_dir().join(format!("mesh-llm-cfg-push-ok-{}", rand::random::<u64>()));
@@ -9326,12 +9894,12 @@ mod tests {
 
         let server = make_test_node_with_owner(
             super::NodeRole::Host { http_port: 9337 },
-            &signing_key,
+            &owner_keypair,
             &tmp.join("server"),
         )
         .await?;
         let client =
-            make_test_node_with_owner(super::NodeRole::Worker, &signing_key, &tmp.join("client"))
+            make_test_node_with_owner(super::NodeRole::Worker, &owner_keypair, &tmp.join("client"))
                 .await?;
 
         server.set_mesh_id("cfg-push-ok-mesh-01".to_string()).await;
@@ -9367,7 +9935,7 @@ mod tests {
             plugins: vec![],
         };
 
-        let push = build_signed_config_push(&signing_key, &client_id, &server_id, 0, new_config);
+        let push = build_signed_config_push(&owner_keypair, &client_id, &server_id, 0, new_config);
 
         let (mut send, mut recv) = conn.open_bi().await?;
         send.write_all(&[STREAM_CONFIG_PUSH]).await?;
@@ -9394,7 +9962,7 @@ mod tests {
         assert_eq!(
             response.apply_mode,
             crate::proto::node::ConfigApplyMode::Staged as i32,
-            "config must be staged to disk"
+            "config push should report staged apply mode"
         );
 
         std::fs::remove_dir_all(&tmp).ok();
@@ -9407,7 +9975,7 @@ mod tests {
         use crate::protocol::write_len_prefixed;
         use prost::Message as _;
 
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x66u8; 32]);
+        let owner_keypair = test_owner_keypair(0x66, 0x67);
 
         let tmp =
             std::env::temp_dir().join(format!("mesh-llm-cfg-conflict-{}", rand::random::<u64>()));
@@ -9416,12 +9984,12 @@ mod tests {
 
         let server = make_test_node_with_owner(
             super::NodeRole::Host { http_port: 9337 },
-            &signing_key,
+            &owner_keypair,
             &tmp.join("server"),
         )
         .await?;
         let client =
-            make_test_node_with_owner(super::NodeRole::Worker, &signing_key, &tmp.join("client"))
+            make_test_node_with_owner(super::NodeRole::Worker, &owner_keypair, &tmp.join("client"))
                 .await?;
 
         server.set_mesh_id("cfg-conflict-mesh-01".to_string()).await;
@@ -9458,8 +10026,13 @@ mod tests {
         };
 
         // First push (revision 0 → 1) — must succeed
-        let push1 =
-            build_signed_config_push(&signing_key, &client_id, &server_id, 0, good_config.clone());
+        let push1 = build_signed_config_push(
+            &owner_keypair,
+            &client_id,
+            &server_id,
+            0,
+            good_config.clone(),
+        );
         let (mut send1, mut recv1) = conn.open_bi().await?;
         send1.write_all(&[STREAM_CONFIG_PUSH]).await?;
         write_len_prefixed(&mut send1, &push1.encode_to_vec()).await?;
@@ -9469,7 +10042,8 @@ mod tests {
         assert!(resp1.success, "first push must succeed: {:?}", resp1.error);
 
         // Second push with stale expected_revision=0 — must be rejected
-        let push2 = build_signed_config_push(&signing_key, &client_id, &server_id, 0, good_config);
+        let push2 =
+            build_signed_config_push(&owner_keypair, &client_id, &server_id, 0, good_config);
         let (mut send2, mut recv2) = conn.open_bi().await?;
         send2.write_all(&[STREAM_CONFIG_PUSH]).await?;
         write_len_prefixed(&mut send2, &push2.encode_to_vec()).await?;
@@ -9498,7 +10072,7 @@ mod tests {
         use crate::protocol::write_len_prefixed;
         use prost::Message as _;
 
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x77u8; 32]);
+        let owner_keypair = test_owner_keypair(0x77, 0x78);
 
         let tmp =
             std::env::temp_dir().join(format!("mesh-llm-cfg-badsig-{}", rand::random::<u64>()));
@@ -9507,12 +10081,12 @@ mod tests {
 
         let server = make_test_node_with_owner(
             super::NodeRole::Host { http_port: 9337 },
-            &signing_key,
+            &owner_keypair,
             &tmp.join("server"),
         )
         .await?;
         let client =
-            make_test_node_with_owner(super::NodeRole::Worker, &signing_key, &tmp.join("client"))
+            make_test_node_with_owner(super::NodeRole::Worker, &owner_keypair, &tmp.join("client"))
                 .await?;
 
         server.set_mesh_id("cfg-badsig-mesh-01".to_string()).await;
@@ -9549,7 +10123,7 @@ mod tests {
         };
 
         // Build a push but corrupt the signature
-        let mut push = build_signed_config_push(&signing_key, &client_id, &server_id, 0, config);
+        let mut push = build_signed_config_push(&owner_keypair, &client_id, &server_id, 0, config);
         push.signature = vec![0xDE; 64]; // garbage signature
 
         let (mut send, mut recv) = conn.open_bi().await?;
@@ -9580,8 +10154,7 @@ mod tests {
         use crate::protocol::write_len_prefixed;
         use prost::Message as _;
 
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x88u8; 32]);
-        let owner_id = crate::crypto::owner_id_from_verifying_key(&signing_key.verifying_key());
+        let owner_keypair = test_owner_keypair(0x88, 0x89);
 
         let tmp =
             std::env::temp_dir().join(format!("mesh-llm-cfg-notif-{}", rand::random::<u64>()));
@@ -9590,12 +10163,12 @@ mod tests {
 
         let server = make_test_node_with_owner(
             super::NodeRole::Host { http_port: 9337 },
-            &signing_key,
+            &owner_keypair,
             &tmp.join("server"),
         )
         .await?;
         let client =
-            make_test_node_with_owner(super::NodeRole::Worker, &signing_key, &tmp.join("client"))
+            make_test_node_with_owner(super::NodeRole::Worker, &owner_keypair, &tmp.join("client"))
                 .await?;
 
         server.set_mesh_id("cfg-notif-mesh-01".to_string()).await;
@@ -9623,7 +10196,7 @@ mod tests {
         };
 
         // Subscribe to config on the server from the client
-        let (initial_snapshot, mut notif_rx) = client.subscribe_to_config(&conn, &owner_id).await?;
+        let (initial_snapshot, mut notif_rx) = client.subscribe_to_config(&conn).await?;
         let initial_revision = initial_snapshot.revision;
 
         // Now push a config change to the server from the client
@@ -9640,7 +10213,7 @@ mod tests {
             plugins: vec![],
         };
         let push = build_signed_config_push(
-            &signing_key,
+            &owner_keypair,
             &client_id,
             &server_id,
             initial_revision,
@@ -9803,42 +10376,60 @@ pub fn clear_public_identity() {
 
 /// Load secret key from ~/.mesh-llm/key, or create a new one and save it.
 async fn load_or_create_key() -> Result<SecretKey> {
-    let home =
-        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
-    load_or_create_key_at(&home.join(".mesh-llm")).await
+    let key_path = default_node_key_path()?;
+    let dir = key_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Invalid node key path {}", key_path.display()))?;
+    ensure_private_node_key_dir(dir)?;
+
+    if key_path.exists() {
+        ensure_private_node_key_file(&key_path)?;
+        let hex = tokio::fs::read_to_string(&key_path).await?;
+        let bytes = hex::decode(hex.trim())?;
+        if bytes.len() != 32 {
+            anyhow::bail!("Invalid key length in {}", key_path.display());
+        }
+        let key = SecretKey::from_bytes(&bytes.try_into().unwrap());
+        tracing::info!("Loaded key from {}", key_path.display());
+        return Ok(key);
+    }
+
+    let key = SecretKey::generate(&mut rand::rng());
+    save_node_key_to_path(&key_path, &key)?;
+    tracing::info!("Generated new key, saved to {}", key_path.display());
+    Ok(key)
 }
 
-async fn load_or_create_key_at(dir: &std::path::Path) -> Result<SecretKey> {
-    let dir = dir.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        ensure_private_identity_dir(&dir)?;
-        let key_path = dir.join("key");
+pub fn default_node_key_path() -> Result<std::path::PathBuf> {
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
+    Ok(home.join(".mesh-llm").join("key"))
+}
 
-        if key_path.exists() {
-            ensure_private_identity_file(&key_path)?;
-            let hex = std::fs::read_to_string(&key_path)?;
-            let bytes = hex::decode(hex.trim())?;
-            if bytes.len() != 32 {
-                anyhow::bail!("Invalid key length in {}", key_path.display());
-            }
-            let key = SecretKey::from_bytes(&bytes.try_into().unwrap());
-            tracing::info!("Loaded key from {}", key_path.display());
-            return Ok(key);
-        }
+pub fn load_node_key_from_path(path: &std::path::Path) -> Result<SecretKey> {
+    let hex = std::fs::read_to_string(path)?;
+    let bytes = hex::decode(hex.trim())?;
+    if bytes.len() != 32 {
+        anyhow::bail!("Invalid key length in {}", path.display());
+    }
+    Ok(SecretKey::from_bytes(&bytes.try_into().unwrap()))
+}
 
-        let key = SecretKey::generate(&mut rand::rng());
-        crate::crypto::write_keystore_bytes_atomically(
-            &key_path,
-            hex::encode(key.to_bytes()).as_bytes(),
-        )?;
-        tracing::info!("Generated new key, saved to {}", key_path.display());
-        Ok(key)
-    })
-    .await?
+pub fn save_node_key_to_path(path: &std::path::Path, key: &SecretKey) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Invalid node key path {}", path.display()))?;
+    ensure_private_node_key_dir(parent)?;
+    if path.exists() {
+        ensure_private_node_key_file(path)?;
+    }
+    crate::crypto::write_keystore_bytes_atomically(path, hex::encode(key.to_bytes()).as_bytes())?;
+    ensure_private_node_key_file(path)?;
+    Ok(())
 }
 
 #[cfg(unix)]
-fn ensure_private_identity_dir(dir: &std::path::Path) -> Result<()> {
+fn ensure_private_node_key_dir(dir: &std::path::Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     std::fs::create_dir_all(dir)?;
@@ -9852,18 +10443,18 @@ fn ensure_private_identity_dir(dir: &std::path::Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn ensure_private_identity_dir(dir: &std::path::Path) -> Result<()> {
+fn ensure_private_node_key_dir(dir: &std::path::Path) -> Result<()> {
     std::fs::create_dir_all(dir)?;
     Ok(())
 }
 
 #[cfg(unix)]
-fn ensure_private_identity_file(path: &std::path::Path) -> Result<()> {
+fn ensure_private_node_key_file(path: &std::path::Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     let metadata = std::fs::symlink_metadata(path)?;
     if !metadata.file_type().is_file() {
-        anyhow::bail!("Identity key path is not a regular file");
+        anyhow::bail!("Node key path is not a regular file");
     }
     let mut perms = metadata.permissions();
     if perms.mode() & 0o077 != 0 {
@@ -9874,77 +10465,12 @@ fn ensure_private_identity_file(path: &std::path::Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn ensure_private_identity_file(_path: &std::path::Path) -> Result<()> {
+fn ensure_private_node_key_file(path: &std::path::Path) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        anyhow::bail!("Node key path is not a regular file");
+    }
     Ok(())
-}
-
-#[cfg(test)]
-mod private_key_tests {
-    use super::*;
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn temp_mesh_dir(prefix: &str) -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!("{prefix}-{unique}"))
-    }
-
-    #[tokio::test]
-    async fn load_or_create_key_at_round_trips_key_material() {
-        let dir = temp_mesh_dir("mesh-llm-node-key");
-        let key = load_or_create_key_at(&dir).await.unwrap();
-        let loaded = load_or_create_key_at(&dir).await.unwrap();
-        assert_eq!(key.to_bytes(), loaded.to_bytes());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn load_or_create_key_at_hardens_existing_permissions() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = temp_mesh_dir("mesh-llm-node-key-perms");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let key_path = dir.join("key");
-        std::fs::write(&key_path, hex::encode([7u8; 32])).unwrap();
-        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644)).unwrap();
-
-        let key = load_or_create_key_at(&dir).await.unwrap();
-        assert_eq!(key.to_bytes(), [7u8; 32]);
-        assert_eq!(
-            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
-            0o700
-        );
-        assert_eq!(
-            std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn load_or_create_key_at_rejects_symlink_key() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = temp_mesh_dir("mesh-llm-node-key-symlink");
-        std::fs::create_dir_all(&dir).unwrap();
-        let key_path = dir.join("key");
-        let real_file = dir.join("key.real");
-        std::fs::write(&real_file, hex::encode([7u8; 32])).unwrap();
-        std::fs::set_permissions(&real_file, std::fs::Permissions::from_mode(0o600)).unwrap();
-        std::os::unix::fs::symlink(&real_file, &key_path).unwrap();
-
-        let result = load_or_create_key_at(&dir).await;
-        assert!(result.is_err(), "expected error for symlinked key file");
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 }
 
 #[cfg(test)]
