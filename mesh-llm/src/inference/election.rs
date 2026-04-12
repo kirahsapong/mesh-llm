@@ -106,6 +106,100 @@ pub fn should_be_host_for_model(
     true
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DenseLaunchPlan {
+    Solo,
+    Split {
+        worker_ids: Vec<iroh::EndpointId>,
+        total_group_vram: u64,
+    },
+    WaitingForCapacity {
+        worker_ids: Vec<iroh::EndpointId>,
+        total_group_vram: u64,
+        min_vram: u64,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DenseRunningPlan {
+    Solo,
+    Split { worker_ids: Vec<iroh::EndpointId> },
+}
+
+impl DenseLaunchPlan {
+    fn running_plan(&self) -> Option<DenseRunningPlan> {
+        match self {
+            DenseLaunchPlan::Solo => Some(DenseRunningPlan::Solo),
+            DenseLaunchPlan::Split { worker_ids, .. } => Some(DenseRunningPlan::Split {
+                worker_ids: worker_ids.clone(),
+            }),
+            DenseLaunchPlan::WaitingForCapacity { .. } => None,
+        }
+    }
+}
+
+fn split_peer_vram_bytes(peer: &mesh::PeerInfo, my_vram: u64) -> u64 {
+    if peer.vram_bytes > 0 {
+        peer.vram_bytes
+    } else {
+        my_vram
+    }
+}
+
+fn build_dense_launch_plan(
+    my_vram: u64,
+    model_bytes: u64,
+    force_split: bool,
+    model_name: &str,
+    model_peers: &[mesh::PeerInfo],
+) -> DenseLaunchPlan {
+    let min_vram = (model_bytes as f64 * 1.1) as u64;
+    if !force_split && my_vram >= min_vram {
+        return DenseLaunchPlan::Solo;
+    }
+
+    let mut candidates: Vec<_> = model_peers
+        .iter()
+        .filter(|p| matches!(p.role, NodeRole::Worker) || p.is_assigned_model(model_name))
+        .filter(|p| !matches!(p.role, NodeRole::Client))
+        .filter(|p| !matches!(p.rtt_ms, Some(rtt) if rtt > mesh::MAX_SPLIT_RTT_MS))
+        .collect();
+    candidates.sort_by_key(|p| (p.rtt_ms.unwrap_or(u32::MAX), p.id));
+
+    let mut total_group_vram = my_vram;
+    let mut worker_ids = Vec::new();
+    for peer in candidates {
+        if total_group_vram >= min_vram && !(force_split && worker_ids.is_empty()) {
+            break;
+        }
+        total_group_vram += split_peer_vram_bytes(peer, my_vram);
+        worker_ids.push(peer.id);
+    }
+
+    if total_group_vram >= min_vram && (!force_split || !worker_ids.is_empty()) {
+        DenseLaunchPlan::Split {
+            worker_ids,
+            total_group_vram,
+        }
+    } else {
+        DenseLaunchPlan::WaitingForCapacity {
+            worker_ids,
+            total_group_vram,
+            min_vram,
+        }
+    }
+}
+
+fn rpc_ports_for_worker_ids(
+    all_ports: &HashMap<iroh::EndpointId, u16>,
+    worker_ids: &[iroh::EndpointId],
+) -> Option<Vec<u16>> {
+    worker_ids
+        .iter()
+        .map(|id| all_ports.get(id).copied())
+        .collect()
+}
+
 /// The current state of llama-server as managed by the election loop.
 /// The API proxy reads this to know where to forward requests.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -1180,8 +1274,8 @@ pub async fn election_loop(
 ) {
     let mut peer_rx = node.peer_change_rx.clone();
 
-    // Track the set of model-group worker IDs to detect when we actually need to restart
-    let mut last_worker_set: Vec<iroh::EndpointId> = vec![];
+    // Track the actual running launch topology so we only restart on real split changes.
+    let mut last_running_plan: Option<DenseRunningPlan> = None;
     let mut currently_host = false;
     let mut current_local_port: Option<u16> = None;
     let mut llama_process: Option<launch::InferenceServerProcess> = None;
@@ -1286,14 +1380,16 @@ pub async fn election_loop(
             .filter(|p| p.is_assigned_model(&model_name))
             .cloned()
             .collect();
+        let desired_launch =
+            build_dense_launch_plan(my_vram, model_bytes, force_split, &model_name, &model_peers);
 
         // Splitting decision: only split when forced OR when the model
         // genuinely doesn't fit on this node alone. If it fits, every
         // node serving this model runs its own independent llama-server
         // (no election needed — everyone is a host).
-        let need_split = force_split || !model_fits_locally;
+        let requires_split = force_split || !model_fits_locally;
 
-        let i_am_host = if need_split {
+        let i_am_host = if requires_split {
             // Distributed mode: elect one host from the model group
             should_be_host_for_model(node.id(), my_vram, &model_peers)
         } else if model_peers.is_empty() {
@@ -1335,27 +1431,8 @@ pub async fn election_loop(
             should_dup
         };
 
-        // Compute the worker set (only relevant in split mode).
-        // Only include RTT-eligible peers so that when a peer's RTT drops
-        // below the split threshold (e.g. relay → direct), the worker set
-        // changes and triggers a restart with --rpc.
-        let mut new_worker_set: Vec<iroh::EndpointId> = if need_split {
-            model_peers
-                .iter()
-                .filter(|p| !matches!(p.role, NodeRole::Client))
-                .filter(|p| match p.rtt_ms {
-                    Some(rtt) if rtt > mesh::MAX_SPLIT_RTT_MS => false,
-                    _ => true,
-                })
-                .map(|p| p.id)
-                .collect()
-        } else {
-            vec![] // solo mode — no workers
-        };
-        new_worker_set.sort();
-
         // If we're already host and nothing changed, skip restart
-        if currently_host && i_am_host && new_worker_set == last_worker_set {
+        if currently_host && i_am_host && desired_launch.running_plan() == last_running_plan {
             // Just update the target map (in case other models' hosts changed)
             if let Some(local_port) = current_local_port {
                 update_targets(
@@ -1385,6 +1462,7 @@ pub async fn election_loop(
                     llama_process = None;
                     currently_host = false;
                     current_local_port = None;
+                    last_running_plan = None;
                     update_targets(&node, &model_name, InferenceTarget::None, &target_tx).await;
                     on_process(None);
                     on_change(false, false);
@@ -1407,6 +1485,7 @@ pub async fn election_loop(
             tunnel_mgr.set_http_port(0);
             node.set_role(NodeRole::Worker).await;
             current_local_port = None;
+            last_running_plan = None;
             update_targets(&node, &model_name, InferenceTarget::None, &target_tx).await;
             on_process(None);
             on_change(false, false);
@@ -1418,52 +1497,49 @@ pub async fn election_loop(
         }
 
         if i_am_host {
-            if need_split {
-                // Distributed mode: check total group VRAM
-                let peer_vram: u64 = model_peers
-                    .iter()
-                    .filter(|p| !matches!(p.role, NodeRole::Client))
-                    .map(|p| p.vram_bytes)
-                    .sum();
-                let total_vram = my_vram + peer_vram;
-                let min_vram = (model_bytes as f64 * 1.1) as u64;
-
-                if total_vram < min_vram {
+            match &desired_launch {
+                DenseLaunchPlan::WaitingForCapacity {
+                    total_group_vram,
+                    min_vram,
+                    ..
+                } => {
                     eprintln!(
-                        "⏳ [{}] Waiting for more peers — need {:.1}GB capacity, have {:.1}GB",
+                        "⏳ [{}] Waiting for more peers — need {:.1}GB capacity, have {:.1}GB across eligible split workers",
                         model_name,
-                        min_vram as f64 / 1e9,
-                        total_vram as f64 / 1e9
+                        *min_vram as f64 / 1e9,
+                        *total_group_vram as f64 / 1e9
                     );
                     update_targets(&node, &model_name, InferenceTarget::None, &target_tx).await;
                     on_change(false, false);
-                    last_worker_set = new_worker_set;
                     if peer_rx.changed().await.is_err() {
                         break;
                     }
                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                     continue;
                 }
-
-                eprintln!(
-                    "🗳 [{}] Elected as host ({:.1}GB capacity for {:.1}GB model, {} node(s), split)",
-                    model_name,
-                    total_vram as f64 / 1e9,
-                    model_bytes as f64 / 1e9,
-                    model_peers.len() + 1
-                );
-            } else {
-                eprintln!(
-                    "🗳 [{}] Running as host ({:.1}GB capacity for {:.1}GB model, serving entirely)",
-                    model_name,
-                    my_vram as f64 / 1e9,
-                    model_bytes as f64 / 1e9
-                );
+                DenseLaunchPlan::Split {
+                    total_group_vram,
+                    worker_ids,
+                } => {
+                    eprintln!(
+                        "🗳 [{}] Elected as host ({:.1}GB capacity for {:.1}GB model, {} node(s), split)",
+                        model_name,
+                        *total_group_vram as f64 / 1e9,
+                        model_bytes as f64 / 1e9,
+                        worker_ids.len() + 1
+                    );
+                }
+                DenseLaunchPlan::Solo => {
+                    eprintln!(
+                        "🗳 [{}] Running as host ({:.1}GB capacity for {:.1}GB model, serving entirely)",
+                        model_name,
+                        my_vram as f64 / 1e9,
+                        model_bytes as f64 / 1e9
+                    );
+                }
             }
             on_change(true, false);
 
-            // In solo mode, pass empty model_peers so start_llama won't use any workers
-            let peers_for_launch = if need_split { &model_peers[..] } else { &[] };
             let (llama_port, process) = match start_llama(
                 &runtime,
                 &node,
@@ -1472,11 +1548,11 @@ pub async fn election_loop(
                 &bin_dir,
                 &model,
                 &model_name,
-                peers_for_launch,
+                &model_peers,
+                &desired_launch,
                 explicit_mmproj.as_deref(),
                 draft.as_deref(),
                 draft_max,
-                force_split,
                 binary_flavor,
                 ctx_size_override,
             )
@@ -1485,7 +1561,6 @@ pub async fn election_loop(
                 Some((port, death_rx)) => (port, death_rx),
                 None => {
                     on_change(true, false);
-                    last_worker_set = new_worker_set;
                     let _ = peer_rx.changed().await;
                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                     continue;
@@ -1502,7 +1577,7 @@ pub async fn election_loop(
             tunnel_mgr.set_http_port(llama_port);
             currently_host = true;
             current_local_port = Some(llama_port);
-            last_worker_set = new_worker_set;
+            last_running_plan = desired_launch.running_plan();
             // Re-gossip so peers learn we're the host for this model
             node.regossip().await;
             update_targets(
@@ -1530,7 +1605,7 @@ pub async fn election_loop(
             // We're a worker in split mode. Find who the host is.
             node.set_role(NodeRole::Worker).await;
             currently_host = false;
-            last_worker_set = new_worker_set;
+            last_running_plan = None;
 
             let host_peer = model_peers
                 .iter()
@@ -1576,6 +1651,8 @@ pub async fn election_loop(
                 eprintln!("🔄 [{}] llama-server died — restarting...", model_name);
                 llama_process = None;
                 currently_host = false;
+                current_local_port = None;
+                last_running_plan = None;
                 update_targets(&node, &model_name, InferenceTarget::None, &target_tx).await;
                 on_change(false, false);
             }
@@ -2293,89 +2370,50 @@ async fn start_llama(
     model: &Path,
     model_name: &str,
     model_peers: &[mesh::PeerInfo],
+    launch_plan: &DenseLaunchPlan,
     explicit_mmproj: Option<&Path>,
     draft: Option<&Path>,
     draft_max: u16,
-    force_split: bool,
     binary_flavor: Option<launch::BinaryFlavor>,
     ctx_size_override: Option<u32>,
 ) -> Option<(u16, launch::InferenceServerProcess)> {
     let my_vram = node.vram_bytes();
     let model_bytes = total_model_bytes(model);
-    let min_vram = (model_bytes as f64 * 1.1) as u64;
-
-    // Decide whether to split: only if model doesn't fit on host alone, or --split forced
-    let need_split = force_split || my_vram < min_vram;
-
-    // Only use workers from our model group, preferring lowest-latency peers.
-    // Take just enough to cover the VRAM shortfall, sorted by RTT.
-    let worker_ids: Vec<_> = if need_split {
-        let mut candidates: Vec<_> = model_peers
-            .iter()
-            .filter(|p| matches!(p.role, NodeRole::Worker) || p.is_assigned_model(model_name))
-            .filter(|p| !matches!(p.role, NodeRole::Client))
-            .filter(|p| match p.rtt_ms {
-                Some(rtt) if rtt > mesh::MAX_SPLIT_RTT_MS => {
-                    eprintln!(
-                        "  ⚠ Skipping {} — RTT {}ms exceeds {}ms limit",
-                        p.id.fmt_short(),
-                        rtt,
-                        mesh::MAX_SPLIT_RTT_MS
-                    );
-                    false
-                }
-                _ => true,
-            })
-            .collect();
-
-        // Sort by RTT ascending (unknown RTT sorts last)
-        candidates.sort_by_key(|p| p.rtt_ms.unwrap_or(u32::MAX));
-
-        // Take just enough peers to cover the VRAM gap.
-        // When --split is forced, always include at least one worker.
-        let mut accumulated_vram = my_vram;
-        let mut selected = Vec::new();
-        for p in &candidates {
-            if accumulated_vram >= min_vram && !(force_split && selected.is_empty()) {
-                break; // we have enough VRAM already (but force at least 1 if --split)
+    let worker_ids = match launch_plan {
+        DenseLaunchPlan::Solo => {
+            let worker_count = model_peers
+                .iter()
+                .filter(|p| !matches!(p.role, NodeRole::Client))
+                .count();
+            if worker_count > 0 {
+                eprintln!(
+                    "  Model fits on host ({:.1}GB capacity for {:.1}GB model) — serving entirely",
+                    my_vram as f64 / 1e9,
+                    model_bytes as f64 / 1e9
+                );
+                eprintln!("  Use --split to force distributed mode");
             }
-            accumulated_vram += p.vram_bytes;
-            let rtt_str = p
-                .rtt_ms
-                .map(|r| format!("{}ms", r))
-                .unwrap_or("?ms".to_string());
-            eprintln!(
-                "  ✓ Adding {} — {:.1}GB capacity, RTT {rtt_str}",
-                p.id.fmt_short(),
-                p.vram_bytes as f64 / 1e9
-            );
-            selected.push(p.id);
+            Vec::new()
         }
-        if accumulated_vram < min_vram {
-            eprintln!(
-                "  ⚠ Total capacity {:.1}GB still short of {:.1}GB — using all {} candidates",
-                accumulated_vram as f64 / 1e9,
-                min_vram as f64 / 1e9,
-                candidates.len()
-            );
-            // Fall back to all candidates if we can't cover it
-            selected = candidates.iter().map(|p| p.id).collect();
+        DenseLaunchPlan::Split { worker_ids, .. } => {
+            for id in worker_ids {
+                if let Some(peer) = model_peers.iter().find(|peer| peer.id == *id) {
+                    let rtt_str = peer
+                        .rtt_ms
+                        .map(|r| format!("{}ms", r))
+                        .unwrap_or("?ms".to_string());
+                    eprintln!(
+                        "  ✓ Adding {} — {:.1}GB capacity, RTT {rtt_str}",
+                        peer.id.fmt_short(),
+                        split_peer_vram_bytes(peer, my_vram) as f64 / 1e9
+                    );
+                }
+            }
+            worker_ids.clone()
         }
-        selected
-    } else {
-        let worker_count = model_peers
-            .iter()
-            .filter(|p| !matches!(p.role, NodeRole::Client))
-            .count();
-        if worker_count > 0 {
-            eprintln!(
-                "  Model fits on host ({:.1}GB capacity for {:.1}GB model) — serving entirely",
-                my_vram as f64 / 1e9,
-                model_bytes as f64 / 1e9
-            );
-            eprintln!("  Use --split to force distributed mode");
+        DenseLaunchPlan::WaitingForCapacity { .. } => {
+            return None;
         }
-        vec![]
     };
 
     // Wait for tunnels to workers
@@ -2402,12 +2440,17 @@ async fn start_llama(
     // The host's own GPU is used directly on the local backend — no need to route
     // through the local rpc-server (which would add unnecessary TCP round trips).
     let all_ports = tunnel_mgr.peer_ports_map().await;
-    let mut rpc_ports: Vec<u16> = Vec::new();
-    for id in &worker_ids {
-        if let Some(&port) = all_ports.get(id) {
-            rpc_ports.push(port);
-        }
-    }
+    let Some(rpc_ports) = rpc_ports_for_worker_ids(&all_ports, &worker_ids) else {
+        eprintln!(
+            "  Waiting for selected worker tunnels ({}/{} ready)",
+            all_ports
+                .keys()
+                .filter(|id| worker_ids.contains(id))
+                .count(),
+            worker_ids.len()
+        );
+        return None;
+    };
 
     // Calculate tensor split from VRAM.
     // Device order: RPC workers first (matching --rpc order), then the local host device last.
@@ -2415,11 +2458,7 @@ async fn start_llama(
     let mut all_vrams: Vec<f64> = Vec::new();
     for id in &worker_ids {
         if let Some(peer) = model_peers.iter().find(|p| p.id == *id) {
-            all_vrams.push(if peer.vram_bytes > 0 {
-                peer.vram_bytes as f64
-            } else {
-                my_vram_f
-            });
+            all_vrams.push(split_peer_vram_bytes(peer, my_vram) as f64);
         }
     }
     all_vrams.push(my_vram_f); // Host device is last
@@ -2508,6 +2547,7 @@ async fn find_free_port() -> anyhow::Result<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iroh::EndpointAddr;
     use iroh::SecretKey;
 
     /// Create a deterministic EndpointId from a byte seed.
@@ -2515,6 +2555,170 @@ mod tests {
         let mut bytes = [0u8; 32];
         bytes[0] = seed;
         SecretKey::from_bytes(&bytes).public()
+    }
+
+    fn make_dense_peer(
+        id: iroh::EndpointId,
+        vram_bytes: u64,
+        rtt_ms: Option<u32>,
+        serving_model: &str,
+    ) -> mesh::PeerInfo {
+        mesh::PeerInfo {
+            id,
+            addr: EndpointAddr {
+                id,
+                addrs: Default::default(),
+            },
+            tunnel_port: None,
+            role: NodeRole::Worker,
+            models: vec![],
+            vram_bytes,
+            rtt_ms,
+            model_source: None,
+            serving_models: vec![serving_model.to_string()],
+            hosted_models: vec![],
+            hosted_models_known: false,
+            available_models: vec![],
+            requested_models: vec![],
+            last_seen: std::time::Instant::now(),
+            moe_recovered_at: None,
+            version: None,
+            gpu_name: None,
+            hostname: None,
+            is_soc: None,
+            gpu_vram: None,
+            gpu_bandwidth_gbps: None,
+            available_model_metadata: vec![],
+            experts_summary: None,
+            available_model_sizes: HashMap::new(),
+            served_model_descriptors: vec![],
+            served_model_runtime: vec![],
+            owner_attestation: None,
+            owner_summary: crate::crypto::OwnershipSummary::default(),
+        }
+    }
+
+    #[test]
+    fn dense_launch_plan_prefers_lowest_rtt_workers_needed_for_capacity() {
+        let model = "dense";
+        let id_a = make_id(1);
+        let id_b = make_id(2);
+        let id_c = make_id(3);
+        let id_d = make_id(4);
+        let peers = vec![
+            make_dense_peer(id_b, 30, Some(60), model),
+            make_dense_peer(id_c, 30, Some(20), model),
+            make_dense_peer(id_d, 30, Some(40), model),
+        ];
+
+        let plan = build_dense_launch_plan(60, 100, false, model, &peers);
+        assert_eq!(
+            plan,
+            DenseLaunchPlan::Split {
+                worker_ids: vec![id_c, id_d],
+                total_group_vram: 120,
+            }
+        );
+
+        assert!(should_be_host_for_model(id_a, 60, &peers));
+    }
+
+    #[test]
+    fn dense_launch_plan_ignores_unselected_spare_worker_churn() {
+        let model = "dense";
+        let id_b = make_id(2);
+        let id_c = make_id(3);
+        let id_d = make_id(4);
+        let base = vec![
+            make_dense_peer(id_b, 30, Some(10), model),
+            make_dense_peer(id_c, 30, Some(20), model),
+        ];
+        let mut with_spare = base.clone();
+        with_spare.push(make_dense_peer(id_d, 50, Some(70), model));
+
+        let base_plan = build_dense_launch_plan(60, 100, false, model, &base);
+        let spare_plan = build_dense_launch_plan(60, 100, false, model, &with_spare);
+
+        assert_eq!(base_plan.running_plan(), spare_plan.running_plan());
+        assert_eq!(
+            base_plan.running_plan(),
+            Some(DenseRunningPlan::Split {
+                worker_ids: vec![id_b, id_c],
+            })
+        );
+    }
+
+    #[test]
+    fn dense_launch_plan_replans_across_surviving_workers_after_peer_loss() {
+        let model = "dense";
+        let id_b = make_id(2);
+        let id_c = make_id(3);
+        let id_d = make_id(4);
+        let initial = vec![
+            make_dense_peer(id_b, 30, Some(10), model),
+            make_dense_peer(id_c, 30, Some(20), model),
+            make_dense_peer(id_d, 30, Some(30), model),
+        ];
+        let survivors = vec![
+            make_dense_peer(id_c, 30, Some(20), model),
+            make_dense_peer(id_d, 30, Some(30), model),
+        ];
+
+        let initial_plan = build_dense_launch_plan(50, 100, false, model, &initial);
+        let survivor_plan = build_dense_launch_plan(50, 100, false, model, &survivors);
+
+        assert_eq!(
+            initial_plan.running_plan(),
+            Some(DenseRunningPlan::Split {
+                worker_ids: vec![id_b, id_c],
+            })
+        );
+        assert_eq!(
+            survivor_plan.running_plan(),
+            Some(DenseRunningPlan::Split {
+                worker_ids: vec![id_c, id_d],
+            })
+        );
+    }
+
+    #[test]
+    fn dense_launch_plan_waits_when_only_ineligible_capacity_remains() {
+        let model = "dense";
+        let id_b = make_id(2);
+        let id_c = make_id(3);
+        let peers = vec![
+            make_dense_peer(id_b, 30, Some(10), model),
+            make_dense_peer(id_c, 40, Some(mesh::MAX_SPLIT_RTT_MS + 1), model),
+        ];
+
+        let plan = build_dense_launch_plan(50, 100, false, model, &peers);
+        assert_eq!(
+            plan,
+            DenseLaunchPlan::WaitingForCapacity {
+                worker_ids: vec![id_b],
+                total_group_vram: 80,
+                min_vram: 110,
+            }
+        );
+    }
+
+    #[test]
+    fn selected_worker_ids_require_complete_rpc_port_map() {
+        let id_b = make_id(2);
+        let id_c = make_id(3);
+        let mut complete = HashMap::new();
+        complete.insert(id_b, 9001);
+        complete.insert(id_c, 9002);
+
+        let ports =
+            rpc_ports_for_worker_ids(&complete, &[id_b, id_c]).expect("all selected workers ready");
+        assert_eq!(ports, vec![9001, 9002]);
+
+        complete.remove(&id_c);
+        assert!(
+            rpc_ports_for_worker_ids(&complete, &[id_b, id_c]).is_none(),
+            "launch must wait until every selected worker has a resolved RPC port"
+        );
     }
 
     // ── Shard index computation ──
