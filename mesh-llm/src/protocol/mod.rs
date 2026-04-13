@@ -1552,7 +1552,6 @@ mod tests {
                     mem_bandwidth_gbps: Some("1948.70".to_string()),
                     compute_tflops_fp32: None,
                     compute_tflops_fp16: None,
-                    is_soc: Some(false),
                 }],
             }),
             ..Default::default()
@@ -1586,7 +1585,6 @@ mod tests {
                         mem_bandwidth_gbps: Some("1948.70".to_string()),
                         compute_tflops_fp32: Some("19.50".to_string()),
                         compute_tflops_fp16: Some("312.00".to_string()),
-                        is_soc: Some(false),
                     },
                     crate::proto::node::GpuInfo {
                         name: Some("NVIDIA A100".to_string()),
@@ -1595,7 +1593,6 @@ mod tests {
                         mem_bandwidth_gbps: Some("1948.70".to_string()),
                         compute_tflops_fp32: Some("19.50".to_string()),
                         compute_tflops_fp16: Some("312.00".to_string()),
-                        is_soc: Some(false),
                     },
                 ],
             }),
