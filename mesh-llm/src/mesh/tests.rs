@@ -1,3 +1,8 @@
+use super::heartbeat::{
+    relay_reconnect_reason, should_remove_connection, HeartbeatFailurePolicy, RelayPathSnapshot,
+    RelayPeerHealth, RelayReconnectReason, SelectedPathKind, RELAY_DEGRADED_RTT_MS,
+    RELAY_ONLY_RECONNECT_SECS, RELAY_RECONNECT_COOLDOWN_SECS,
+};
 use super::*;
 use crate::proto::node::{GossipFrame, NodeRole, PeerAnnouncement, RouteTableRequest};
 use tokio::sync::watch;
@@ -1071,6 +1076,165 @@ fn make_test_endpoint_id(seed: u8) -> EndpointId {
     let mut bytes = [0u8; 32];
     bytes[0] = seed;
     EndpointId::from(SecretKey::from_bytes(&bytes).public())
+}
+
+#[test]
+fn relay_health_prefers_direct_paths_and_clears_relay_age() {
+    let now = std::time::Instant::now();
+    let mut health = RelayPeerHealth::default();
+    health.observe(
+        RelayPathSnapshot {
+            kind: SelectedPathKind::Relay,
+            rtt_ms: Some(240),
+        },
+        now - std::time::Duration::from_secs(RELAY_ONLY_RECONNECT_SECS + 5),
+    );
+    assert!(
+        health.relay_since.is_some(),
+        "relay age should start on relay path"
+    );
+
+    health.observe(
+        RelayPathSnapshot {
+            kind: SelectedPathKind::Direct,
+            rtt_ms: Some(18),
+        },
+        now,
+    );
+    assert!(
+        health.relay_since.is_none(),
+        "direct path should clear relay-only aging"
+    );
+}
+
+#[test]
+fn relay_health_reconnects_degraded_relay_paths() {
+    let now = std::time::Instant::now();
+    let mut health = RelayPeerHealth::default();
+    health.observe(
+        RelayPathSnapshot {
+            kind: SelectedPathKind::Relay,
+            rtt_ms: Some(RELAY_DEGRADED_RTT_MS + 50),
+        },
+        now - std::time::Duration::from_secs(30),
+    );
+
+    assert_eq!(
+        relay_reconnect_reason(
+            &health,
+            RelayPathSnapshot {
+                kind: SelectedPathKind::Relay,
+                rtt_ms: Some(RELAY_DEGRADED_RTT_MS + 50),
+            },
+            now,
+            0,
+            true,
+        ),
+        Some(RelayReconnectReason::RelayRttDegraded)
+    );
+}
+
+#[test]
+fn relay_health_reconnects_long_lived_relay_paths() {
+    let now = std::time::Instant::now();
+    let mut health = RelayPeerHealth::default();
+    health.observe(
+        RelayPathSnapshot {
+            kind: SelectedPathKind::Relay,
+            rtt_ms: Some(260),
+        },
+        now - std::time::Duration::from_secs(RELAY_ONLY_RECONNECT_SECS + 5),
+    );
+
+    assert_eq!(
+        relay_reconnect_reason(
+            &health,
+            RelayPathSnapshot {
+                kind: SelectedPathKind::Relay,
+                rtt_ms: Some(260),
+            },
+            now,
+            0,
+            true,
+        ),
+        Some(RelayReconnectReason::RelayOnlyTooLong)
+    );
+}
+
+#[test]
+fn relay_health_respects_cooldown_and_inflight_requests() {
+    let now = std::time::Instant::now();
+    let mut health = RelayPeerHealth::default();
+    health.observe(
+        RelayPathSnapshot {
+            kind: SelectedPathKind::Relay,
+            rtt_ms: Some(RELAY_DEGRADED_RTT_MS + 10),
+        },
+        now - std::time::Duration::from_secs(30),
+    );
+    health.last_reconnect_at =
+        Some(now - std::time::Duration::from_secs(RELAY_RECONNECT_COOLDOWN_SECS - 1));
+
+    assert_eq!(
+        relay_reconnect_reason(
+            &health,
+            RelayPathSnapshot {
+                kind: SelectedPathKind::Relay,
+                rtt_ms: Some(RELAY_DEGRADED_RTT_MS + 10),
+            },
+            now,
+            0,
+            true,
+        ),
+        None,
+        "cooldown should suppress immediate retry"
+    );
+
+    health.last_reconnect_at = None;
+    assert_eq!(
+        relay_reconnect_reason(
+            &health,
+            RelayPathSnapshot {
+                kind: SelectedPathKind::Relay,
+                rtt_ms: Some(RELAY_DEGRADED_RTT_MS + 10),
+            },
+            now,
+            1,
+            true,
+        ),
+        None,
+        "active requests should suppress relay refresh"
+    );
+    assert_eq!(
+        relay_reconnect_reason(
+            &health,
+            RelayPathSnapshot {
+                kind: SelectedPathKind::Relay,
+                rtt_ms: Some(RELAY_DEGRADED_RTT_MS + 10),
+            },
+            now,
+            0,
+            false,
+        ),
+        None,
+        "missing home relay should suppress churn"
+    );
+}
+
+#[test]
+fn stale_dispatcher_cannot_remove_replacement_connection() {
+    assert!(
+        should_remove_connection(Some(7), 7),
+        "matching stable id should remove tracked connection"
+    );
+    assert!(
+        !should_remove_connection(Some(8), 7),
+        "stale dispatcher must not remove a newer replacement connection"
+    );
+    assert!(
+        !should_remove_connection(None, 7),
+        "missing connection slot should be a no-op"
+    );
 }
 
 #[test]
@@ -4437,6 +4601,643 @@ async fn config_subscribe_unowned_node_returns_error() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_subscribe_rejects_pinned_snapshot_for_older_peer() -> Result<()> {
+    let owner_keypair = test_owner_keypair(0x13, 0x14);
+
+    let tmp = std::env::temp_dir().join(format!("mesh-llm-cfg-sub-old-{}", rand::random::<u64>()));
+    std::fs::create_dir_all(tmp.join("server")).ok();
+    std::fs::create_dir_all(tmp.join("client")).ok();
+
+    let server = make_test_node_with_owner(
+        super::NodeRole::Host { http_port: 9337 },
+        &owner_keypair,
+        &tmp.join("server"),
+    )
+    .await?;
+    let client =
+        make_test_node_with_owner(super::NodeRole::Worker, &owner_keypair, &tmp.join("client"))
+            .await?;
+
+    server.set_mesh_id("cfg-sub-old-mesh-01".to_string()).await;
+    client.set_mesh_id("cfg-sub-old-mesh-01".to_string()).await;
+    server.start_accepting();
+    client.start_accepting();
+
+    let server_id = server.id();
+    let server_addr = server.endpoint.addr();
+    let invite =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&server_addr)?);
+
+    client.join(&invite).await?;
+    wait_for_peer(&client, server_id).await;
+    wait_for_peer(&server, client.id()).await;
+
+    {
+        let mut state = server.state.lock().await;
+        state
+            .peers
+            .get_mut(&client.id())
+            .expect("server must track client peer")
+            .version = Some("0.58.0".to_string());
+    }
+
+    {
+        let mut state = server.config_state.lock().await;
+        let expected_revision = state.revision();
+        let result = state.apply(
+            crate::plugin::MeshConfig {
+                version: Some(1),
+                gpu: crate::plugin::GpuConfig {
+                    assignment: crate::plugin::GpuAssignment::Pinned,
+                },
+                models: vec![crate::plugin::ModelConfigEntry {
+                    model: "Qwen3-8B-Q4_K_M".into(),
+                    mmproj: None,
+                    ctx_size: Some(8192),
+                    gpu_id: Some("pci:0000:65:00.0".into()),
+                }],
+                plugins: vec![],
+            },
+            expected_revision,
+        );
+        assert!(matches!(
+            result,
+            crate::runtime::config_state::ApplyResult::Applied { .. }
+        ));
+    }
+
+    let conn = {
+        let state = client.state.lock().await;
+        state
+            .connections
+            .get(&server_id)
+            .cloned()
+            .expect("connection to server must exist after join")
+    };
+
+    let err = client
+        .subscribe_to_config(&conn)
+        .await
+        .expect_err("older peer must be rejected for pinned config subscribe")
+        .to_string();
+    assert!(
+        err.contains("pinned gpu config sync requires mesh-llm >= 0.59.0"),
+        "error must mention pinned config compatibility gate, got: {err}"
+    );
+
+    std::fs::remove_dir_all(&tmp).ok();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_subscribe_rejects_pinned_snapshot_for_malformed_peer_version() -> Result<()> {
+    let owner_keypair = test_owner_keypair(0x33, 0x34);
+
+    let tmp = std::env::temp_dir().join(format!(
+        "mesh-llm-cfg-sub-bad-ver-{}",
+        rand::random::<u64>()
+    ));
+    std::fs::create_dir_all(tmp.join("server")).ok();
+    std::fs::create_dir_all(tmp.join("client")).ok();
+
+    let server = make_test_node_with_owner(
+        super::NodeRole::Host { http_port: 9337 },
+        &owner_keypair,
+        &tmp.join("server"),
+    )
+    .await?;
+    let client =
+        make_test_node_with_owner(super::NodeRole::Worker, &owner_keypair, &tmp.join("client"))
+            .await?;
+
+    server
+        .set_mesh_id("cfg-sub-bad-ver-mesh-01".to_string())
+        .await;
+    client
+        .set_mesh_id("cfg-sub-bad-ver-mesh-01".to_string())
+        .await;
+    server.start_accepting();
+    client.start_accepting();
+
+    let server_id = server.id();
+    let server_addr = server.endpoint.addr();
+    let invite =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&server_addr)?);
+
+    client.join(&invite).await?;
+    wait_for_peer(&client, server_id).await;
+    wait_for_peer(&server, client.id()).await;
+
+    {
+        let mut state = server.state.lock().await;
+        state
+            .peers
+            .get_mut(&client.id())
+            .expect("server must track client peer")
+            .version = Some("dev".to_string());
+    }
+
+    {
+        let mut state = server.config_state.lock().await;
+        let expected_revision = state.revision();
+        let result = state.apply(
+            crate::plugin::MeshConfig {
+                version: Some(1),
+                gpu: crate::plugin::GpuConfig {
+                    assignment: crate::plugin::GpuAssignment::Pinned,
+                },
+                models: vec![crate::plugin::ModelConfigEntry {
+                    model: "Qwen3-8B-Q4_K_M".into(),
+                    mmproj: None,
+                    ctx_size: Some(8192),
+                    gpu_id: Some("pci:0000:65:00.0".into()),
+                }],
+                plugins: vec![],
+            },
+            expected_revision,
+        );
+        assert!(matches!(
+            result,
+            crate::runtime::config_state::ApplyResult::Applied { .. }
+        ));
+    }
+
+    let conn = {
+        let state = client.state.lock().await;
+        state
+            .connections
+            .get(&server_id)
+            .cloned()
+            .expect("connection to server must exist after join")
+    };
+
+    let err = client
+        .subscribe_to_config(&conn)
+        .await
+        .expect_err("malformed-version peer must be rejected for pinned config subscribe")
+        .to_string();
+    assert!(
+        err.contains("pinned gpu config sync requires mesh-llm >= 0.59.0"),
+        "error must mention pinned config compatibility gate, got: {err}"
+    );
+
+    std::fs::remove_dir_all(&tmp).ok();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_subscribe_allows_pinned_snapshot_for_same_release_prerelease_peer() -> Result<()> {
+    let owner_keypair = test_owner_keypair(0x37, 0x38);
+
+    let tmp =
+        std::env::temp_dir().join(format!("mesh-llm-cfg-sub-rc-ver-{}", rand::random::<u64>()));
+    std::fs::create_dir_all(tmp.join("server")).ok();
+    std::fs::create_dir_all(tmp.join("client")).ok();
+
+    let server = make_test_node_with_owner(
+        super::NodeRole::Host { http_port: 9337 },
+        &owner_keypair,
+        &tmp.join("server"),
+    )
+    .await?;
+    let client =
+        make_test_node_with_owner(super::NodeRole::Worker, &owner_keypair, &tmp.join("client"))
+            .await?;
+
+    server
+        .set_mesh_id("cfg-sub-rc-ver-mesh-01".to_string())
+        .await;
+    client
+        .set_mesh_id("cfg-sub-rc-ver-mesh-01".to_string())
+        .await;
+    server.start_accepting();
+    client.start_accepting();
+
+    let server_id = server.id();
+    let server_addr = server.endpoint.addr();
+    let invite =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&server_addr)?);
+
+    client.join(&invite).await?;
+    wait_for_peer(&client, server_id).await;
+    wait_for_peer(&server, client.id()).await;
+
+    {
+        let mut state = server.state.lock().await;
+        state
+            .peers
+            .get_mut(&client.id())
+            .expect("server must track client peer")
+            .version = Some("0.59.0-rc.1".to_string());
+    }
+
+    {
+        let mut state = server.config_state.lock().await;
+        let expected_revision = state.revision();
+        let result = state.apply(
+            crate::plugin::MeshConfig {
+                version: Some(1),
+                gpu: crate::plugin::GpuConfig {
+                    assignment: crate::plugin::GpuAssignment::Pinned,
+                },
+                models: vec![crate::plugin::ModelConfigEntry {
+                    model: "Qwen3-8B-Q4_K_M".into(),
+                    mmproj: None,
+                    ctx_size: Some(8192),
+                    gpu_id: Some("pci:0000:65:00.0".into()),
+                }],
+                plugins: vec![],
+            },
+            expected_revision,
+        );
+        assert!(matches!(
+            result,
+            crate::runtime::config_state::ApplyResult::Applied { .. }
+        ));
+    }
+
+    let conn = {
+        let state = client.state.lock().await;
+        state
+            .connections
+            .get(&server_id)
+            .cloned()
+            .expect("connection to server must exist after join")
+    };
+
+    let (snapshot, _notif_rx) = client.subscribe_to_config(&conn).await?;
+    assert!(snapshot.error.is_none() || snapshot.error.as_deref() == Some(""));
+    assert!(
+        snapshot.config.is_some(),
+        "same-release prerelease peer should receive pinned config snapshot"
+    );
+
+    std::fs::remove_dir_all(&tmp).ok();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_subscribe_auto_snapshot_still_allowed_for_older_peer() -> Result<()> {
+    let owner_keypair = test_owner_keypair(0x15, 0x16);
+
+    let tmp = std::env::temp_dir().join(format!(
+        "mesh-llm-cfg-sub-auto-old-{}",
+        rand::random::<u64>()
+    ));
+    std::fs::create_dir_all(tmp.join("server")).ok();
+    std::fs::create_dir_all(tmp.join("client")).ok();
+
+    let server = make_test_node_with_owner(
+        super::NodeRole::Host { http_port: 9337 },
+        &owner_keypair,
+        &tmp.join("server"),
+    )
+    .await?;
+    let client =
+        make_test_node_with_owner(super::NodeRole::Worker, &owner_keypair, &tmp.join("client"))
+            .await?;
+
+    server
+        .set_mesh_id("cfg-sub-auto-old-mesh-01".to_string())
+        .await;
+    client
+        .set_mesh_id("cfg-sub-auto-old-mesh-01".to_string())
+        .await;
+    server.start_accepting();
+    client.start_accepting();
+
+    let server_id = server.id();
+    let server_addr = server.endpoint.addr();
+    let invite =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&server_addr)?);
+
+    client.join(&invite).await?;
+    wait_for_peer(&client, server_id).await;
+    wait_for_peer(&server, client.id()).await;
+
+    {
+        let mut state = server.state.lock().await;
+        state
+            .peers
+            .get_mut(&client.id())
+            .expect("server must track client peer")
+            .version = Some("0.58.0".to_string());
+    }
+
+    let conn = {
+        let state = client.state.lock().await;
+        state
+            .connections
+            .get(&server_id)
+            .cloned()
+            .expect("connection to server must exist after join")
+    };
+
+    let (snapshot, _notif_rx) = client.subscribe_to_config(&conn).await?;
+    assert!(snapshot.error.is_none() || snapshot.error.as_deref() == Some(""));
+    assert!(
+        snapshot.config.is_some(),
+        "auto config snapshot should still be sent"
+    );
+
+    std::fs::remove_dir_all(&tmp).ok();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_subscribe_closes_when_revision_becomes_pinned_for_malformed_peer_version(
+) -> Result<()> {
+    let owner_keypair = test_owner_keypair(0x35, 0x36);
+
+    let tmp = std::env::temp_dir().join(format!(
+        "mesh-llm-cfg-sub-update-bad-ver-{}",
+        rand::random::<u64>()
+    ));
+    std::fs::create_dir_all(tmp.join("server")).ok();
+    std::fs::create_dir_all(tmp.join("client")).ok();
+
+    let server = make_test_node_with_owner(
+        super::NodeRole::Host { http_port: 9337 },
+        &owner_keypair,
+        &tmp.join("server"),
+    )
+    .await?;
+    let client =
+        make_test_node_with_owner(super::NodeRole::Worker, &owner_keypair, &tmp.join("client"))
+            .await?;
+
+    server
+        .set_mesh_id("cfg-sub-update-bad-ver-mesh-01".to_string())
+        .await;
+    client
+        .set_mesh_id("cfg-sub-update-bad-ver-mesh-01".to_string())
+        .await;
+    server.start_accepting();
+    client.start_accepting();
+
+    let server_id = server.id();
+    let server_addr = server.endpoint.addr();
+    let invite =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&server_addr)?);
+
+    client.join(&invite).await?;
+    wait_for_peer(&client, server_id).await;
+    wait_for_peer(&server, client.id()).await;
+
+    {
+        let mut state = server.state.lock().await;
+        state
+            .peers
+            .get_mut(&client.id())
+            .expect("server must track client peer")
+            .version = Some("dev".to_string());
+    }
+
+    let conn = {
+        let state = client.state.lock().await;
+        state
+            .connections
+            .get(&server_id)
+            .cloned()
+            .expect("connection to server must exist after join")
+    };
+
+    let (_snapshot, mut notif_rx) = client.subscribe_to_config(&conn).await?;
+
+    let new_revision = {
+        let mut state = server.config_state.lock().await;
+        let expected_revision = state.revision();
+        let result = state.apply(
+            crate::plugin::MeshConfig {
+                version: Some(1),
+                gpu: crate::plugin::GpuConfig {
+                    assignment: crate::plugin::GpuAssignment::Pinned,
+                },
+                models: vec![crate::plugin::ModelConfigEntry {
+                    model: "Qwen3-8B-Q4_K_M".into(),
+                    mmproj: None,
+                    ctx_size: Some(8192),
+                    gpu_id: Some("pci:0000:65:00.0".into()),
+                }],
+                plugins: vec![],
+            },
+            expected_revision,
+        );
+        match result {
+            crate::runtime::config_state::ApplyResult::Applied { revision, .. } => revision,
+            other => panic!("pinned config state update must apply in test, got {other:?}"),
+        }
+    };
+
+    let _ = server.config_revision_tx.send(new_revision);
+
+    let changed = tokio::time::timeout(std::time::Duration::from_secs(5), notif_rx.changed())
+        .await
+        .expect("config subscribe stream must react within 5 seconds");
+    assert!(
+        changed.is_err(),
+        "malformed-version subscriber stream should close instead of receiving pinned update"
+    );
+
+    std::fs::remove_dir_all(&tmp).ok();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_subscribe_closes_when_revision_becomes_pinned_for_older_peer() -> Result<()> {
+    let owner_keypair = test_owner_keypair(0x17, 0x18);
+
+    let tmp = std::env::temp_dir().join(format!(
+        "mesh-llm-cfg-sub-update-old-{}",
+        rand::random::<u64>()
+    ));
+    std::fs::create_dir_all(tmp.join("server")).ok();
+    std::fs::create_dir_all(tmp.join("client")).ok();
+
+    let server = make_test_node_with_owner(
+        super::NodeRole::Host { http_port: 9337 },
+        &owner_keypair,
+        &tmp.join("server"),
+    )
+    .await?;
+    let client =
+        make_test_node_with_owner(super::NodeRole::Worker, &owner_keypair, &tmp.join("client"))
+            .await?;
+
+    server
+        .set_mesh_id("cfg-sub-update-old-mesh-01".to_string())
+        .await;
+    client
+        .set_mesh_id("cfg-sub-update-old-mesh-01".to_string())
+        .await;
+    server.start_accepting();
+    client.start_accepting();
+
+    let server_id = server.id();
+    let server_addr = server.endpoint.addr();
+    let invite =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&server_addr)?);
+
+    client.join(&invite).await?;
+    wait_for_peer(&client, server_id).await;
+    wait_for_peer(&server, client.id()).await;
+
+    {
+        let mut state = server.state.lock().await;
+        state
+            .peers
+            .get_mut(&client.id())
+            .expect("server must track client peer")
+            .version = Some("0.58.0".to_string());
+    }
+
+    let conn = {
+        let state = client.state.lock().await;
+        state
+            .connections
+            .get(&server_id)
+            .cloned()
+            .expect("connection to server must exist after join")
+    };
+
+    let (_snapshot, mut notif_rx) = client.subscribe_to_config(&conn).await?;
+
+    let new_revision = {
+        let mut state = server.config_state.lock().await;
+        let expected_revision = state.revision();
+        let result = state.apply(
+            crate::plugin::MeshConfig {
+                version: Some(1),
+                gpu: crate::plugin::GpuConfig {
+                    assignment: crate::plugin::GpuAssignment::Pinned,
+                },
+                models: vec![crate::plugin::ModelConfigEntry {
+                    model: "Qwen3-8B-Q4_K_M".into(),
+                    mmproj: None,
+                    ctx_size: Some(8192),
+                    gpu_id: Some("pci:0000:65:00.0".into()),
+                }],
+                plugins: vec![],
+            },
+            expected_revision,
+        );
+        match result {
+            crate::runtime::config_state::ApplyResult::Applied { revision, .. } => revision,
+            other => panic!("pinned config state update must apply in test, got {other:?}"),
+        }
+    };
+
+    let _ = server.config_revision_tx.send(new_revision);
+
+    let changed = tokio::time::timeout(std::time::Duration::from_secs(5), notif_rx.changed())
+        .await
+        .expect("config subscribe stream must react within 5 seconds");
+    assert!(
+        changed.is_err(),
+        "older subscriber stream should close instead of receiving pinned update"
+    );
+
+    std::fs::remove_dir_all(&tmp).ok();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_subscribe_keeps_stream_open_when_revision_becomes_pinned_for_same_release_prerelease_peer(
+) -> Result<()> {
+    let owner_keypair = test_owner_keypair(0x39, 0x3a);
+
+    let tmp = std::env::temp_dir().join(format!(
+        "mesh-llm-cfg-sub-update-rc-ver-{}",
+        rand::random::<u64>()
+    ));
+    std::fs::create_dir_all(tmp.join("server")).ok();
+    std::fs::create_dir_all(tmp.join("client")).ok();
+
+    let server = make_test_node_with_owner(
+        super::NodeRole::Host { http_port: 9337 },
+        &owner_keypair,
+        &tmp.join("server"),
+    )
+    .await?;
+    let client =
+        make_test_node_with_owner(super::NodeRole::Worker, &owner_keypair, &tmp.join("client"))
+            .await?;
+
+    server
+        .set_mesh_id("cfg-sub-update-rc-ver-mesh-01".to_string())
+        .await;
+    client
+        .set_mesh_id("cfg-sub-update-rc-ver-mesh-01".to_string())
+        .await;
+    server.start_accepting();
+    client.start_accepting();
+
+    let server_id = server.id();
+    let server_addr = server.endpoint.addr();
+    let invite =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&server_addr)?);
+
+    client.join(&invite).await?;
+    wait_for_peer(&client, server_id).await;
+    wait_for_peer(&server, client.id()).await;
+
+    {
+        let mut state = server.state.lock().await;
+        state
+            .peers
+            .get_mut(&client.id())
+            .expect("server must track client peer")
+            .version = Some("0.59.0-rc.1".to_string());
+    }
+
+    let conn = {
+        let state = client.state.lock().await;
+        state
+            .connections
+            .get(&server_id)
+            .cloned()
+            .expect("connection to server must exist after join")
+    };
+
+    let (_snapshot, mut notif_rx) = client.subscribe_to_config(&conn).await?;
+
+    let new_revision = {
+        let mut state = server.config_state.lock().await;
+        let expected_revision = state.revision();
+        let result = state.apply(
+            crate::plugin::MeshConfig {
+                version: Some(1),
+                gpu: crate::plugin::GpuConfig {
+                    assignment: crate::plugin::GpuAssignment::Pinned,
+                },
+                models: vec![crate::plugin::ModelConfigEntry {
+                    model: "Qwen3-8B-Q4_K_M".into(),
+                    mmproj: None,
+                    ctx_size: Some(8192),
+                    gpu_id: Some("pci:0000:65:00.0".into()),
+                }],
+                plugins: vec![],
+            },
+            expected_revision,
+        );
+        match result {
+            crate::runtime::config_state::ApplyResult::Applied { revision, .. } => revision,
+            other => panic!("pinned config state update must apply in test, got {other:?}"),
+        }
+    };
+
+    let _ = server.config_revision_tx.send(new_revision);
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), notif_rx.changed())
+        .await
+        .expect("config subscribe stream must react within 5 seconds")
+        .expect("same-release prerelease subscriber stream should remain open");
+
+    std::fs::remove_dir_all(&tmp).ok();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn config_push_valid_signature_accepted() -> Result<()> {
     use crate::proto::node::{NodeConfigSnapshot, NodeGpuConfig};
     use crate::protocol::write_len_prefixed;
@@ -4761,6 +5562,9 @@ async fn config_subscribe_delivers_update_notification_after_push() -> Result<()
             model: "test-model.gguf".to_string(),
             mmproj: None,
             ctx_size: None,
+            gpu_id: None,
+            model_ref: None,
+            mmproj_ref: None,
         }],
         plugins: vec![],
     };
@@ -4802,4 +5606,117 @@ async fn config_subscribe_delivers_update_notification_after_push() -> Result<()
 
     std::fs::remove_dir_all(&tmp).ok();
     Ok(())
+}
+
+#[test]
+fn pinned_gpu_runtime_push_rejects_invalid_pushed_pinned_config_before_apply() {
+    let config = crate::plugin::MeshConfig {
+        gpu: crate::plugin::GpuConfig {
+            assignment: crate::plugin::GpuAssignment::Pinned,
+        },
+        models: vec![crate::plugin::ModelConfigEntry {
+            model: "Qwen3-8B-Q4_K_M".into(),
+            mmproj: None,
+            ctx_size: Some(8192),
+            gpu_id: Some("pci:0000:b3:00.0".into()),
+        }],
+        ..crate::plugin::MeshConfig::default()
+    };
+    let gpus = vec![crate::system::hardware::GpuFacts {
+        index: 0,
+        display_name: "GPU 0".into(),
+        backend_device: Some("CUDA0".into()),
+        vram_bytes: 24_000_000_000,
+        reserved_bytes: None,
+        mem_bandwidth_gbps: None,
+        compute_tflops_fp32: None,
+        compute_tflops_fp16: None,
+        unified_memory: false,
+        stable_id: Some("pci:0000:65:00.0".into()),
+        pci_bdf: None,
+        vendor_uuid: None,
+        metal_registry_id: None,
+        dxgi_luid: None,
+        pnp_instance_id: None,
+    }];
+
+    let err = preflight_pushed_config_for_current_node_with_gpus(&config, &gpus).unwrap_err();
+    let message = format!("{err:#}");
+
+    assert!(message.contains("failed pinned GPU preflight"));
+    assert!(message.contains("did not match any available pinnable GPU"));
+}
+
+#[test]
+fn pinned_gpu_runtime_push_accepts_valid_pushed_pinned_config() {
+    let config = crate::plugin::MeshConfig {
+        gpu: crate::plugin::GpuConfig {
+            assignment: crate::plugin::GpuAssignment::Pinned,
+        },
+        models: vec![crate::plugin::ModelConfigEntry {
+            model: "Qwen3-8B-Q4_K_M".into(),
+            mmproj: None,
+            ctx_size: Some(8192),
+            gpu_id: Some("uuid:GPU-123".into()),
+        }],
+        ..crate::plugin::MeshConfig::default()
+    };
+    let gpus = vec![crate::system::hardware::GpuFacts {
+        index: 3,
+        display_name: "GPU 3".into(),
+        backend_device: Some("CUDA3".into()),
+        vram_bytes: 24_000_000_000,
+        reserved_bytes: None,
+        mem_bandwidth_gbps: None,
+        compute_tflops_fp32: None,
+        compute_tflops_fp16: None,
+        unified_memory: false,
+        stable_id: Some("uuid:GPU-123".into()),
+        pci_bdf: None,
+        vendor_uuid: None,
+        metal_registry_id: None,
+        dxgi_luid: None,
+        pnp_instance_id: None,
+    }];
+
+    preflight_pushed_config_for_current_node_with_gpus(&config, &gpus).unwrap();
+}
+
+#[test]
+fn pinned_gpu_runtime_push_rejects_resolved_gpu_without_backend_device() {
+    let config = crate::plugin::MeshConfig {
+        gpu: crate::plugin::GpuConfig {
+            assignment: crate::plugin::GpuAssignment::Pinned,
+        },
+        models: vec![crate::plugin::ModelConfigEntry {
+            model: "Qwen3-8B-Q4_K_M".into(),
+            mmproj: None,
+            ctx_size: Some(8192),
+            gpu_id: Some("uuid:GPU-123".into()),
+        }],
+        ..crate::plugin::MeshConfig::default()
+    };
+    let gpus = vec![crate::system::hardware::GpuFacts {
+        index: 3,
+        display_name: "GPU 3".into(),
+        backend_device: None,
+        vram_bytes: 24_000_000_000,
+        reserved_bytes: None,
+        mem_bandwidth_gbps: None,
+        compute_tflops_fp32: None,
+        compute_tflops_fp16: None,
+        unified_memory: false,
+        stable_id: Some("uuid:GPU-123".into()),
+        pci_bdf: None,
+        vendor_uuid: None,
+        metal_registry_id: None,
+        dxgi_luid: None,
+        pnp_instance_id: None,
+    }];
+
+    let err = preflight_pushed_config_for_current_node_with_gpus(&config, &gpus).unwrap_err();
+    let message = format!("{err:#}");
+
+    assert!(message.contains("failed pinned GPU preflight"));
+    assert!(message.contains("without a backend_device"));
 }

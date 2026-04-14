@@ -10,7 +10,7 @@ pub use mesh_client::mesh::{
     ModelSourceKind, ServedModelDescriptor, ServedModelIdentity, DEMAND_TTL_SECS, MAX_SPLIT_RTT_MS,
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use base64::Engine;
 use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
@@ -1477,6 +1477,15 @@ impl Node {
         }
         let json = serde_json::to_vec(&addr).expect("serializable");
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&json)
+    }
+
+    /// Decode an invite token into an [`EndpointAddr`] without connecting.
+    /// Returns `Err` if the token is not valid base64 or not valid JSON.
+    pub fn decode_invite_token(invite_token: &str) -> Result<EndpointAddr> {
+        let json = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(invite_token)
+            .context("invalid invite token encoding")?;
+        serde_json::from_slice(&json).context("invalid invite token JSON")
     }
 
     #[cfg(test)]
