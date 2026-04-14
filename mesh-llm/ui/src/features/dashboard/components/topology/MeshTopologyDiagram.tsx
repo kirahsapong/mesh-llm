@@ -855,6 +855,8 @@ function MeshRadarField({
   const isDark = resolvedTheme === "dark";
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 0, y: 0 });
+  const zoomRef = useRef(1);
+  const panRef = useRef({ x: 0, y: 0 });
   const [debugNodes, setDebugNodes] = useState<TopologyNode[]>([]);
   const displayNodes = useMemo(() => [...nodes, ...debugNodes], [debugNodes, nodes]);
   const renderNodes = useRadarFieldNodes(
@@ -1098,6 +1100,8 @@ function MeshRadarField({
       }
 
       for (const node of renderNodes) {
+        const currentZoom = zoomRef.current;
+        const currentPan = panRef.current;
         if (
           node.id !== selfNode?.id &&
           !seenNodeIdsRef.current.has(node.id) &&
@@ -1179,8 +1183,8 @@ function MeshRadarField({
           }
         }
         seenNodeIdsRef.current.add(node.id);
-        px = px * zoom + pan.x;
-        py = py * zoom + pan.y;
+        px = px * currentZoom + currentPan.x;
+        py = py * currentZoom + currentPan.y;
         const isHighlighted = highlightedSet.has(node.id);
         const twinkle = twinkleAnimationRef.current.get(node.id);
         const twinkleProgress = twinkle
@@ -1222,8 +1226,8 @@ function MeshRadarField({
           (node.selectedModelMatch || highlightedSet.has(node.id)) &&
           node.lineColor[3] > 0
         ) {
-          const centerPx = centerNode.x * cssWidth * zoom + pan.x;
-          const centerPy = centerNode.y * cssHeight * zoom + pan.y;
+          const centerPx = centerNode.x * cssWidth * currentZoom + currentPan.x;
+          const centerPy = centerNode.y * cssHeight * currentZoom + currentPan.y;
           linePositions.push(
             centerPx * devicePixelRatio,
             centerPy * devicePixelRatio,
@@ -1249,8 +1253,10 @@ function MeshRadarField({
         const shockwave = Math.sin(progress * Math.PI * 0.92);
         const shockFront = Math.max(0, Math.sin(progress * Math.PI * 1.35 - 0.35));
         const collapse = 1 - Math.pow(progress, 1.55);
-        const px = node.x * cssWidth * zoom + pan.x;
-        const py = node.y * cssHeight * zoom + pan.y;
+        const currentZoom = zoomRef.current;
+        const currentPan = panRef.current;
+        const px = node.x * cssWidth * currentZoom + currentPan.x;
+        const py = node.y * cssHeight * currentZoom + currentPan.y;
         const exitScale = 1 + flash * 1.15 + shockFront * 0.42 + progress * 0.22;
         const exitAlpha = collapse * (0.28 + flash * 1.1 + shockFront * 0.18);
         const whiteCore = Math.max(0, Math.sin(progress * Math.PI * 1.8)) * (1 - progress);
@@ -1377,7 +1383,7 @@ function MeshRadarField({
       gl.deleteProgram(pointProgram);
       gl.deleteProgram(lineProgram);
     };
-  }, [pan.x, pan.y, renderNodes, selfNode?.id, status.model_name, zoom]);
+  }, [renderNodes, selfNode?.id, status.model_name]);
 
   const handlePointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
     if (dragRef.current.active) {
@@ -1389,7 +1395,9 @@ function MeshRadarField({
       ) {
         dragRef.current.moved = true;
       }
-      setPan({ x: nextPanX, y: nextPanY });
+      const nextPan = { x: nextPanX, y: nextPanY };
+      panRef.current = nextPan;
+      setPan(nextPan);
       setHoveredNode(null);
       return;
     }
@@ -1416,8 +1424,8 @@ function MeshRadarField({
       active: true,
       originX: event.clientX,
       originY: event.clientY,
-      panX: pan.x,
-      panY: pan.y,
+      panX: panRef.current.x,
+      panY: panRef.current.y,
       moved: false,
     };
   };
@@ -1438,17 +1446,24 @@ function MeshRadarField({
     const rect = hostRef.current.getBoundingClientRect();
     const pointerX = event.clientX - rect.left;
     const pointerY = event.clientY - rect.top;
-    const nextZoom = clamp(zoom * (event.deltaY > 0 ? 0.92 : 1.08), 0.7, 2.4);
-    const worldX = (pointerX - pan.x) / zoom;
-    const worldY = (pointerY - pan.y) / zoom;
-    setZoom(nextZoom);
-    setPan({
+    const currentZoom = zoomRef.current;
+    const currentPan = panRef.current;
+    const nextZoom = clamp(currentZoom * (event.deltaY > 0 ? 0.92 : 1.08), 0.7, 2.4);
+    const worldX = (pointerX - currentPan.x) / currentZoom;
+    const worldY = (pointerY - currentPan.y) / currentZoom;
+    const nextPan = {
       x: pointerX - worldX * nextZoom,
       y: pointerY - worldY * nextZoom,
-    });
+    };
+    zoomRef.current = nextZoom;
+    panRef.current = nextPan;
+    setZoom(nextZoom);
+    setPan(nextPan);
   };
 
   const resetView = () => {
+    zoomRef.current = 1;
+    panRef.current = { x: 0, y: 0 };
     setZoom(1);
     setPan({ x: 0, y: 0 });
   };
@@ -1587,7 +1602,9 @@ function MeshRadarField({
           onPointerDown={(event) => event.stopPropagation()}
           onClick={(event) => {
             event.stopPropagation();
-            setZoom((current) => clamp(current * 1.12, 0.7, 2.4));
+            const nextZoom = clamp(zoomRef.current * 1.12, 0.7, 2.4);
+            zoomRef.current = nextZoom;
+            setZoom(nextZoom);
           }}
         >
           <Plus className="h-4 w-4" />
@@ -1603,7 +1620,9 @@ function MeshRadarField({
           onPointerDown={(event) => event.stopPropagation()}
           onClick={(event) => {
             event.stopPropagation();
-            setZoom((current) => clamp(current * 0.88, 0.7, 2.4));
+            const nextZoom = clamp(zoomRef.current * 0.88, 0.7, 2.4);
+            zoomRef.current = nextZoom;
+            setZoom(nextZoom);
           }}
         >
           <Minus className="h-4 w-4" />
