@@ -497,7 +497,19 @@ pub(crate) async fn run() -> Result<()> {
         .iter()
         .map(|model| model.resolved_path.clone())
         .collect();
-    models::warn_about_updates_for_paths(&resolved_models);
+    {
+        let update_check_paths = resolved_models.clone();
+        match tokio::task::spawn_blocking(move || {
+            models::warn_about_updates_for_paths(&update_check_paths);
+        })
+        .await
+        {
+            Ok(()) => {}
+            Err(err) => {
+                eprintln!("Warning: could not join Hugging Face update check task: {err}");
+            }
+        }
+    }
 
     // Build requested model names from all resolved models
     // Strip split GGUF suffix so "MiniMax-M2.5-Q4_K_M-00001-of-00004" → "MiniMax-M2.5-Q4_K_M"
