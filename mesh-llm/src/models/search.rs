@@ -87,7 +87,9 @@ where
     const SEARCH_CONCURRENCY: usize = 10;
 
     let repo_limit = match sort {
-        SearchSort::ParametersDesc | SearchSort::ParametersAsc => (limit.saturating_mul(5)).clamp(1, 100),
+        SearchSort::ParametersDesc | SearchSort::ParametersAsc => {
+            (limit.saturating_mul(5)).clamp(1, 100)
+        }
         _ => limit.clamp(1, 100),
     };
     progress(SearchProgress::SearchingHub);
@@ -268,9 +270,8 @@ fn approx_parameter_count_b(hit: &SearchHit) -> f64 {
 }
 
 fn approximate_parameter_count_b_from_text(text: &str) -> Option<f64> {
-    static MULTIPLIED_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?i)(\d+(?:\.\d+)?)x(\d+(?:\.\d+)?)([bm])").unwrap()
-    });
+    static MULTIPLIED_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)(\d+(?:\.\d+)?)x(\d+(?:\.\d+)?)([bm])").unwrap());
     static SIMPLE_RE: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"(?i)(\d+(?:\.\d+)?)([bm])").unwrap());
 

@@ -2,8 +2,8 @@ mod formatters;
 mod formatters_console;
 mod formatters_json;
 
-use crate::cli::models::ModelsCommand;
 use crate::cli::models::ModelSearchSort;
+use crate::cli::models::ModelsCommand;
 use crate::cli::terminal_progress::{clear_stderr_line, start_spinner, DeterminateProgressLine};
 use crate::models::{
     catalog, download_model_ref_with_progress_details, find_catalog_model_exact,
@@ -64,46 +64,52 @@ pub async fn run_model_search(
     };
     let mut repo_spinner = None;
     let repo_progress = DeterminateProgressLine::new("🔎");
-    let results = search_huggingface(&query, limit, filter, search_sort, |progress| match progress {
-        SearchProgress::SearchingHub => {}
-        SearchProgress::InspectingRepos { completed, total } => {
-            if formatter.is_json() {
-                return;
+    let results = search_huggingface(
+        &query,
+        limit,
+        filter,
+        search_sort,
+        |progress| match progress {
+            SearchProgress::SearchingHub => {}
+            SearchProgress::InspectingRepos { completed, total } => {
+                if formatter.is_json() {
+                    return;
+                }
+                if let Some(mut spinner) = search_spinner.take() {
+                    spinner.finish();
+                }
+                if total == 0 {
+                    return;
+                }
+                if !announced_repo_scan {
+                    announced_repo_scan = true;
+                    repo_spinner = Some(start_spinner(&format!(
+                        "Inspecting {total} candidate repos..."
+                    )));
+                }
+                if completed == 0 {
+                    return;
+                }
+                if let Some(mut spinner) = repo_spinner.take() {
+                    spinner.finish();
+                }
+                if completed < total && completed < last_reported_completed.saturating_add(5) {
+                    return;
+                }
+                last_reported_completed = completed;
+                let _ = repo_progress.draw_counts(
+                    "Inspecting repos",
+                    completed,
+                    total,
+                    Some(" candidate repos"),
+                );
+                if completed == total {
+                    let _ = clear_stderr_line();
+                    eprintln!("   Inspected {completed}/{total} candidate repos...");
+                }
             }
-            if let Some(mut spinner) = search_spinner.take() {
-                spinner.finish();
-            }
-            if total == 0 {
-                return;
-            }
-            if !announced_repo_scan {
-                announced_repo_scan = true;
-                repo_spinner = Some(start_spinner(&format!(
-                    "Inspecting {total} candidate repos..."
-                )));
-            }
-            if completed == 0 {
-                return;
-            }
-            if let Some(mut spinner) = repo_spinner.take() {
-                spinner.finish();
-            }
-            if completed < total && completed < last_reported_completed.saturating_add(5) {
-                return;
-            }
-            last_reported_completed = completed;
-            let _ = repo_progress.draw_counts(
-                "Inspecting repos",
-                completed,
-                total,
-                Some(" candidate repos"),
-            );
-            if completed == total {
-                let _ = clear_stderr_line();
-                eprintln!("   Inspected {completed}/{total} candidate repos...");
-            }
-        }
-    })
+        },
+    )
     .await?;
     if let Some(mut spinner) = search_spinner.take() {
         spinner.finish();
