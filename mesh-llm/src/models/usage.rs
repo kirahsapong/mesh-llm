@@ -18,6 +18,10 @@ pub struct ModelUsageRecord {
     pub mesh_managed: bool,
     pub primary_path: PathBuf,
     pub managed_paths: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hf_repo_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hf_revision: Option<String>,
     pub first_seen_at: String,
     pub last_used_at: String,
 }
@@ -62,6 +66,26 @@ struct CleanupEntry {
     stale_record_only: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RecordLocation {
+    lookup_key: String,
+    record_path: PathBuf,
+    record: Option<ModelUsageRecord>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HuggingFaceRecordIdentity {
+    repo_id: String,
+    revision: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PathHuggingFaceIdentity {
+    repo_id: String,
+    revision: String,
+    canonical_ref: String,
+}
+
 pub fn model_usage_cache_dir() -> PathBuf {
     super::mesh_llm_cache_dir().join("model-usage")
 }
@@ -70,8 +94,7 @@ pub fn load_model_usage_record_for_path(path: &Path) -> Option<ModelUsageRecord>
     let usage_dir = model_usage_cache_dir();
     let root = huggingface_hub_cache_dir();
     let lookup_key = usage_lookup_key(path, &root)?;
-    let record_path = usage_record_path(&usage_dir, &lookup_key);
-    read_usage_record(&record_path)
+    resolve_record_location(&usage_dir, &lookup_key, &[normalize_path(path)]).record
 }
 
 pub fn track_model_usage(
@@ -169,11 +192,13 @@ fn record_model_usage_in_dir(
     let Some(lookup_key) = usage_lookup_key(path, track_root) else {
         return Ok(());
     };
-
     let now = Utc::now().to_rfc3339();
-    let record_path = usage_record_path(usage_dir, &lookup_key);
-    let existing = read_usage_record(&record_path);
     let primary_path = normalize_path(path);
+    let normalized_managed_paths = unique_paths(managed_paths.to_vec());
+    let candidate_paths = usage_record_candidate_paths(&primary_path, &normalized_managed_paths);
+    let location = resolve_record_location(usage_dir, &lookup_key, &candidate_paths);
+    let record_path = location.record_path;
+    let existing = location.record;
     let existing_display_name = existing
         .as_ref()
         .map(|record| record.display_name.as_str())
@@ -191,16 +216,18 @@ fn record_model_usage_in_dir(
         .map(|record| record.managed_paths.clone())
         .unwrap_or_default();
     if mesh_managed {
-        if managed_paths.is_empty() {
+        if normalized_managed_paths.is_empty() {
             merged_paths.push(primary_path.clone());
         } else {
-            merged_paths.extend(managed_paths.iter().map(|path| normalize_path(path)));
+            merged_paths.extend(normalized_managed_paths.iter().cloned());
         }
     }
     merged_paths = unique_paths(merged_paths);
+    let hf_identity = infer_record_hf_identity(&primary_path, &merged_paths, track_root)
+        .or_else(|| existing.as_ref().and_then(record_hf_identity));
 
     let record = ModelUsageRecord {
-        lookup_key: lookup_key.clone(),
+        lookup_key: location.lookup_key,
         display_name: display_name
             .or(existing_display_name)
             .map(str::to_string)
@@ -216,6 +243,12 @@ fn record_model_usage_in_dir(
         mesh_managed: mesh_managed || existing.as_ref().is_some_and(|record| record.mesh_managed),
         primary_path,
         managed_paths: merged_paths,
+        hf_repo_id: hf_identity
+            .as_ref()
+            .map(|identity| identity.repo_id.clone()),
+        hf_revision: hf_identity
+            .as_ref()
+            .map(|identity| identity.revision.clone()),
         first_seen_at: existing
             .as_ref()
             .map(|record| record.first_seen_at.clone())
@@ -296,6 +329,7 @@ fn plan_cleanup_entries(
         let removable_paths: Vec<PathBuf> = unique_paths(record.managed_paths.clone())
             .into_iter()
             .filter(|path| is_trackable_path(path, track_root))
+            .filter(|path| path_matches_record_identity(&record, path, track_root))
             .filter(|path| path.exists())
             .collect();
         let total_bytes = removable_paths
@@ -358,6 +392,9 @@ fn usage_lookup_key(path: &Path, track_root: &Path) -> Option<String> {
     if !is_trackable_path(path, track_root) {
         return None;
     }
+    if let Some(identity) = hf_identity_for_path_in_root(path, track_root) {
+        return Some(format!("hf:{}", identity.canonical_ref));
+    }
     if let Some(identity) = huggingface_identity_for_path(path) {
         return Some(format!("hf:{}", identity.canonical_ref));
     }
@@ -365,6 +402,137 @@ fn usage_lookup_key(path: &Path, track_root: &Path) -> Option<String> {
         "path:{}",
         normalize_path(path).to_string_lossy().replace('\\', "/")
     ))
+}
+
+fn resolve_record_location(
+    usage_dir: &Path,
+    direct_lookup_key: &str,
+    candidate_paths: &[PathBuf],
+) -> RecordLocation {
+    let direct_record_path = usage_record_path(usage_dir, direct_lookup_key);
+    if let Some(record) = read_usage_record(&direct_record_path) {
+        return RecordLocation {
+            lookup_key: direct_lookup_key.to_string(),
+            record_path: direct_record_path,
+            record: Some(record),
+        };
+    }
+
+    let Some(existing) = find_usage_record_by_paths(usage_dir, candidate_paths) else {
+        return RecordLocation {
+            lookup_key: direct_lookup_key.to_string(),
+            record_path: direct_record_path,
+            record: None,
+        };
+    };
+
+    let record_path = usage_record_path(usage_dir, &existing.lookup_key);
+    RecordLocation {
+        lookup_key: existing.lookup_key.clone(),
+        record_path,
+        record: Some(existing),
+    }
+}
+
+fn find_usage_record_by_paths(
+    usage_dir: &Path,
+    candidate_paths: &[PathBuf],
+) -> Option<ModelUsageRecord> {
+    let candidate_paths = unique_paths(candidate_paths.to_vec());
+    if candidate_paths.is_empty() {
+        return None;
+    }
+    let candidate_set: HashSet<PathBuf> = candidate_paths.iter().cloned().collect();
+    load_model_usage_records_from_dir(usage_dir)
+        .into_iter()
+        .find(|record| record_matches_any_path(record, &candidate_set))
+}
+
+fn record_matches_any_path(record: &ModelUsageRecord, candidate_paths: &HashSet<PathBuf>) -> bool {
+    let primary_path = normalize_path(&record.primary_path);
+    if candidate_paths.contains(&primary_path) {
+        return true;
+    }
+    if record
+        .managed_paths
+        .iter()
+        .map(|path| normalize_path(path))
+        .any(|path| candidate_paths.contains(&path))
+    {
+        return true;
+    }
+    false
+}
+
+fn usage_record_candidate_paths(primary_path: &Path, managed_paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut paths = vec![primary_path.to_path_buf()];
+    paths.extend(managed_paths.iter().cloned());
+    unique_paths(paths)
+}
+
+fn infer_record_hf_identity(
+    primary_path: &Path,
+    managed_paths: &[PathBuf],
+    track_root: &Path,
+) -> Option<HuggingFaceRecordIdentity> {
+    let mut paths = usage_record_candidate_paths(primary_path, managed_paths).into_iter();
+    let first = paths
+        .find_map(|path| hf_identity_for_path_in_root(&path, track_root))
+        .map(|identity| HuggingFaceRecordIdentity {
+            repo_id: identity.repo_id,
+            revision: identity.revision,
+        })?;
+
+    for path in usage_record_candidate_paths(primary_path, managed_paths) {
+        let Some(identity) = hf_identity_for_path_in_root(&path, track_root) else {
+            continue;
+        };
+        if identity.repo_id != first.repo_id || identity.revision != first.revision {
+            return None;
+        }
+    }
+    Some(first)
+}
+
+fn record_hf_identity(record: &ModelUsageRecord) -> Option<HuggingFaceRecordIdentity> {
+    Some(HuggingFaceRecordIdentity {
+        repo_id: record.hf_repo_id.clone()?,
+        revision: record.hf_revision.clone()?,
+    })
+}
+
+fn path_matches_record_identity(record: &ModelUsageRecord, path: &Path, track_root: &Path) -> bool {
+    let Some(record_identity) = record_hf_identity(record) else {
+        return true;
+    };
+    hf_identity_for_path_in_root(path, track_root).is_some_and(|identity| {
+        identity.repo_id == record_identity.repo_id && identity.revision == record_identity.revision
+    })
+}
+
+fn hf_identity_for_path_in_root(path: &Path, track_root: &Path) -> Option<PathHuggingFaceIdentity> {
+    let path = normalize_path(path);
+    let root = normalize_path(track_root);
+    let relative = path.strip_prefix(&root).ok()?;
+    let mut components = relative.components();
+    let repo_dir = components.next()?.as_os_str().to_str()?;
+    let repo_id = repo_dir.strip_prefix("models--")?.replace("--", "/");
+    if components.next()?.as_os_str() != "snapshots" {
+        return None;
+    }
+    let revision = components.next()?.as_os_str().to_str()?.to_string();
+    let relative_file = components
+        .map(|component| component.as_os_str().to_str())
+        .collect::<Option<Vec<_>>>()?
+        .join("/");
+    if relative_file.is_empty() {
+        return None;
+    }
+    Some(PathHuggingFaceIdentity {
+        repo_id: repo_id.clone(),
+        revision: revision.clone(),
+        canonical_ref: format!("{repo_id}@{revision}/{relative_file}"),
+    })
 }
 
 fn usage_record_path(usage_dir: &Path, lookup_key: &str) -> PathBuf {
@@ -444,10 +612,16 @@ fn prune_empty_ancestors(path: &Path, stop_at: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn temp_dir(prefix: &str) -> PathBuf {
+        let sequence = TEMP_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!(
-            "{prefix}-{}",
+            "{prefix}-{}-{}-{}",
+            std::process::id(),
+            sequence,
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("system time should be after epoch")
@@ -501,6 +675,110 @@ mod tests {
         assert!(records[0].mesh_managed);
         assert_eq!(records[0].managed_paths.len(), 2);
         assert_eq!(records[0].display_name, "Demo-Q4_K_M");
+        assert_eq!(records[0].hf_repo_id.as_deref(), Some("Org/Demo"));
+        assert_eq!(records[0].hf_revision.as_deref(), Some("rev1"));
+
+        let _ = std::fs::remove_dir_all(&usage_dir);
+        let _ = std::fs::remove_dir_all(&cache_root);
+    }
+
+    #[test]
+    fn load_model_usage_record_for_split_shard_returns_bundle_record() {
+        let usage_dir = temp_dir("mesh-llm-usage-dir");
+        let cache_root = temp_dir("mesh-llm-hf-cache");
+        let primary = cache_root
+            .join("models--Org--Bundle")
+            .join("snapshots")
+            .join("rev1")
+            .join("Bundle-Q4_K_M-00001-of-00002.gguf");
+        let shard = cache_root
+            .join("models--Org--Bundle")
+            .join("snapshots")
+            .join("rev1")
+            .join("Bundle-Q4_K_M-00002-of-00002.gguf");
+        std::fs::create_dir_all(primary.parent().expect("primary path should have parent"))
+            .expect("primary parent should exist");
+        std::fs::write(&primary, b"primary").expect("primary model should be written");
+        std::fs::write(&shard, b"shard").expect("shard model should be written");
+
+        record_model_usage_in_dir(
+            &usage_dir,
+            &cache_root,
+            &primary,
+            &[primary.clone(), shard.clone()],
+            Some("Bundle-Q4_K_M"),
+            Some("Org/Bundle@rev1/Bundle-Q4_K_M-00001-of-00002.gguf"),
+            Some("catalog"),
+            true,
+        )
+        .expect("managed usage should be recorded");
+
+        let record = find_usage_record_by_paths(&usage_dir, &[shard.clone()])
+            .expect("split shard should resolve back to the bundle record");
+        assert_eq!(
+            record.lookup_key,
+            usage_lookup_key(&primary, &cache_root).expect("primary path should key")
+        );
+        assert_eq!(record.managed_paths.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&usage_dir);
+        let _ = std::fs::remove_dir_all(&cache_root);
+    }
+
+    #[test]
+    fn record_model_usage_updates_last_used_at_by_managed_identity() {
+        let usage_dir = temp_dir("mesh-llm-usage-dir");
+        let cache_root = temp_dir("mesh-llm-hf-cache");
+        let primary = cache_root
+            .join("models--Org--Bundle")
+            .join("snapshots")
+            .join("rev1")
+            .join("Bundle-Q4_K_M-00001-of-00002.gguf");
+        let shard = cache_root
+            .join("models--Org--Bundle")
+            .join("snapshots")
+            .join("rev1")
+            .join("Bundle-Q4_K_M-00002-of-00002.gguf");
+        std::fs::create_dir_all(primary.parent().expect("primary path should have parent"))
+            .expect("primary parent should exist");
+        std::fs::write(&primary, b"primary").expect("primary model should be written");
+        std::fs::write(&shard, b"shard").expect("shard model should be written");
+
+        let lookup_key = usage_lookup_key(&primary, &cache_root).expect("primary path should key");
+        write_record(
+            &usage_dir,
+            &ModelUsageRecord {
+                lookup_key: lookup_key.clone(),
+                display_name: "Bundle-Q4_K_M".to_string(),
+                model_ref: Some("Org/Bundle@rev1/Bundle-Q4_K_M-00001-of-00002.gguf".to_string()),
+                source: "catalog".to_string(),
+                mesh_managed: true,
+                primary_path: primary.clone(),
+                managed_paths: vec![primary.clone(), shard.clone()],
+                hf_repo_id: Some("Org/Bundle".to_string()),
+                hf_revision: Some("rev1".to_string()),
+                first_seen_at: "2026-04-01T00:00:00Z".to_string(),
+                last_used_at: "2026-04-01T00:00:00Z".to_string(),
+            },
+        );
+
+        record_model_usage_in_dir(
+            &usage_dir,
+            &cache_root,
+            &shard,
+            &[],
+            None,
+            None,
+            Some("resolve"),
+            false,
+        )
+        .expect("usage refresh should succeed");
+
+        let records = load_model_usage_records_from_dir(&usage_dir);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].lookup_key, lookup_key);
+        assert_eq!(records[0].managed_paths.len(), 2);
+        assert_ne!(records[0].last_used_at, "2026-04-01T00:00:00Z");
 
         let _ = std::fs::remove_dir_all(&usage_dir);
         let _ = std::fs::remove_dir_all(&cache_root);
@@ -542,6 +820,8 @@ mod tests {
                 mesh_managed: true,
                 primary_path: old_path.clone(),
                 managed_paths: vec![old_path.clone()],
+                hf_repo_id: Some("Org/Old".to_string()),
+                hf_revision: Some("rev1".to_string()),
                 first_seen_at: "2026-04-01T00:00:00Z".to_string(),
                 last_used_at: "2026-04-01T00:00:00Z".to_string(),
             },
@@ -557,6 +837,8 @@ mod tests {
                 mesh_managed: true,
                 primary_path: recent_path.clone(),
                 managed_paths: vec![recent_path.clone()],
+                hf_repo_id: Some("Org/Recent".to_string()),
+                hf_revision: Some("rev1".to_string()),
                 first_seen_at: Utc::now().to_rfc3339(),
                 last_used_at: Utc::now().to_rfc3339(),
             },
@@ -572,6 +854,8 @@ mod tests {
                 mesh_managed: false,
                 primary_path: external_path.clone(),
                 managed_paths: vec![],
+                hf_repo_id: Some("Org/External".to_string()),
+                hf_revision: Some("rev1".to_string()),
                 first_seen_at: "2026-04-01T00:00:00Z".to_string(),
                 last_used_at: "2026-04-01T00:00:00Z".to_string(),
             },
@@ -609,6 +893,8 @@ mod tests {
             mesh_managed: true,
             primary_path: primary.clone(),
             managed_paths: vec![primary.clone()],
+            hf_repo_id: Some("Org/Cleanup".to_string()),
+            hf_revision: Some("rev1".to_string()),
             first_seen_at: "2026-04-01T00:00:00Z".to_string(),
             last_used_at: "2026-04-01T00:00:00Z".to_string(),
         };
@@ -628,6 +914,51 @@ mod tests {
         assert_eq!(result.removed_records, 1);
         assert!(!primary.exists());
         assert!(load_model_usage_records_from_dir(&usage_dir).is_empty());
+
+        let _ = std::fs::remove_dir_all(&usage_dir);
+        let _ = std::fs::remove_dir_all(&cache_root);
+    }
+
+    #[test]
+    fn cleanup_skips_paths_that_no_longer_match_record_identity() {
+        let usage_dir = temp_dir("mesh-llm-usage-dir");
+        let cache_root = temp_dir("mesh-llm-hf-cache");
+        let old_path = cache_root
+            .join("models--Org--Actual")
+            .join("snapshots")
+            .join("rev2")
+            .join("Actual-Q4_K_M.gguf");
+        std::fs::create_dir_all(old_path.parent().expect("cleanup path should have parent"))
+            .expect("cleanup parent should exist");
+        std::fs::write(&old_path, vec![0_u8; 32]).expect("cleanup model should be written");
+
+        let record = ModelUsageRecord {
+            lookup_key: "hf:Org/Expected@rev1/Expected-Q4_K_M.gguf".to_string(),
+            display_name: "Expected".to_string(),
+            model_ref: Some("Org/Expected@rev1/Expected-Q4_K_M.gguf".to_string()),
+            source: "catalog".to_string(),
+            mesh_managed: true,
+            primary_path: old_path.clone(),
+            managed_paths: vec![old_path.clone()],
+            hf_repo_id: Some("Org/Expected".to_string()),
+            hf_revision: Some("rev1".to_string()),
+            first_seen_at: "2026-04-01T00:00:00Z".to_string(),
+            last_used_at: "2026-04-01T00:00:00Z".to_string(),
+        };
+        write_record(&usage_dir, &record);
+
+        let mut skipped_recent = 0usize;
+        let entries = plan_cleanup_entries(
+            vec![record],
+            &usage_dir,
+            &cache_root,
+            None,
+            &mut skipped_recent,
+        );
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].removable_paths.is_empty());
+        assert!(entries[0].stale_record_only);
+        assert!(old_path.exists());
 
         let _ = std::fs::remove_dir_all(&usage_dir);
         let _ = std::fs::remove_dir_all(&cache_root);
