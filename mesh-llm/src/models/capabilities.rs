@@ -1,4 +1,7 @@
-pub use mesh_client::models::capabilities::*;
+pub use mesh_client::models::capabilities::{
+    merge_config_signals, merge_name_signals, merge_sibling_signals, CapabilityLevel,
+    ModelCapabilities,
+};
 
 use super::build_hf_tokio_api;
 use super::catalog;
@@ -41,6 +44,9 @@ pub fn infer_local_model_capabilities(
                 .unwrap_or_default(),
         ],
     );
+    for config in read_local_metadata_jsons(path) {
+        caps = merge_config_signals(caps, &config);
+    }
     caps.normalize()
 }
 
@@ -59,6 +65,25 @@ pub async fn infer_remote_hf_capabilities(
         caps = merge_config_signals(caps, &config);
     }
     caps.normalize()
+}
+
+fn read_local_metadata_jsons(path: &Path) -> Vec<Value> {
+    let mut values = Vec::new();
+    for dir in path.ancestors().skip(1).take(6) {
+        for name in ["config.json", "tokenizer_config.json", "chat_template.json"] {
+            let candidate = dir.join(name);
+            if !candidate.is_file() {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&candidate) else {
+                continue;
+            };
+            if let Ok(value) = serde_json::from_str(&text) {
+                values.push(value);
+            }
+        }
+    }
+    values
 }
 
 async fn fetch_remote_metadata_jsons(repo: &str, revision: Option<&str>) -> Vec<Value> {

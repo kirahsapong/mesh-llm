@@ -10,6 +10,7 @@ If a model fits on one machine, it runs there. If it does not, Mesh LLM automati
 
 - Dense models use pipeline parallelism.
 - MoE models use expert sharding with zero cross-node inference traffic.
+- Models collaborate during inference — a text-only model consults a vision peer, an uncertain model gets a second opinion from a different architecture.
 - Every node gets the same local API at `http://localhost:9337/v1`.
 
 ## Why people use it
@@ -89,7 +90,7 @@ just build
 
 Requires: `just`, `cmake`, Rust toolchain, Node.js 24 + npm. NVIDIA GPU builds need `nvcc` (CUDA toolkit). AMD GPU builds need ROCm/HIP. Vulkan GPU builds need the Vulkan development files plus `glslc`. CPU-only and Jetson/Tegra also work. For source builds, `just build` auto-detects CUDA vs ROCm vs Vulkan on Linux, or you can force `backend=rocm` or `backend=vulkan`. See [CONTRIBUTING.md](CONTRIBUTING.md) for details.
 
-Windows source builds are also supported for `cuda`, `rocm`/`hip`, `vulkan`, and `cpu` via `just build`. Metal remains macOS-only. Tagged GitHub releases now publish Windows `.zip` bundles for `cpu`, `cuda`, `rocm`, and `vulkan`, and you can generate the same artifacts locally with `just release-build-windows`, `just release-build-cuda-windows`, `just release-build-rocm-windows`, `just release-build-vulkan-windows`, and the matching `release-bundle-*-windows` recipes.
+Windows source builds are also supported for `cuda`, `rocm`/`hip`, `vulkan`, and `cpu` via `just build`. Metal remains macOS-only. Tagged GitHub releases currently publish macOS bundles plus Linux CPU, Linux ARM64 CPU, Linux CUDA, Linux ROCm, and Linux Vulkan bundles. The Linux ARM64 CPU artifact is `mesh-llm-aarch64-unknown-linux-gnu.tar.gz`. In install and release contexts, `arm64` and `aarch64` mean the same 64-bit ARM target, and generic 32-bit ARM is not a published release target. Windows publish jobs are currently commented out in `.github/workflows/release.yml`, but you can still generate the matching local Windows artifacts with `just release-build-windows`, `just release-build-cuda-windows`, `just release-build-rocm-windows`, `just release-build-vulkan-windows`, and the matching `release-bundle-*-windows` recipes.
 
 ## Run
 Once installed, you can run:
@@ -135,6 +136,8 @@ Currently using a lightly forked version of llama.cpp (see the Justfile for wher
 **Multi-model** — different nodes serve different models simultaneously. The API proxy peeks at the `model` field in each request and routes to the right node via QUIC tunnel. `/v1/models` lists everything available.
 
 **Demand-aware rebalancing** — a unified demand map tracks which models the mesh wants (from `--model` flags, API requests, and gossip). Demand signals propagate infectiously across all nodes and decay naturally via TTL. Standby nodes auto-promote to serve unserved models with active demand, or rebalance when one model is significantly hotter than others. When a model loses its last server, standby nodes detect it within ~60s.
+
+**Inter-model collaboration** — models on the mesh help each other during inference. When a text-only model receives an image, it silently consults a vision model on the mesh for a caption and generates from that. When a small model is uncertain, it races two peers for a second opinion and injects the winner's answer as context. When a model gets stuck in a repetition loop, another model nudges it out. The caller sees one seamless response — they don't know multiple models collaborated. Inspired by [Mixture of Models (NSED)](https://arxiv.org/pdf/2601.16863) — the mesh is the ensemble. See [VIRTUAL_LLM.md](mesh-llm/docs/VIRTUAL_LLM.md).
 
 **Latency design** — the key insight is that HTTP streaming is latency-tolerant while RPC is latency-multiplied. llama-server always runs on the same box as the GPU. The mesh tunnels HTTP, so cross-network latency only affects time-to-first-token, not per-token throughput. RPC only crosses the network for pipeline splits where the model physically doesn't fit on one machine.
 
@@ -348,7 +351,7 @@ Build-from-source and UI development instructions are in [CONTRIBUTING.md](CONTR
 
 mesh-llm exposes an OpenAI-compatible API on `localhost:9337`. Any tool that supports custom OpenAI endpoints works. `/v1/models` lists available models; the `model` field in requests routes to the right node.
 
-For built-in launcher integrations (`goose`, `claude`):
+For built-in launcher integrations (`goose`, `claude`, `opencode`):
 
 - If a mesh is already running locally on `--port`, it is reused.
 - If not, `mesh-llm` auto-starts a background client node that auto-joins the mesh.
@@ -370,6 +373,20 @@ mesh-llm goose --model MiniMax-M2.5-Q4_K_M
 ```
 
 This command writes/updates `~/.config/goose/custom_providers/mesh.json` and launches Goose.
+
+### opencode
+
+OpenCode uses a temporary provider config injected by Mesh, so you don't need to edit local config files by hand. For the full advanced or manual setup, see [docs/AGENTS.md](docs/AGENTS.md).
+
+```bash
+mesh-llm opencode
+```
+
+Use a specific model (example: MiniMax):
+
+```bash
+mesh-llm opencode --model MiniMax-M2.5-Q4_K_M
+```
 
 ### pi
 
@@ -452,6 +469,9 @@ Installed release bundles use flavor-specific llama.cpp binaries:
 
 - macOS: `metal`
 - Linux: `cpu`, `cuda`, `rocm`, `vulkan`
+- Linux ARM64 CPU: `cpu` (asset triple: `aarch64-unknown-linux-gnu`)
+
+For release and install naming, `arm64` and `aarch64` both refer to the same 64-bit ARM target. Generic 32-bit ARM is not a published release target.
 
 To update a bundle install to the latest release:
 
@@ -496,6 +516,8 @@ You can also try the hosted demo:
 - [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for benchmark numbers and context
 - [CONTRIBUTING.md](CONTRIBUTING.md) for local development and build workflows
 - [PLUGINS.md](PLUGINS.md) for the plugin system and blackboard internals
+- [mesh-llm/docs/VIRTUAL_LLM.md](mesh-llm/docs/VIRTUAL_LLM.md) for inter-model collaboration design
+- [mesh-llm/docs/LLAMA_CPP_FORK.md](mesh-llm/docs/LLAMA_CPP_FORK.md) for llama.cpp fork maintenance
 - [mesh-llm/README.md](mesh-llm/README.md) for Rust crate structure
 - [ROADMAP.md](ROADMAP.md) for future work
 

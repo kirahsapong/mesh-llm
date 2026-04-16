@@ -1216,6 +1216,10 @@ async fn run_auto(
 ) -> Result<()> {
     let resolved_plugins = resolve_plugins_from_config(&config, &cli)?;
     let api_port = cli.port;
+    // Export management API port for llama-server mesh hook callbacks.
+    // Must be the console/management port (default 3131), NOT the proxy port
+    // (default 9337) — hooks hitting the proxy would loop back to llama-server.
+    std::env::set_var("MESH_API_PORT", cli.console.to_string());
     let console_port = Some(cli.console);
     let is_client = cli.client;
     let resolved_models: Vec<PathBuf> = startup_models
@@ -2122,15 +2126,16 @@ async fn run_auto(
                     }
                     api::RuntimeControlRequest::Unload { model, resp } => {
                         let result = if let Some(handle) = runtime_models.remove(&model) {
-                            remove_runtime_local_target(&target_tx, &model, handle.port);
+                            let port = handle.port;
+                            remove_runtime_local_target(&target_tx, &model, port);
                             withdraw_advertised_model(&node, &model).await;
                             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                            handle.process.shutdown().await;
+                            handle.shutdown().await;
                             remove_serving_assignment(&node, &model).await;
                             if let Some(ref cs) = console_state {
                                 cs.remove_local_process(&model).await;
                             }
-                            eprintln!("🗑 Unloaded local model '{}' from :{}", model, handle.port);
+                            eprintln!("🗑 Unloaded local model '{}' from :{}", model, port);
                             Ok(())
                         } else if let Some(controller) = managed_models.remove(&model) {
                             let _ = controller.stop_tx.send(true);
@@ -2157,7 +2162,9 @@ async fn run_auto(
                             .map(|handle| handle.port == port)
                             .unwrap_or(false);
                         if matches {
-                            runtime_models.remove(&model);
+                            if let Some(handle) = runtime_models.remove(&model) {
+                                handle.shutdown().await;
+                            }
                             remove_runtime_local_target(&target_tx, &model, port);
                             withdraw_advertised_model(&node, &model).await;
                             remove_serving_assignment(&node, &model).await;
@@ -2196,7 +2203,7 @@ async fn run_auto(
         if let Some(ref cs) = console_state {
             cs.remove_local_process(&name).await;
         }
-        handle.process.shutdown().await;
+        handle.shutdown().await;
     }
 
     // Signal each election loop to stop, then give it a short window to drop

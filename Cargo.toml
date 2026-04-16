@@ -7,6 +7,7 @@ members = [
     "mesh-host-core",
     "mesh-api-ffi",
     "mesh-llm-test-harness",
+    "tools/xtask",
 ]
 default-members = [
     "mesh-llm",

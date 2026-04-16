@@ -47,14 +47,18 @@ build-linux backend="" cuda_arch="" rocm_arch="":
 release-build:
     @scripts/build-release.sh
 
+# Build a Linux ARM64 CPU release artifact on a native ARM64 runner.
+release-build-arm64:
+    @scripts/build-release.sh
+
 release-build-windows:
     @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows.ps1 -Backend cpu
 
 # Build a Linux CUDA release artifact with an explicit architecture list.
-release-build-cuda cuda_arch="75;80;86;89;90;120":
+release-build-cuda cuda_arch="75;80;86;87;89;90;100;103;120":
     @scripts/build-linux.sh --backend cuda --cuda-arch "{{ cuda_arch }}"
 
-release-build-cuda-windows cuda_arch="75;80;86;89;90;120":
+release-build-cuda-windows cuda_arch="75;80;86;87;89;90;100;103;120":
     @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows.ps1 -Backend cuda -CudaArch "{{cuda_arch}}"
 
 # Build a Linux ROCm release artifact with an explicit architecture list.
@@ -89,6 +93,7 @@ release version:
         echo "Error: working tree is not clean. Commit or stash changes before releasing." >&2
         exit 1
     fi
+    just check-release
     tag="{{ version }}"
     if [[ "$tag" != v* ]]; then
         tag="v$tag"
@@ -260,6 +265,19 @@ bundle output="/tmp/mesh-bundle.tar.gz":
 release-bundle version output="dist":
     @scripts/package-release.sh "{{ version }}" "{{ output }}"
 
+# Create a Linux ARM64 CPU release archive on a native ARM64 runner.
+release-bundle-arm64 version output="dist":
+    @scripts/package-release.sh "{{ version }}" "{{ output }}"
+
+# Run repo-level release-target consistency checks.
+[unix]
+check-release:
+    cargo run -p xtask -- repo-consistency release-targets
+
+[windows]
+check-release:
+    cargo run -p xtask -- repo-consistency release-targets
+
 release-bundle-windows version output="dist":
     @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version "{{version}}" -OutputDir "{{output}}"
 
@@ -383,9 +401,9 @@ moe-live-smoke model api_url console_url expected_nodes="2" timeout="120":
 bench-prefix-affinity:
     @scripts/benchmark-prefix-affinity.sh
 
-# Show the diff from upstream llama.cpp
+# Show our custom commits on top of upstream llama.cpp
 diff:
-    cd {{ llama_dir }} && git log --oneline master..upstream-latest
+    cd {{ llama_dir }} && git log --oneline --ancestry-path $(git merge-base HEAD upstream/master 2>/dev/null || echo HEAD~8)..HEAD
 
 # Build the client-only Docker image (no GPU, no llama.cpp)
 [unix]
@@ -407,13 +425,13 @@ docker-build-cpu tag="mesh-llm:cpu":
 
 # Build the CUDA full-node Docker image
 [unix]
-docker-build-cuda tag="mesh-llm:cuda" cuda_arch="75;80;86;89;90;120":
+docker-build-cuda tag="mesh-llm:cuda" cuda_arch="75;80;86;87;89;90;100;103;120":
     DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile.cuda \
         --build-arg CUDA_ARCH="{{ cuda_arch }}" \
         -t {{ tag }} .
 
 [windows]
-docker-build-cuda tag="mesh-llm:cuda" cuda_arch="75;80;86;89;90;120":
+docker-build-cuda tag="mesh-llm:cuda" cuda_arch="75;80;86;87;89;90;100;103;120":
     @powershell -NoProfile -ExecutionPolicy Bypass -Command "$env:DOCKER_BUILDKIT='1'; docker build -f docker/Dockerfile.cuda --build-arg CUDA_ARCH='{{ cuda_arch }}' -t '{{ tag }}' ."
 
 # Build the ROCm full-node Docker image
