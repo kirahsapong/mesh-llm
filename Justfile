@@ -79,60 +79,36 @@ release-build-vulkan-windows:
 release-version version:
     @scripts/release-version.sh "{{ version }}"
 
-# Tag and push a release. Bumps version, updates Cargo.lock, commits, tags, pushes.
-# CI builds and publishes the GitHub release automatically.
+# Releases are now orchestrated by the GitHub Actions Release workflow.
 release version:
     #!/usr/bin/env bash
     set -euo pipefail
-    current_branch="$(git branch --show-current)"
-    if [[ "$current_branch" != "main" ]]; then
-        echo "Error: release must be run from the 'main' branch (current: ${current_branch:-detached HEAD})" >&2
-        exit 1
-    fi
-    if [[ -n "$(git status --porcelain)" ]]; then
-        echo "Error: working tree is not clean. Commit or stash changes before releasing." >&2
-        exit 1
-    fi
-    just check-release
     tag="{{ version }}"
     if [[ "$tag" != v* ]]; then
         tag="v$tag"
     fi
-    scripts/release-version.sh "$tag"
-    git add -A
-    git commit -m "$tag: release"
-    git tag "$tag"
-    git push origin main
-    git push origin "$tag"
+    echo "Releases are now created by the GitHub Actions Release workflow." >&2
+    echo "Run it with:" >&2
+    echo "  gh workflow run release.yml -f version=$tag -f prerelease=false -f target_ref=main" >&2
+    exit 1
 
-# Tag and push a prerelease from the current branch. Bumps version, updates
-# Cargo.lock, commits, tags, and pushes the branch plus prerelease tag.
+# Prereleases are now orchestrated by the GitHub Actions Release workflow.
 prerelease version:
     #!/usr/bin/env bash
     set -euo pipefail
-    current_branch="$(git branch --show-current)"
-    if [[ -z "$current_branch" ]]; then
-        echo "Error: prerelease must be run from a branch, not detached HEAD." >&2
-        exit 1
-    fi
-    if [[ -n "$(git status --porcelain)" ]]; then
-        echo "Error: working tree is not clean. Commit or stash changes before prereleasing." >&2
-        exit 1
-    fi
     tag="{{ version }}"
     if [[ "$tag" != v* ]]; then
         tag="v$tag"
     fi
-    if [[ "$tag" != *-* ]]; then
-        echo "Error: prerelease tag must include a prerelease suffix such as -rc.1 (got: $tag)" >&2
+    current_branch="$(git branch --show-current)"
+    if [[ -z "$current_branch" ]]; then
+        echo "Error: prerelease workflow dispatch needs a branch, not detached HEAD." >&2
         exit 1
     fi
-    scripts/release-version.sh "$tag"
-    git add -A
-    git commit -m "$tag: prerelease"
-    git tag "$tag"
-    git push origin "$current_branch"
-    git push origin "$tag"
+    echo "Prereleases are now created by the GitHub Actions Release workflow." >&2
+    echo "Run it with:" >&2
+    echo "  gh workflow run release.yml -f version=$tag -f prerelease=true -f target_ref=$current_branch" >&2
+    exit 1
 
 # Download the default model (GLM-4.7-Flash Q4_K_M, 17GB)
 download-model:
