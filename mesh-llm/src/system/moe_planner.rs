@@ -7,6 +7,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::cli::terminal_progress::start_spinner;
 use crate::inference::{election, moe};
 use crate::models::{
     build_hf_api, catalog, gguf::GgufTensorByteProfile, huggingface_identity_for_path,
@@ -663,6 +664,18 @@ async fn resolve_best_ranking(
     let remote_source_revision = source_revision.clone();
     let remote_distribution_id = distribution_id.clone();
     let remote_progress = args.progress;
+    let mut remote_spinner = args.progress.then(|| {
+        start_spinner(&format!(
+            "Checking published MoE data for {}",
+            model.display_name
+        ))
+    });
+    if let Some(spinner) = remote_spinner.as_mut() {
+        spinner.set_message(format!(
+            "Fetching published MoE ranking and analysis for {}",
+            model.display_name
+        ));
+    }
     let remote_lookup = tokio::task::spawn_blocking(move || {
         fetch_remote_ranking(
             &remote_dataset_repo,
@@ -672,8 +685,12 @@ async fn resolve_best_ranking(
             remote_progress,
         )
     })
-    .await
-    .context("Join blocking Hugging Face MoE ranking lookup task")?;
+    .await;
+    if let Some(spinner) = remote_spinner.as_mut() {
+        spinner.finish();
+    }
+    let remote_lookup =
+        remote_lookup.context("Join blocking Hugging Face MoE ranking lookup task")?;
 
     let remote = match remote_lookup {
         Ok(remote) => remote,
