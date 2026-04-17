@@ -83,6 +83,8 @@ public final class EventStreamBridge: EventListener, @unchecked Sendable {
             return
         }
         let requestId = self.requestId
+        finished = true
+        self.requestId = nil
         stateLock.unlock()
 
         guard let requestId else {
