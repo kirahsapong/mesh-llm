@@ -37,6 +37,7 @@ pub enum ModelsCommand {
         #[arg(long)]
         json: bool,
     },
+    // Delete variant defined with explicit clap args later in file (existing block).
     /// List built-in catalog models.
     #[command(hide = true)]
     List {
@@ -98,6 +99,18 @@ pub enum ModelsCommand {
         /// Check for newer upstream revisions without refreshing local cache.
         #[arg(long)]
         check: bool,
+        /// Emit JSON output.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete a specific model from local storage.
+    Delete {
+        /// Model stem name (e.g. Qwen3.5-9B-BF16) or exact file path to delete.
+        #[arg(required = true)]
+        model: String,
+        /// Skip dry-run preview and delete immediately.
+        #[arg(long)]
+        yes: bool,
         /// Emit JSON output.
         #[arg(long)]
         json: bool,

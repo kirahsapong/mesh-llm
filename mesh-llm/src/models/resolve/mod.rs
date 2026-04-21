@@ -5,14 +5,25 @@ use super::{
     track_model_usage,
 };
 use crate::cli::terminal_progress::start_spinner;
+use crate::models::usage::ModelUsageRecord;
 use anyhow::{anyhow, bail, Context, Result};
 use hf_hub::{ListModelsParams, RepoInfo, RepoInfoParams};
 use std::cmp::Ordering;
 use std::collections::HashSet;
+// std imports kept minimal; filesystem ops via std::fs::read_dir used in helper
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::{Arc, LazyLock, Mutex};
 use tokio_stream::StreamExt;
+
+// Resolver result type for model identifier resolution
+#[derive(Clone, Debug)]
+pub struct ResolvedModel {
+    pub path: PathBuf,
+    pub display_name: String,
+    pub is_exact_path: bool,
+    pub matched_records: Vec<ModelUsageRecord>,
+}
 
 #[derive(Clone, Debug)]
 pub struct ModelDetails {

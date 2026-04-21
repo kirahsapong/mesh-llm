@@ -157,6 +157,78 @@ pub fn execute_model_cleanup(unused_since: Option<Duration>) -> Result<ModelClea
     execute_model_cleanup_entries(entries)
 }
 
+pub fn delete_model_by_path(path: &Path) -> Result<ModelCleanupResult> {
+    let usage_dir = model_usage_cache_dir();
+    let normalized = normalize_path(path);
+
+    let records = load_model_usage_records_from_dir(&usage_dir);
+    let entry = match records
+        .into_iter()
+        .find(|r| r.mesh_managed && r.primary_path == normalized)
+    {
+        Some(record) => {
+            let removable_paths: Vec<PathBuf> = unique_paths(record.managed_paths.clone())
+                .into_iter()
+                .filter(|p| p.exists())
+                .collect();
+            let total_bytes = removable_paths
+                .iter()
+                .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
+                .sum();
+            let stale_record_only = removable_paths.is_empty();
+            let record_path = usage_record_path(&usage_dir, &record.lookup_key);
+
+            CleanupEntry {
+                record,
+                record_path,
+                removable_paths,
+                total_bytes,
+                stale_record_only,
+            }
+        }
+        None => {
+            let record = ModelUsageRecord {
+                lookup_key: format!("path:{}", normalized.display()),
+                display_name: normalized
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown")
+                    .to_string(),
+                model_ref: None,
+                source: "direct".to_string(),
+                primary_path: normalized.clone(),
+                managed_paths: vec![],
+                mesh_managed: false,
+                hf_repo_id: None,
+                hf_revision: None,
+                first_seen_at: Utc::now().to_rfc3339(),
+                last_used_at: Utc::now().to_rfc3339(),
+            };
+            let removable_paths = if normalized.exists() {
+                vec![normalized.clone()]
+            } else {
+                vec![]
+            };
+            let stale_record_only = removable_paths.is_empty();
+            let total_bytes = removable_paths
+                .iter()
+                .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
+                .sum();
+            let record_path = usage_record_path(&usage_dir, &record.lookup_key);
+
+            CleanupEntry {
+                record,
+                record_path,
+                removable_paths,
+                total_bytes,
+                stale_record_only,
+            }
+        }
+    };
+
+    execute_model_cleanup_entries(vec![entry])
+}
+
 fn load_model_usage_records_from_dir(dir: &Path) -> Vec<ModelUsageRecord> {
     let mut records = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
