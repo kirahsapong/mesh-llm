@@ -8,11 +8,59 @@ $ErrorActionPreference = "Stop"
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $scriptDir ".."))
-$llamaDir = Join-Path $repoRoot "llama.cpp"
+$llamaDir = if ($env:MESH_LLM_LLAMA_DIR) { $env:MESH_LLM_LLAMA_DIR } else { Join-Path $repoRoot ".deps\llama.cpp" }
 $buildDir = Join-Path $llamaDir "build"
 $meshUiDir = Join-Path $repoRoot "mesh-llm\ui"
 $compilerLauncherArgs = @()
 $compilerCacheBin = $null
+
+function Prepare-Llama {
+    $pinFile = Join-Path $repoRoot "third_party\llama.cpp\upstream.txt"
+    $patchDir = Join-Path $repoRoot "third_party\llama.cpp\patches"
+    $upstreamUrl = if ($env:LLAMA_UPSTREAM_URL) { $env:LLAMA_UPSTREAM_URL } else { "https://github.com/ggml-org/llama.cpp.git" }
+    $targetSha = if ($env:MESH_LLM_LLAMA_PIN_SHA) { $env:MESH_LLM_LLAMA_PIN_SHA } else { (Get-Content $pinFile -Raw).Trim() }
+
+    if (-not (Test-Path $pinFile)) {
+        throw "Missing llama.cpp upstream pin: $pinFile"
+    }
+    if (-not (Test-Path $patchDir)) {
+        throw "Missing llama.cpp patch directory: $patchDir"
+    }
+
+    $llamaParent = Split-Path -Parent $llamaDir
+    New-Item -ItemType Directory -Force -Path $llamaParent | Out-Null
+    if (-not (Test-Path (Join-Path $llamaDir ".git"))) {
+        if (Test-Path $llamaDir) {
+            Remove-Item -Recurse -Force $llamaDir
+        }
+        Invoke-NativeCommand "git" @("clone", "--filter=blob:none", $upstreamUrl, $llamaDir)
+    }
+
+    Push-Location $llamaDir
+    try {
+        & git am --abort *> $null
+        Invoke-NativeCommand "git" @("remote", "set-url", "origin", $upstreamUrl)
+        Invoke-NativeCommand "git" @("fetch", "origin", "master", "--tags")
+        Invoke-NativeCommand "git" @("config", "user.name", "Mesh-LLM CI")
+        Invoke-NativeCommand "git" @("config", "user.email", "ci@mesh-llm.local")
+        Invoke-NativeCommand "git" @("-c", "advice.detachedHead=false", "checkout", "--detach", "--quiet", $targetSha)
+        Invoke-NativeCommand "git" @("reset", "--hard", "--quiet", $targetSha)
+        Invoke-NativeCommand "git" @("clean", "-fdx", "-e", "build/")
+
+        $patches = Get-ChildItem -Path $patchDir -Filter "*.patch" | Sort-Object Name
+        foreach ($patch in $patches) {
+            Invoke-NativeCommand "git" @("am", "--3way", $patch.FullName)
+        }
+
+        $patchedSha = (& git rev-parse HEAD).Trim()
+        Write-Host "prepared llama.cpp"
+        Write-Host "  upstream: $targetSha"
+        Write-Host "  patched:  $patchedSha"
+        Write-Host "  workdir:  $llamaDir"
+    } finally {
+        Pop-Location
+    }
+}
 
 function Add-ToPath {
     param([string]$Directory)
@@ -627,65 +675,7 @@ switch ($backendName) {
 }
 
 Invoke-InRepo {
-    $llamaRepo = "https://github.com/Mesh-LLM/llama.cpp.git"
-    $llamaPinSha = $env:MESH_LLM_LLAMA_PIN_SHA
-    $llamaPinFile = Join-Path $repoRoot "LLAMA_CPP_SHA"
-    if (-not $llamaPinSha -and (Test-Path $llamaPinFile)) {
-        $llamaPinSha = (Get-Content -Path $llamaPinFile -Raw).Trim()
-    }
-
-    if (-not (Test-Path $llamaDir)) {
-        if ($llamaPinSha) {
-            Write-Host "Cloning Mesh-LLM/llama.cpp pinned to $llamaPinSha..."
-            Invoke-NativeCommand "git" @("clone", "-b", "master", "--depth", "1", $llamaRepo, $llamaDir)
-            Push-Location $llamaDir
-            try {
-                if (-not (Test-CommandSuccess "git" @("cat-file", "-e", "${llamaPinSha}^{commit}"))) {
-                    Write-Host "Pinned SHA not on master tip, fetching explicitly..."
-                    Invoke-NativeCommand "git" @("fetch", "--depth", "1", "origin", $llamaPinSha)
-                }
-                Invoke-NativeCommand "git" @("checkout", "--detach", $llamaPinSha)
-            } finally {
-                Pop-Location
-            }
-        } else {
-            Write-Host "Cloning Mesh-LLM/llama.cpp (master)..."
-            Invoke-NativeCommand "git" @("clone", "-b", "master", $llamaRepo, $llamaDir)
-        }
-    } else {
-        Push-Location $llamaDir
-        try {
-            if (Test-CommandSuccess "git" @("remote", "get-url", "origin")) {
-                Invoke-NativeCommand "git" @("remote", "set-url", "origin", $llamaRepo)
-            } else {
-                Invoke-NativeCommand "git" @("remote", "add", "origin", $llamaRepo)
-            }
-
-            if ($llamaPinSha) {
-                if (-not (Test-CommandSuccess "git" @("cat-file", "-e", "${llamaPinSha}^{commit}"))) {
-                    Write-Host "Fetching pinned llama.cpp SHA $llamaPinSha..."
-                    Invoke-NativeCommand "git" @("fetch", "--depth", "1", "origin", $llamaPinSha)
-                }
-                $currentSha = (& git rev-parse HEAD).Trim()
-                if ($currentSha -ne $llamaPinSha) {
-                    Write-Host "Checking out pinned llama.cpp SHA $llamaPinSha (was $currentSha)..."
-                    Invoke-NativeCommand "git" @("checkout", "--detach", $llamaPinSha)
-                } else {
-                    Write-Host "llama.cpp already at pinned SHA $llamaPinSha, no checkout needed"
-                }
-            } else {
-                $currentBranch = (& git branch --show-current).Trim()
-                if ($currentBranch -ne "master") {
-                    Write-Host "Switching llama.cpp from '$currentBranch' to master..."
-                    Invoke-NativeCommand "git" @("checkout", "master")
-                }
-                Write-Host "Pulling latest master from origin..."
-                Invoke-NativeCommand "git" @("pull", "--ff-only", "origin", "master")
-            }
-        } finally {
-            Pop-Location
-        }
-    }
+    Prepare-Llama
 
     $cmakeArgs = @(
         "-B", $buildDir,
