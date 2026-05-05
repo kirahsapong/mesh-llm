@@ -171,14 +171,7 @@ impl AffinityRouter {
     }
 
     pub fn learn_target(&self, model: &str, prefix_hash: u64, target: &election::InferenceTarget) {
-        if !self.config.prefix_enabled
-            || matches!(
-                target,
-                election::InferenceTarget::None
-                    | election::InferenceTarget::MoeLocal(_)
-                    | election::InferenceTarget::MoeRemote(_)
-            )
-        {
+        if !self.config.prefix_enabled || matches!(target, election::InferenceTarget::None) {
             return;
         }
 
@@ -513,7 +506,7 @@ fn scaffold_prefix_hash_from_body(body: &Value) -> Option<u64> {
     // Fall back to the first user message when there is no system/developer
     // prompt and no tools — plenty of real chats look like this, and without
     // a fallback the prefix cache is never populated, so turn-2+ has no way
-    // to stick to the same peer and reuse its llama-server KV cache.
+    // to stick to the same peer and reuse its serving-runtime KV cache.
     if !found {
         if let Some(user_hash) = first_user_hash_from_body(body) {
             hash = hash_combine(hash, user_hash);

@@ -523,7 +523,6 @@ mod tests {
                 id: peer_id,
                 addrs: Default::default(),
             },
-            tunnel_port: None,
             role: crate::mesh::NodeRole::Worker,
             first_joined_mesh_ts: None,
             models: vec![],
@@ -538,7 +537,6 @@ mod tests {
             explicit_model_interests: vec![],
             last_seen: std::time::Instant::now(),
             last_mentioned: std::time::Instant::now(),
-            moe_recovered_at: None,
             version: None,
             gpu_name: None,
             hostname: None,
@@ -1184,6 +1182,7 @@ mod tests {
             .expect_err("GossipFrame gen=2 (future version) must be rejected");
         assert!(matches!(err, ControlFrameError::BadGeneration { got: 2 }));
     }
+
     #[test]
     fn owner_fields_roundtrip_through_proto_announcement() {
         let peer_id = EndpointId::from(SecretKey::from_bytes(&[0xAB; 32]).public());
@@ -1582,6 +1581,11 @@ mod tests {
                 ctx_size: Some(8192),
                 gpu_id: Some("pci:0000:65:00.0".to_string()),
                 parallel: None,
+                cache_type_k: None,
+                cache_type_v: None,
+                batch: None,
+                ubatch: None,
+                flash_attention: None,
             }],
             plugins: vec![PluginConfigEntry {
                 name: "blackboard".to_string(),
@@ -1633,6 +1637,11 @@ mod tests {
                 ctx_size: None,
                 gpu_id: None,
                 parallel: None,
+                cache_type_k: None,
+                cache_type_v: None,
+                batch: None,
+                ubatch: None,
+                flash_attention: None,
             }],
             plugins: vec![],
         };
@@ -1654,6 +1663,11 @@ mod tests {
                 ctx_size: None,
                 gpu_id: None,
                 parallel: None,
+                cache_type_k: None,
+                cache_type_v: None,
+                batch: None,
+                ubatch: None,
+                flash_attention: None,
             }],
             plugins: vec![],
         };
@@ -1678,6 +1692,11 @@ mod tests {
                 ctx_size: Some(8192),
                 gpu_id: Some("pci:0000:65:00.0".to_string()),
                 parallel: None,
+                cache_type_k: None,
+                cache_type_v: None,
+                batch: None,
+                ubatch: None,
+                flash_attention: None,
             }],
             plugins: vec![],
         };

@@ -7,7 +7,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use crate::cli::{Cli, Command};
-use crate::inference::launch;
+use crate::system::backend;
 use crate::system::release_target::{CanonicalArch, CanonicalOs, ReleaseTarget};
 use crate::VERSION;
 
@@ -44,7 +44,7 @@ struct UpdateTarget {
     exe: PathBuf,
     install_dir: PathBuf,
     release_target: ReleaseTarget,
-    bundle_flavor: launch::BinaryFlavor,
+    bundle_flavor: backend::BinaryFlavor,
 }
 
 #[derive(Clone, Copy)]
@@ -111,7 +111,7 @@ fn platform_has_release_assets() -> bool {
 }
 
 fn platform_has_release_assets_for(os: &str, arch: &str) -> bool {
-    launch::BinaryFlavor::ALL.into_iter().any(|flavor| {
+    backend::BinaryFlavor::ALL.into_iter().any(|flavor| {
         ReleaseTarget::from_raw(os, arch, flavor)
             .map(|target| target.support_status().is_supported())
             .unwrap_or(false)
@@ -337,7 +337,7 @@ async fn apply_update_if_available(
     Ok(true)
 }
 
-fn current_release_target(flavor: launch::BinaryFlavor) -> Option<ReleaseTarget> {
+fn current_release_target(flavor: backend::BinaryFlavor) -> Option<ReleaseTarget> {
     ReleaseTarget::from_raw(std::env::consts::OS, std::env::consts::ARCH, flavor).ok()
 }
 
@@ -345,7 +345,7 @@ fn current_release_target(flavor: launch::BinaryFlavor) -> Option<ReleaseTarget>
 fn stable_release_asset_name_for(
     os: &str,
     arch: &str,
-    flavor: launch::BinaryFlavor,
+    flavor: backend::BinaryFlavor,
 ) -> Option<String> {
     ReleaseTarget::from_raw(os, arch, flavor)
         .ok()
@@ -357,7 +357,7 @@ fn legacy_release_asset_name(target: ReleaseTarget) -> Option<String> {
         == ReleaseTarget::new(
             CanonicalOs::Macos,
             CanonicalArch::Aarch64,
-            launch::BinaryFlavor::Metal,
+            backend::BinaryFlavor::Metal,
         ))
     .then_some("mesh-bundle.tar.gz".to_string())
 }
@@ -407,7 +407,7 @@ fn resolve_release_asset_name(
 }
 
 fn release_has_any_platform_asset(release: &ReleaseInfo, os: &str, arch: &str) -> bool {
-    launch::BinaryFlavor::ALL.into_iter().any(|flavor| {
+    backend::BinaryFlavor::ALL.into_iter().any(|flavor| {
         ReleaseTarget::from_raw(os, arch, flavor)
             .ok()
             .and_then(|target| {
@@ -418,41 +418,21 @@ fn release_has_any_platform_asset(release: &ReleaseInfo, os: &str, arch: &str) -
 }
 
 fn mesh_binary_name() -> String {
-    launch::platform_bin_name("mesh-llm")
-}
-
-fn bundled_server_flavor_name(name: &str, flavor: launch::BinaryFlavor) -> String {
-    launch::platform_bin_name(&format!("{name}-{}", flavor.suffix()))
-}
-
-fn has_bundled_server_pair(dir: &Path, flavor: launch::BinaryFlavor) -> bool {
-    dir.join(bundled_server_flavor_name("rpc-server", flavor))
-        .is_file()
-        && dir
-            .join(bundled_server_flavor_name("llama-server", flavor))
-            .is_file()
-}
-
-fn bundled_server_flavors(dir: &Path) -> Vec<launch::BinaryFlavor> {
-    launch::BinaryFlavor::ALL
-        .into_iter()
-        .filter(|flavor| has_bundled_server_pair(dir, *flavor))
-        .collect()
+    backend::platform_bin_name("mesh-llm")
 }
 
 fn installed_bundle_flavor(
-    dir: &Path,
-    requested: Option<launch::BinaryFlavor>,
-) -> Option<launch::BinaryFlavor> {
+    _dir: &Path,
+    requested: Option<backend::BinaryFlavor>,
+) -> Option<backend::BinaryFlavor> {
     if let Some(flavor) = requested {
-        return has_bundled_server_pair(dir, flavor).then_some(flavor);
+        return Some(flavor);
     }
 
-    let mut matches = bundled_server_flavors(dir);
-    if matches.len() == 1 {
-        matches.pop()
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        Some(backend::BinaryFlavor::Metal)
     } else {
-        None
+        Some(backend::BinaryFlavor::Cpu)
     }
 }
 
@@ -558,8 +538,8 @@ fn path_is_writable(path: &Path) -> bool {
 
 fn bundle_install_dir(
     exe: &Path,
-    requested_flavor: Option<launch::BinaryFlavor>,
-) -> Option<(PathBuf, launch::BinaryFlavor)> {
+    requested_flavor: Option<backend::BinaryFlavor>,
+) -> Option<(PathBuf, backend::BinaryFlavor)> {
     let dir = exe.parent()?;
     let file_name = exe.file_name()?.to_str()?;
     #[cfg(windows)]
@@ -583,7 +563,7 @@ async fn install_latest_bundle(
     install_dir: &Path,
     release: &ReleaseInfo,
     asset_name: &str,
-    expected_flavor: launch::BinaryFlavor,
+    expected_flavor: backend::BinaryFlavor,
     action: PostInstallAction,
 ) -> Result<InstallOutcome> {
     let unique = format!(
@@ -760,19 +740,9 @@ mod zip_tests {
 }
 fn collect_bundle_files(
     extracted: &Path,
-    expected_flavor: launch::BinaryFlavor,
+    expected_flavor: backend::BinaryFlavor,
 ) -> Result<Vec<String>> {
-    let flavors = bundled_server_flavors(extracted);
-    anyhow::ensure!(
-        flavors.len() == 1,
-        "Downloaded bundle must contain exactly one bundled server flavor"
-    );
-    anyhow::ensure!(
-        flavors[0] == expected_flavor,
-        "Downloaded bundle flavor mismatch: expected {}, found {}",
-        expected_flavor.suffix(),
-        flavors[0].suffix()
-    );
+    let _ = expected_flavor;
 
     let mut files = Vec::new();
     for entry in std::fs::read_dir(extracted)
@@ -840,16 +810,10 @@ fn replace_bundle_files(
     std::fs::create_dir_all(backup)
         .with_context(|| format!("Failed to create backup dir {}", backup.display()))?;
 
-    let staged_names: BTreeSet<&str> = staged_files.iter().map(String::as_str).collect();
-    let mut managed_names: BTreeSet<String> = BTreeSet::from([mesh_binary_name()]);
-    managed_names.extend(crate::runtime::bundled_bin_names("rpc-server"));
-    managed_names.extend(crate::runtime::bundled_bin_names("llama-server"));
+    let managed_names: BTreeSet<String> = BTreeSet::from([mesh_binary_name()]);
 
     let mut backed_up = Vec::new();
     for name in managed_names {
-        if staged_names.contains(name.as_str()) {
-            continue;
-        }
         backup_existing_file(install_dir, backup, &name, &mut backed_up)?;
     }
     for name in staged_files {
@@ -959,9 +923,7 @@ fn windows_update_script(
         .collect();
     let args_json = serde_json::to_string(&args)?;
 
-    let mut managed_names: BTreeSet<String> = BTreeSet::from([mesh_binary_name()]);
-    managed_names.extend(crate::runtime::bundled_bin_names("rpc-server"));
-    managed_names.extend(crate::runtime::bundled_bin_names("llama-server"));
+    let managed_names: BTreeSet<String> = BTreeSet::from([mesh_binary_name()]);
     let managed_json = serde_json::to_string(&managed_names.into_iter().collect::<Vec<_>>())?;
 
     let quote = |path: &Path| path.to_string_lossy().replace('\'', "''");
@@ -1205,11 +1167,11 @@ mod tests {
     fn test_stable_release_asset_name_matches_platform() {
         let expected = match (std::env::consts::OS, std::env::consts::ARCH) {
             ("macos", "aarch64") => Some((
-                launch::BinaryFlavor::Metal,
+                backend::BinaryFlavor::Metal,
                 "mesh-llm-aarch64-apple-darwin.tar.gz",
             )),
             ("linux", "x86_64") => Some((
-                launch::BinaryFlavor::Cpu,
+                backend::BinaryFlavor::Cpu,
                 "mesh-llm-x86_64-unknown-linux-gnu.tar.gz",
             )),
             _ => None,
@@ -1228,19 +1190,19 @@ mod tests {
     fn test_windows_release_asset_names() {
         assert!(platform_has_release_assets_for("windows", "x86_64"));
         assert_eq!(
-            stable_release_asset_name_for("windows", "x86_64", launch::BinaryFlavor::Cpu),
+            stable_release_asset_name_for("windows", "x86_64", backend::BinaryFlavor::Cpu),
             Some("mesh-llm-x86_64-pc-windows-msvc.zip".to_string())
         );
         assert_eq!(
-            stable_release_asset_name_for("windows", "x86_64", launch::BinaryFlavor::Cuda),
+            stable_release_asset_name_for("windows", "x86_64", backend::BinaryFlavor::Cuda),
             Some("mesh-llm-x86_64-pc-windows-msvc-cuda.zip".to_string())
         );
         assert_eq!(
-            stable_release_asset_name_for("windows", "x86_64", launch::BinaryFlavor::Rocm),
+            stable_release_asset_name_for("windows", "x86_64", backend::BinaryFlavor::Rocm),
             Some("mesh-llm-x86_64-pc-windows-msvc-rocm.zip".to_string())
         );
         assert_eq!(
-            stable_release_asset_name_for("windows", "x86_64", launch::BinaryFlavor::Vulkan),
+            stable_release_asset_name_for("windows", "x86_64", backend::BinaryFlavor::Vulkan),
             Some("mesh-llm-x86_64-pc-windows-msvc-vulkan.zip".to_string())
         );
         let release = ReleaseInfo {
@@ -1268,7 +1230,7 @@ mod tests {
         let stable_asset = "mesh-llm-aarch64-unknown-linux-gnu.tar.gz".to_string();
         assert!(platform_has_release_assets_for("linux", "aarch64"));
         assert_eq!(
-            stable_release_asset_name_for("linux", "aarch64", launch::BinaryFlavor::Cpu),
+            stable_release_asset_name_for("linux", "aarch64", backend::BinaryFlavor::Cpu),
             Some(stable_asset.clone())
         );
 
@@ -1298,9 +1260,9 @@ mod tests {
     #[test]
     fn test_linux_arm64_aliases_resolve_identical_release_assets() {
         let arm64_asset =
-            stable_release_asset_name_for("linux", "arm64", launch::BinaryFlavor::Cpu);
+            stable_release_asset_name_for("linux", "arm64", backend::BinaryFlavor::Cpu);
         let aarch64_asset =
-            stable_release_asset_name_for("linux", "aarch64", launch::BinaryFlavor::Cpu);
+            stable_release_asset_name_for("linux", "aarch64", backend::BinaryFlavor::Cpu);
         assert_eq!(arm64_asset, aarch64_asset);
         assert_eq!(
             arm64_asset,
@@ -1322,7 +1284,7 @@ mod tests {
         assert_eq!(
             resolve_release_asset_name(
                 &release,
-                ReleaseTarget::from_raw("linux", "arm64", launch::BinaryFlavor::Cpu).unwrap(),
+                ReleaseTarget::from_raw("linux", "arm64", backend::BinaryFlavor::Cpu).unwrap(),
                 ReleaseAssetPreference::StableFirst,
             ),
             Some("mesh-llm-aarch64-unknown-linux-gnu.tar.gz".to_string())
@@ -1340,7 +1302,7 @@ mod tests {
         assert_eq!(
             resolve_release_asset_name(
                 &release,
-                ReleaseTarget::from_raw("linux", "aarch64", launch::BinaryFlavor::Cpu).unwrap(),
+                ReleaseTarget::from_raw("linux", "aarch64", backend::BinaryFlavor::Cpu).unwrap(),
                 ReleaseAssetPreference::StableFirst,
             ),
             Some("mesh-llm-v0.60.0-aarch64-unknown-linux-gnu.tar.gz".to_string())
@@ -1361,7 +1323,7 @@ mod tests {
         assert_eq!(
             resolve_release_asset_name(
                 &release,
-                ReleaseTarget::from_raw("linux", "aarch64", launch::BinaryFlavor::Cpu).unwrap(),
+                ReleaseTarget::from_raw("linux", "aarch64", backend::BinaryFlavor::Cpu).unwrap(),
                 ReleaseAssetPreference::VersionedFirst,
             ),
             Some("mesh-llm-v0.60.0-aarch64-unknown-linux-gnu.tar.gz".to_string())
@@ -1379,7 +1341,7 @@ mod tests {
         assert_eq!(
             resolve_release_asset_name(
                 &release,
-                ReleaseTarget::from_raw("linux", "arm64", launch::BinaryFlavor::Cpu).unwrap(),
+                ReleaseTarget::from_raw("linux", "arm64", backend::BinaryFlavor::Cpu).unwrap(),
                 ReleaseAssetPreference::VersionedFirst,
             ),
             Some("mesh-llm-aarch64-unknown-linux-gnu.tar.gz".to_string())
@@ -1400,7 +1362,7 @@ mod tests {
                 ReleaseTarget::new(
                     CanonicalOs::Macos,
                     CanonicalArch::Aarch64,
-                    launch::BinaryFlavor::Metal,
+                    backend::BinaryFlavor::Metal,
                 ),
                 ReleaseAssetPreference::StableFirst,
             ),
@@ -1441,46 +1403,25 @@ mod tests {
     }
 
     #[test]
-    fn test_bundle_install_dir_requires_matching_flavor_pair() {
+    fn test_bundle_install_dir_uses_requested_or_platform_default_flavor() {
         let dir = temp_dir("bundle-install");
         let exe = dir.join(mesh_binary_name());
         std::fs::write(&exe, b"binary").unwrap();
-        std::fs::write(
-            dir.join(bundled_server_flavor_name(
-                "rpc-server",
-                launch::BinaryFlavor::Cpu,
-            )),
-            b"rpc",
-        )
-        .unwrap();
-        std::fs::write(
-            dir.join(bundled_server_flavor_name(
-                "llama-server",
-                launch::BinaryFlavor::Cpu,
-            )),
-            b"llama",
-        )
-        .unwrap();
+        let default_flavor = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            backend::BinaryFlavor::Metal
+        } else {
+            backend::BinaryFlavor::Cpu
+        };
 
         assert_eq!(
             bundle_install_dir(&exe, None),
-            Some((dir.clone(), launch::BinaryFlavor::Cpu))
+            Some((dir.clone(), default_flavor))
         );
         assert_eq!(
-            bundle_install_dir(&exe, Some(launch::BinaryFlavor::Cpu)),
-            Some((dir.clone(), launch::BinaryFlavor::Cpu))
+            bundle_install_dir(&exe, Some(backend::BinaryFlavor::Vulkan)),
+            Some((dir.clone(), backend::BinaryFlavor::Vulkan))
         );
-        assert_eq!(
-            bundle_install_dir(&exe, Some(launch::BinaryFlavor::Cuda)),
-            None
-        );
-
-        let missing = temp_dir("bundle-missing");
-        let missing_exe = missing.join(mesh_binary_name());
-        std::fs::write(&missing_exe, b"binary").unwrap();
-        assert_eq!(bundle_install_dir(&missing_exe, None), None);
 
         let _ = std::fs::remove_dir_all(dir);
-        let _ = std::fs::remove_dir_all(missing);
     }
 }

@@ -73,6 +73,7 @@ pub(super) const DISPATCH_REQUEST: DispatchRequestFn =
                 | ("GET", "/api/runtime/events")
                 | ("GET", "/api/runtime/endpoints")
                 | ("GET", "/api/runtime/processes")
+                | ("GET", "/api/runtime/stages")
                 | ("POST", "/api/runtime/models")
                 | ("GET", "/api/events") => {
                     runtime::handle(stream, state, method, path_only, body).await?;
@@ -148,7 +149,7 @@ pub(super) const DISPATCH_REQUEST: DispatchRequestFn =
                         .await?;
                     Ok(true)
                 }
-                // Mesh hook callbacks from llama-server
+                // Mesh hook callbacks from the serving runtime
                 ("POST", "/mesh/hook") => {
                     mesh_hook::handle(stream, state, method, path_only, body).await?;
                     Ok(true)
@@ -157,6 +158,13 @@ pub(super) const DISPATCH_REQUEST: DispatchRequestFn =
                 | ("POST", "/api/objects/complete")
                 | ("POST", "/api/objects/abort") => {
                     objects::handle(stream, state, method, path_only, body).await?;
+                    Ok(true)
+                }
+                (m, p)
+                    if matches!(m, "GET" | "POST" | "OPTIONS")
+                        && (p.starts_with("/v1/") || p == "/models") =>
+                {
+                    chat::handle(stream, state, method, path_only, req).await?;
                     Ok(true)
                 }
                 (m, p)

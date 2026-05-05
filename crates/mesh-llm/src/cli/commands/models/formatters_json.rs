@@ -1,12 +1,12 @@
 use super::formatters::{
     capabilities_json, catalog_model_capabilities, catalog_model_kind_code,
     fit_code_for_size_label, format_installed_size, huggingface_cache_dir,
-    installed_model_kind_code, local_capacity_json, model_kind_code, moe_json, print_json,
-    InstalledRow, JsonFormatter, ModelsFormatter, SearchFormatter,
+    installed_model_kind_code, local_capacity_json, model_kind_code, print_json, InstalledRow,
+    JsonFormatter, ModelsFormatter, SearchFormatter,
 };
 use crate::models::{
-    catalog, search_catalog_json_payload, search_huggingface_json_payload, ModelDetails,
-    SearchArtifactFilter, SearchHit, SearchSort,
+    catalog, catalog_model_draft_ref, catalog_model_ref, search_catalog_json_payload,
+    search_huggingface_json_payload, ModelDetails, SearchArtifactFilter, SearchHit, SearchSort,
 };
 use crate::models::{DeleteResult as CliDeleteResult, ResolvedModel as CliResolvedModel};
 use anyhow::Result;
@@ -27,7 +27,6 @@ fn show_payload(details: &ModelDetails, variants: Option<&[ModelDetails]>) -> Va
         "description": details.description,
         "draft": details.draft,
         "capabilities": capabilities_json(details.capabilities),
-        "moe": moe_json(details.moe.as_ref()),
         "download_url": details.download_url,
         "machine": local_capacity_json(),
         "variants": variants
@@ -106,17 +105,17 @@ impl ModelsFormatter for JsonFormatter {
             .iter()
             .map(|model| {
                 let model_capabilities = catalog_model_capabilities(model);
+                let model_ref = catalog_model_ref(model);
                 json!({
                     "name": model.name,
                     "size": model.size,
                     "description": model.description,
-                    "draft": model.draft,
+                    "draft": catalog_model_draft_ref(model),
                     "type": catalog_model_kind_code(model),
-                    "ref": model.name,
-                    "show": format!("mesh-llm models show {}", model.name),
-                    "download": format!("mesh-llm models download {}", model.name),
+                    "ref": model_ref,
+                    "show": format!("mesh-llm models show {model_ref}"),
+                    "download": format!("mesh-llm models download {model_ref}"),
                     "capabilities": capabilities_json(model_capabilities),
-                    "moe": moe_json(model.moe.as_ref()),
                 })
             })
             .collect();
@@ -145,7 +144,6 @@ impl ModelsFormatter for JsonFormatter {
                     "path": row.path,
                     "about": row.catalog_model.map(|m| m.description.clone()),
                     "draft": row.catalog_model.and_then(|m| m.draft.clone()),
-                    "moe": moe_json(row.catalog_model.and_then(|m| m.moe.as_ref())),
                 })
             })
             .collect();
@@ -225,6 +223,7 @@ impl ModelsFormatter for JsonFormatter {
             "reclaimed_bytes_human": format_installed_size(result.reclaimed_bytes),
             "removed_metadata_files": result.removed_metadata_files,
             "removed_usage_records": result.removed_usage_records,
+            "removed_derived_cache_files": result.removed_derived_cache_files,
         }))
     }
 }
@@ -246,7 +245,6 @@ mod tests {
             description: None,
             draft: None,
             capabilities: ModelCapabilities::default(),
-            moe: None,
         };
         let variants = vec![
             ModelDetails {
@@ -259,7 +257,6 @@ mod tests {
                 description: None,
                 draft: None,
                 capabilities: ModelCapabilities::default(),
-                moe: None,
             },
             ModelDetails {
                 display_name: "Qwen3.6-35B-A3B-Q4_K_M.gguf".to_string(),
@@ -271,7 +268,6 @@ mod tests {
                 description: None,
                 draft: None,
                 capabilities: ModelCapabilities::default(),
-                moe: None,
             },
         ];
 

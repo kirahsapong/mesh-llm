@@ -29,15 +29,11 @@ pub struct CatalogModel {
     pub description: String,
     /// If set, this model has a recommended draft model for speculative decoding.
     pub draft: Option<String>,
-    /// MoE expert routing config. If set, this model supports expert sharding.
-    /// Pre-computed from `moe-analyze --export-ranking --all-layers`.
-    pub moe: Option<MoeConfig>,
     /// Additional split GGUF files (for models too large for a single file).
     /// llama.cpp auto-discovers splits from the first file, but all parts
     /// must be present in the same directory.
     pub extra_files: Vec<CatalogAsset>,
-    /// Multimodal projector for vision models.
-    /// When set, llama-server is launched with `--mmproj <file>`.
+    /// Multimodal projector sidecar for vision models.
     pub mmproj: Option<CatalogAsset>,
 }
 
@@ -55,21 +51,6 @@ impl CatalogModel {
     }
 }
 
-/// Pre-computed MoE expert sharding configuration for a model.
-/// Derived from router gate mass analysis — determines which experts go where.
-#[derive(Clone, Debug)]
-pub struct MoeConfig {
-    /// Total number of experts in the model
-    pub n_expert: u32,
-    /// Number of experts selected per token (top-k)
-    pub n_expert_used: u32,
-    /// Minimum number of experts per node for coherent output.
-    /// Determined experimentally per model (~36% for Qwen3-30B-A3B).
-    pub min_experts_per_node: u32,
-    /// Expert IDs sorted by gate mass descending (hottest first).
-    pub ranking: Vec<u32>,
-}
-
 #[derive(Debug, Deserialize)]
 struct CatalogModelJson {
     name: String,
@@ -78,17 +59,9 @@ struct CatalogModelJson {
     size: String,
     description: String,
     draft: Option<String>,
-    moe: Option<MoeConfigJson>,
     #[serde(default)]
     extra_files: Vec<CatalogAsset>,
     mmproj: Option<CatalogAsset>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct MoeConfigJson {
-    n_expert: u32,
-    n_expert_used: u32,
-    min_experts_per_node: u32,
 }
 
 pub static MODEL_CATALOG: LazyLock<Vec<CatalogModel>> = LazyLock::new(load_catalog);
@@ -108,20 +81,8 @@ impl CatalogModel {
             size: raw.size,
             description: raw.description,
             draft: raw.draft,
-            moe: raw.moe.map(MoeConfig::from_json),
             extra_files: raw.extra_files,
             mmproj: raw.mmproj,
-        }
-    }
-}
-
-impl MoeConfig {
-    fn from_json(raw: MoeConfigJson) -> Self {
-        Self {
-            n_expert: raw.n_expert,
-            n_expert_used: raw.n_expert_used,
-            min_experts_per_node: raw.min_experts_per_node,
-            ranking: Vec::new(),
         }
     }
 }
@@ -1809,7 +1770,6 @@ mod tests {
             size: "4.4GB".to_string(),
             description: "".to_string(),
             draft: None,
-            moe: None,
             extra_files: Vec::new(),
             mmproj: None,
         };
@@ -1855,7 +1815,6 @@ mod tests {
             size: "1GB".to_string(),
             description: "".to_string(),
             draft: None,
-            moe: None,
             extra_files: Vec::new(),
             mmproj: None,
         };

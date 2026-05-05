@@ -66,7 +66,6 @@ pub struct BufferedHttpRequest {
     pub body_len_bytes: usize,
     pub completion_tokens: Option<u32>,
     pub model_name: Option<String>,
-    pub session_hint: Option<String>,
     pub request_object_request_ids: Vec<String>,
     pub response_adapter: ResponseAdapter,
 }
@@ -159,10 +158,6 @@ struct ParsedResponseHeaders {
 struct RequestMetadata {
     #[serde(default)]
     model: Option<String>,
-    #[serde(default)]
-    user: Option<String>,
-    #[serde(default)]
-    session_id: Option<String>,
     #[serde(default)]
     max_completion_tokens: Option<u32>,
     #[serde(default)]
@@ -301,9 +296,6 @@ async fn read_http_request_with_limits(
         None
     };
     let model_name = metadata.as_ref().and_then(|value| value.model.clone());
-    let session_hint = metadata
-        .as_ref()
-        .and_then(|value| value.user.clone().or_else(|| value.session_id.clone()));
     let completion_tokens = metadata.as_ref().and_then(|value| {
         value
             .max_completion_tokens
@@ -331,7 +323,6 @@ async fn read_http_request_with_limits(
         body_len_bytes,
         completion_tokens,
         model_name,
-        session_hint,
         request_object_request_ids,
         response_adapter,
     })
@@ -889,11 +880,8 @@ async fn order_targets_by_context(
     let mut candidates = Vec::with_capacity(targets.len());
     for target in targets {
         let context_length = match target {
-            election::InferenceTarget::Local(_) | election::InferenceTarget::MoeLocal(_) => {
-                node.local_model_context_length(model).await
-            }
-            election::InferenceTarget::Remote(peer_id)
-            | election::InferenceTarget::MoeRemote(peer_id) => {
+            election::InferenceTarget::Local(_) => node.local_model_context_length(model).await,
+            election::InferenceTarget::Remote(peer_id) => {
                 node.peer_model_context_length(*peer_id, model).await
             }
             election::InferenceTarget::None => None,
@@ -994,6 +982,7 @@ async fn relay_translated_responses_stream<R: AsyncRead + Unpin>(
             || usage_missing
             || data.contains("\"delta\"")
             || data.contains("\"content\"")
+            || data.contains("\"logprobs\"")
             || data.contains("\"usage\"")
     }
 
@@ -1073,10 +1062,16 @@ async fn relay_translated_responses_stream<R: AsyncRead + Unpin>(
                 .and_then(|choice| choice.delta.as_ref())
                 .and_then(|delta| delta.content.as_deref())
             {
+                let logprobs = chunk
+                    .choices
+                    .first()
+                    .and_then(|choice| choice.logprobs.clone());
                 output_text.push_str(delta);
-                let event = serde_json::to_string(&response_adapter::responses_stream_delta_event(
-                    &item_id, delta,
-                ))
+                let event = serde_json::to_string(
+                    &response_adapter::responses_stream_delta_event_with_logprobs(
+                        &item_id, delta, logprobs,
+                    ),
+                )
                 .context("serialize response.output_text.delta event")?;
                 response_adapter::write_chunked_sse_event(
                     tcp_stream,
@@ -1236,6 +1231,56 @@ pub fn inject_mesh_hooks_flag(raw: &mut Vec<u8>, enabled: bool) {
     *raw = result;
 }
 
+/// Rewrite the JSON body `model` field and rebuild Content-Length.
+pub fn rewrite_model_field(request: &mut BufferedHttpRequest, model: &str) {
+    let Some(header_end) = request
+        .raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| i + 4)
+    else {
+        return;
+    };
+
+    let Ok(mut body) = serde_json::from_slice::<serde_json::Value>(&request.raw[header_end..])
+    else {
+        return;
+    };
+    let Some(object) = body.as_object_mut() else {
+        return;
+    };
+
+    object.insert(
+        "model".to_string(),
+        serde_json::Value::String(model.to_string()),
+    );
+    let Ok(new_body) = serde_json::to_vec(&body) else {
+        return;
+    };
+
+    let headers = std::str::from_utf8(&request.raw[..header_end - 4]).unwrap_or("");
+    let mut rebuilt = String::new();
+    for line in headers.split("\r\n") {
+        if line.to_ascii_lowercase().starts_with("content-length:") {
+            rebuilt.push_str(&format!("Content-Length: {}", new_body.len()));
+        } else {
+            rebuilt.push_str(line);
+        }
+        rebuilt.push_str("\r\n");
+    }
+    rebuilt.push_str("\r\n");
+
+    let mut raw = rebuilt.into_bytes();
+    raw.extend_from_slice(&new_body);
+
+    request.raw = raw;
+    request.body_len_bytes = new_body.len();
+    request.body_bytes = Some(new_body);
+    request.body_json = Some(body);
+    request.body_json_attempted = true;
+    request.model_name = Some(model.to_string());
+}
+
 pub fn is_models_list_request(method: &str, path: &str) -> bool {
     let path = path.split('?').next().unwrap_or(path);
     method == "GET" && (path == "/v1/models" || path == "/models")
@@ -1302,18 +1347,18 @@ async fn probe_http_response<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Res
 }
 
 /// Like `probe_http_response` but with a much longer timeout suitable for
-/// the local backend proxy (which fronts llama-server). Prefill on a busy
-/// or slow machine can legitimately take minutes (large prompts,
-/// concurrent slot contention, slower hardware). We still bound the wait
-/// to catch a truly wedged local backend proxy path.
+/// the local OpenAI surface. Prefill on a busy or slow machine can
+/// legitimately take minutes (large prompts, concurrent slot contention,
+/// slower hardware). We still bound the wait to catch a truly wedged local
+/// runtime path.
 async fn probe_http_response_local<R: AsyncRead + Unpin>(reader: &mut R) -> Result<ResponseProbe> {
     probe_http_response_with_timeout(reader, local_response_first_byte_timeout()).await
 }
 
-/// Local backend proxy timeout: 10 minutes. This is a safety net for a
-/// wedged local proxy path, not a latency budget. Normal prefill even on
-/// slow hardware with large prompts and concurrent slots completes well
-/// within this window.
+/// Local OpenAI surface timeout: 10 minutes. This is a safety net for a wedged
+/// local runtime path, not a latency budget. Normal prefill even on slow
+/// hardware with large prompts and concurrent slots completes well within this
+/// window.
 fn local_response_first_byte_timeout() -> Duration {
     Duration::from_secs(10 * 60)
 }
@@ -1541,7 +1586,7 @@ async fn route_local_attempt(
             let _ = upstream.set_nodelay(true);
             if let Err(err) = upstream.write_all(prefetched).await {
                 tracing::warn!(
-                    "API proxy: failed to forward buffered request to local backend proxy on {port}: {err}"
+                    "API proxy: failed to forward buffered request to local OpenAI surface on {port}: {err}"
                 );
                 return RouteAttemptResult::RetryableUnavailable;
             }
@@ -1576,7 +1621,7 @@ async fn route_local_attempt(
                 }
                 Err(err) => {
                     tracing::warn!(
-                        "API proxy: failed to read local response from backend proxy on {port}: {err}"
+                        "API proxy: failed to read local response from OpenAI surface on {port}: {err}"
                     );
                     if is_timeout_error(&err) {
                         RouteAttemptResult::RetryableTimeout
@@ -1587,7 +1632,7 @@ async fn route_local_attempt(
             }
         }
         Err(err) => {
-            tracing::warn!("API proxy: can't reach local backend proxy on {port}: {err}");
+            tracing::warn!("API proxy: can't reach local OpenAI surface on {port}: {err}");
             RouteAttemptResult::RetryableUnavailable
         }
     }
@@ -1890,7 +1935,8 @@ pub async fn handle_mesh_request(
     // Handle /v1/models
     if is_models_list_request(&request.method, &request.path) {
         let served = node.models_being_served().await;
-        let _ = send_models_list(tcp_stream, &served).await;
+        let descriptors = node.served_model_descriptors().await;
+        let _ = send_models_list_with_descriptors(tcp_stream, &served, &descriptors).await;
         return;
     }
 
@@ -1906,6 +1952,10 @@ pub async fn handle_mesh_request(
     // we cache the classified model choice by session key, so every turn
     // in the same auto-routed chat reuses the first pick. Prefix affinity
     // then has a chance to keep those turns on the same peer too.
+    let served = node.models_being_served().await;
+    let descriptors = node.served_model_descriptors().await;
+    rewrite_public_model_alias(&mut request, &served, &descriptors);
+
     let is_auto_request =
         request.model_name.is_none() || request.model_name.as_deref() == Some("auto");
     let auto_session_key = if is_auto_request {
@@ -1962,7 +2012,6 @@ pub async fn handle_mesh_request(
                 Some(name)
             } else {
                 let cl = router::classify(body_json);
-                let served = node.models_being_served().await;
                 let with_caps: Vec<(&str, f64, crate::models::ModelCapabilities)> = served
                     .iter()
                     .map(|name| {
@@ -2310,7 +2359,7 @@ async fn route_attempt_for_target(
     response_adapter: ResponseAdapter,
 ) -> RouteAttemptResult {
     match target {
-        election::InferenceTarget::Local(port) | election::InferenceTarget::MoeLocal(port) => {
+        election::InferenceTarget::Local(port) => {
             route_local_attempt(
                 node,
                 tcp_stream,
@@ -2321,8 +2370,7 @@ async fn route_attempt_for_target(
             )
             .await
         }
-        election::InferenceTarget::Remote(host_id)
-        | election::InferenceTarget::MoeRemote(host_id) => {
+        election::InferenceTarget::Remote(host_id) => {
             route_remote_attempt(
                 node,
                 tcp_stream,
@@ -2388,11 +2436,8 @@ pub async fn route_model_request(
         selection.cached_target.as_ref(),
     ) {
         let cached_context = match cached_target {
-            election::InferenceTarget::Local(_) | election::InferenceTarget::MoeLocal(_) => {
-                node.local_model_context_length(model).await
-            }
-            election::InferenceTarget::Remote(peer_id)
-            | election::InferenceTarget::MoeRemote(peer_id) => {
+            election::InferenceTarget::Local(_) => node.local_model_context_length(model).await,
+            election::InferenceTarget::Remote(peer_id) => {
                 node.peer_model_context_length(*peer_id, model).await
             }
             election::InferenceTarget::None => None,
@@ -2484,12 +2529,10 @@ pub async fn route_model_request(
                     }
                 }
                 let service = match target {
-                    election::InferenceTarget::Local(_)
-                    | election::InferenceTarget::MoeLocal(_) => {
+                    election::InferenceTarget::Local(_) => {
                         crate::network::metrics::RequestService::Local
                     }
-                    election::InferenceTarget::Remote(_)
-                    | election::InferenceTarget::MoeRemote(_) => {
+                    election::InferenceTarget::Remote(_) => {
                         crate::network::metrics::RequestService::Remote
                     }
                     election::InferenceTarget::None => {
@@ -2588,213 +2631,7 @@ pub async fn route_model_request(
     true
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn route_moe_request(
-    node: mesh::Node,
-    tcp_stream: TcpStream,
-    targets: &election::ModelTargets,
-    model: &str,
-    session_hint: &str,
-    required_tokens: Option<u32>,
-    prefetched: &[u8],
-) -> bool {
-    let route_started = Instant::now();
-    let mut tcp_stream = tcp_stream;
-    let Some(primary_target) = targets.get_moe_target(session_hint) else {
-        node.record_routed_request(
-            Some(model),
-            0,
-            crate::network::metrics::RequestOutcome::Unavailable,
-        );
-        let _ = send_503(
-            tcp_stream,
-            &format!("no MoE target for model '{model}' session '{session_hint}'"),
-        )
-        .await;
-        return false;
-    };
-    let mut ordered = order_targets_by_context(
-        &node,
-        model,
-        required_tokens,
-        &targets.get_moe_failover_targets(session_hint),
-    )
-    .await;
-    if ordered.is_empty() {
-        node.record_routed_request(
-            Some(model),
-            0,
-            crate::network::metrics::RequestOutcome::Unavailable,
-        );
-        let _ = send_503(
-            tcp_stream,
-            &format!("no MoE failover targets for model '{model}'"),
-        )
-        .await;
-        return false;
-    }
-    move_target_first(&mut ordered, &primary_target);
-
-    let total_targets = ordered.len();
-    let mut attempts = 0usize;
-    let mut refreshed = false;
-    for (idx, target) in ordered.into_iter().enumerate() {
-        attempts += 1;
-        let attempt_started = Instant::now();
-        let retry_context_overflow = idx + 1 < total_targets;
-        let attempt_result = route_attempt_for_target(
-            &node,
-            &mut tcp_stream,
-            &target,
-            prefetched,
-            retry_context_overflow,
-            ResponseAdapter::None,
-        )
-        .await;
-        let queue_wait = attempt_started.duration_since(route_started);
-        let attempt_time = attempt_started.elapsed();
-        match &attempt_result {
-            RouteAttemptResult::Delivered {
-                status_code,
-                completion_tokens,
-            } => node.record_inference_attempt(
-                Some(model),
-                &target,
-                queue_wait,
-                attempt_time,
-                delivered_attempt_outcome(*status_code),
-                *completion_tokens,
-            ),
-            RouteAttemptResult::RetryableTimeout => node.record_inference_attempt(
-                Some(model),
-                &target,
-                queue_wait,
-                attempt_time,
-                crate::network::metrics::AttemptOutcome::Timeout,
-                None,
-            ),
-            RouteAttemptResult::RetryableUnavailable => node.record_inference_attempt(
-                Some(model),
-                &target,
-                queue_wait,
-                attempt_time,
-                crate::network::metrics::AttemptOutcome::Unavailable,
-                None,
-            ),
-            RouteAttemptResult::RetryableContextOverflow => node.record_inference_attempt(
-                Some(model),
-                &target,
-                queue_wait,
-                attempt_time,
-                crate::network::metrics::AttemptOutcome::ContextOverflow,
-                None,
-            ),
-            RouteAttemptResult::ClientDisconnected => {}
-        }
-        tracing::info!(
-            model = model,
-            session_hint = session_hint,
-            target = ?target,
-            attempt = attempts,
-            total_targets = total_targets,
-            outcome = route_attempt_result_label(&attempt_result),
-            attempt_ms = attempt_started.elapsed().as_millis(),
-            total_route_ms = route_started.elapsed().as_millis(),
-            "openai route_moe_request attempt"
-        );
-        match attempt_result {
-            RouteAttemptResult::Delivered {
-                status_code,
-                completion_tokens: _,
-            } => {
-                let service = match target {
-                    election::InferenceTarget::Local(_)
-                    | election::InferenceTarget::MoeLocal(_) => {
-                        crate::network::metrics::RequestService::Local
-                    }
-                    election::InferenceTarget::Remote(_)
-                    | election::InferenceTarget::MoeRemote(_) => {
-                        crate::network::metrics::RequestService::Remote
-                    }
-                    election::InferenceTarget::None => {
-                        crate::network::metrics::RequestService::Remote
-                    }
-                };
-                node.record_routed_request(
-                    Some(model),
-                    attempts,
-                    request_outcome_for_status(status_code, service),
-                );
-                tracing::info!(
-                    model = model,
-                    session_hint = session_hint,
-                    attempts = attempts,
-                    status_code = status_code,
-                    route_ms = route_started.elapsed().as_millis(),
-                    "openai route_moe_request delivered"
-                );
-                return true;
-            }
-            RouteAttemptResult::RetryableContextOverflow => {
-                tracing::warn!("MoE target {target:?} rejected request with context overflow-style 400, trying next");
-            }
-            RouteAttemptResult::RetryableTimeout => {
-                if !refreshed {
-                    let refresh_node = node.clone();
-                    tokio::spawn(async move {
-                        refresh_node.gossip_one_peer().await;
-                    });
-                    refreshed = true;
-                }
-                tracing::warn!("MoE target {target:?} timed out, trying next");
-            }
-            RouteAttemptResult::RetryableUnavailable => {
-                if let election::InferenceTarget::MoeRemote(peer_id) = &target {
-                    node.handle_peer_death(*peer_id).await;
-                }
-                if !refreshed {
-                    let refresh_node = node.clone();
-                    tokio::spawn(async move {
-                        refresh_node.gossip_one_peer().await;
-                    });
-                    refreshed = true;
-                }
-                tracing::warn!("MoE target {target:?} unavailable, trying next");
-            }
-            RouteAttemptResult::ClientDisconnected => {
-                tracing::info!(
-                    model = model,
-                    session_hint = session_hint,
-                    attempts = attempts,
-                    route_ms = route_started.elapsed().as_millis(),
-                    "openai route_moe_request downstream disconnected"
-                );
-                return true;
-            }
-        }
-    }
-
-    let _ = send_503(
-        tcp_stream,
-        &format!("all MoE targets for model '{model}' failed"),
-    )
-    .await;
-    node.record_routed_request(
-        Some(model),
-        attempts,
-        crate::network::metrics::RequestOutcome::Unavailable,
-    );
-    tracing::warn!(
-        model = model,
-        session_hint = session_hint,
-        attempts = attempts,
-        route_ms = route_started.elapsed().as_millis(),
-        "openai route_moe_request exhausted targets"
-    );
-    true
-}
-
-/// Route a request to a known inference target (local backend proxy or remote host).
+/// Route a request to a known inference target (local OpenAI surface or remote host).
 ///
 /// Used by the API proxy after election has determined the target.
 pub async fn route_to_target(
@@ -2808,10 +2645,6 @@ pub async fn route_to_target(
     let route_started = Instant::now();
     let mut tcp_stream = tcp_stream;
     tracing::info!("API proxy: routing to target {target:?}");
-    let moe_remote_id = match &target {
-        election::InferenceTarget::MoeRemote(host_id) => Some(*host_id),
-        _ => None,
-    };
     let result = route_attempt_for_target(
         &node,
         &mut tcp_stream,
@@ -2863,10 +2696,10 @@ pub async fn route_to_target(
             completion_tokens: _,
         } => {
             let service = match target {
-                election::InferenceTarget::Local(_) | election::InferenceTarget::MoeLocal(_) => {
+                election::InferenceTarget::Local(_) => {
                     crate::network::metrics::RequestService::Local
                 }
-                election::InferenceTarget::Remote(_) | election::InferenceTarget::MoeRemote(_) => {
+                election::InferenceTarget::Remote(_) => {
                     crate::network::metrics::RequestService::Remote
                 }
                 election::InferenceTarget::None => crate::network::metrics::RequestService::Remote,
@@ -2877,9 +2710,6 @@ pub async fn route_to_target(
         RouteAttemptResult::RetryableTimeout
         | RouteAttemptResult::RetryableContextOverflow
         | RouteAttemptResult::RetryableUnavailable => {
-            if let Some(moe_host_id) = moe_remote_id {
-                node.handle_peer_death(moe_host_id).await;
-            }
             node.record_routed_request(
                 model,
                 1,
@@ -2983,10 +2813,34 @@ pub async fn route_http_endpoint_request(
 
 // ── Response helpers ──
 
-pub async fn send_models_list(mut stream: TcpStream, models: &[String]) -> std::io::Result<()> {
+pub async fn send_models_list_with_descriptors(
+    mut stream: TcpStream,
+    models: &[String],
+    descriptors: &[mesh::ServedModelDescriptor],
+) -> std::io::Result<()> {
+    let body = models_list_json(models, descriptors).to_string();
+    let resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}",
+        body.len(), body
+    );
+    stream.write_all(resp.as_bytes()).await?;
+    stream.shutdown().await?;
+    Ok(())
+}
+
+fn models_list_json(
+    models: &[String],
+    descriptors: &[mesh::ServedModelDescriptor],
+) -> serde_json::Value {
+    let mut seen = std::collections::HashSet::new();
     let data: Vec<serde_json::Value> = models
         .iter()
-        .map(|m| {
+        .filter_map(|m| {
+            let descriptor = descriptor_for_model(descriptors, m);
+            let public_id = public_model_id(m, descriptor);
+            if !seen.insert(public_id.clone()) {
+                return None;
+            }
             let capabilities = crate::models::installed_model_capabilities(m);
             let has_multimodal = capabilities.supports_multimodal_runtime();
             let has_vision = capabilities.supports_vision_runtime();
@@ -3004,9 +2858,13 @@ pub async fn send_models_list(mut stream: TcpStream, models: &[String]) -> std::
             if capabilities.reasoning_label().is_some() {
                 caps.push("reasoning");
             }
-            let display_name = crate::models::installed_model_display_name(m);
-            serde_json::json!({
-                "id": m,
+            let display_name = if public_id == *m {
+                crate::models::installed_model_display_name(m)
+            } else {
+                public_id.clone()
+            };
+            Some(serde_json::json!({
+                "id": public_id,
                 "display_name": display_name,
                 "object": "model",
                 "owned_by": "mesh-llm",
@@ -3015,18 +2873,97 @@ pub async fn send_models_list(mut stream: TcpStream, models: &[String]) -> std::
                 "vision_status": capabilities.vision_status(),
                 "audio_status": capabilities.audio_status(),
                 "reasoning_status": capabilities.reasoning_status(),
-            })
+            }))
         })
         .collect();
 
-    let body = serde_json::json!({ "object": "list", "data": data }).to_string();
-    let resp = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}",
-        body.len(), body
-    );
-    stream.write_all(resp.as_bytes()).await?;
-    stream.shutdown().await?;
-    Ok(())
+    serde_json::json!({ "object": "list", "data": data })
+}
+
+pub fn rewrite_public_model_alias(
+    request: &mut BufferedHttpRequest,
+    models: &[String],
+    descriptors: &[mesh::ServedModelDescriptor],
+) {
+    let Some(requested) = request.model_name.as_deref() else {
+        return;
+    };
+    if requested == "auto" || models.iter().any(|model| model == requested) {
+        return;
+    }
+    let Some(internal) = internal_model_for_public_id(requested, models, descriptors) else {
+        return;
+    };
+    rewrite_model_field(request, &internal);
+}
+
+fn internal_model_for_public_id(
+    requested: &str,
+    models: &[String],
+    descriptors: &[mesh::ServedModelDescriptor],
+) -> Option<String> {
+    models.iter().find_map(|model| {
+        let descriptor = descriptor_for_model(descriptors, model);
+        (public_model_id(model, descriptor) == requested).then(|| model.clone())
+    })
+}
+
+fn descriptor_for_model<'a>(
+    descriptors: &'a [mesh::ServedModelDescriptor],
+    model_name: &str,
+) -> Option<&'a mesh::ServedModelDescriptor> {
+    descriptors
+        .iter()
+        .find(|descriptor| descriptor.identity.model_name == model_name)
+}
+
+fn public_model_id(model_name: &str, descriptor: Option<&mesh::ServedModelDescriptor>) -> String {
+    if let Some(descriptor) = descriptor {
+        return public_model_id_from_identity(&descriptor.identity)
+            .unwrap_or_else(|| model_name.to_string());
+    }
+
+    public_model_id_from_local_path(model_name).unwrap_or_else(|| model_name.to_string())
+}
+
+fn public_model_id_from_identity(identity: &mesh::ServedModelIdentity) -> Option<String> {
+    match identity.source_kind {
+        mesh::ModelSourceKind::HuggingFace => identity
+            .repository
+            .as_deref()
+            .and_then(|repo| public_huggingface_model_ref(repo, identity.artifact.as_deref()))
+            .or_else(|| {
+                identity
+                    .canonical_ref
+                    .as_deref()
+                    .and_then(|model_ref| model_ref::ModelRef::parse(model_ref).ok())
+                    .map(|model_ref| model_ref.display_id())
+            }),
+        mesh::ModelSourceKind::Catalog => identity
+            .canonical_ref
+            .as_deref()
+            .and_then(|model_ref| model_ref::ModelRef::parse(model_ref).ok())
+            .map(|model_ref| model_ref.display_id()),
+        mesh::ModelSourceKind::LocalGguf
+        | mesh::ModelSourceKind::DirectUrl
+        | mesh::ModelSourceKind::Unknown => None,
+    }
+}
+
+fn public_model_id_from_local_path(model_name: &str) -> Option<String> {
+    let path = crate::models::find_model_path(model_name);
+    if !path.is_file() {
+        return None;
+    }
+    if path.extension().and_then(|extension| extension.to_str()) != Some("gguf") {
+        return None;
+    }
+    Some(crate::models::model_ref_for_path(&path))
+}
+
+fn public_huggingface_model_ref(repo: &str, artifact: Option<&str>) -> Option<String> {
+    let selector = artifact.and_then(model_ref::quant_selector_from_gguf_file);
+    Some(model_ref::format_model_ref(repo, None, selector.as_deref()))
 }
 
 pub async fn send_json_ok(mut stream: TcpStream, data: &serde_json::Value) -> std::io::Result<()> {
@@ -3252,6 +3189,48 @@ mod tests {
     use super::*;
     use tokio::net::TcpListener;
 
+    fn hf_descriptor(model_name: &str) -> mesh::ServedModelDescriptor {
+        mesh::ServedModelDescriptor {
+            identity: mesh::ServedModelIdentity {
+                model_name: model_name.to_string(),
+                source_kind: mesh::ModelSourceKind::HuggingFace,
+                repository: Some("tiiuae/Falcon-H1-1.5B-Instruct-GGUF".to_string()),
+                revision: Some("0d3a6cfe25fb4eeab0153fb8623aac5b69d6bd0a".to_string()),
+                artifact: Some("Falcon-H1-1.5B-Instruct-Q4_K_M.gguf".to_string()),
+                canonical_ref: Some(
+                    "tiiuae/Falcon-H1-1.5B-Instruct-GGUF@0d3a6cfe25fb4eeab0153fb8623aac5b69d6bd0a/Falcon-H1-1.5B-Instruct-Q4_K_M.gguf"
+                        .to_string(),
+                ),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn catalog_model_ref_descriptor(model_name: &str) -> mesh::ServedModelDescriptor {
+        mesh::ServedModelDescriptor {
+            identity: mesh::ServedModelIdentity {
+                model_name: model_name.to_string(),
+                source_kind: mesh::ModelSourceKind::Catalog,
+                canonical_ref: Some("tiiuae/Falcon-H1-1.5B-Instruct-GGUF:Q4_K_M".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn local_gguf_descriptor(model_name: &str) -> mesh::ServedModelDescriptor {
+        mesh::ServedModelDescriptor {
+            identity: mesh::ServedModelIdentity {
+                model_name: model_name.to_string(),
+                source_kind: mesh::ModelSourceKind::LocalGguf,
+                local_file_name: Some(format!("{model_name}.gguf")),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
     async fn read_request_from_parts_with_limits(
         parts: Vec<Vec<u8>>,
         limits: HttpReadLimits,
@@ -3279,6 +3258,83 @@ mod tests {
 
     async fn read_request_from_parts(parts: Vec<Vec<u8>>) -> BufferedHttpRequest {
         read_request_from_parts_with_limits(parts, HTTP_READ_LIMITS).await
+    }
+
+    #[test]
+    fn models_list_uses_public_huggingface_model_ref_ids() {
+        let models = vec!["Falcon-H1-1.5B-Instruct-Q4_K_M".to_string()];
+        let descriptors = vec![hf_descriptor(&models[0])];
+
+        let body = models_list_json(&models, &descriptors);
+
+        assert_eq!(
+            body["data"][0]["id"],
+            "tiiuae/Falcon-H1-1.5B-Instruct-GGUF:Q4_K_M"
+        );
+        assert_eq!(
+            body["data"][0]["display_name"],
+            "tiiuae/Falcon-H1-1.5B-Instruct-GGUF:Q4_K_M"
+        );
+        assert_eq!(body["data"][0]["owned_by"], "mesh-llm");
+    }
+
+    #[test]
+    fn models_list_uses_catalog_model_ref_ids() {
+        let models = vec!["Falcon-H1-1.5B-Instruct-Q4_K_M".to_string()];
+        let descriptors = vec![catalog_model_ref_descriptor(&models[0])];
+
+        let body = models_list_json(&models, &descriptors);
+
+        assert_eq!(
+            body["data"][0]["id"],
+            "tiiuae/Falcon-H1-1.5B-Instruct-GGUF:Q4_K_M"
+        );
+    }
+
+    #[test]
+    fn models_list_keeps_local_gguf_model_name_ids() {
+        let models = vec!["smollm2-a".to_string()];
+        let descriptors = vec![local_gguf_descriptor(&models[0])];
+
+        let body = models_list_json(&models, &descriptors);
+
+        assert_eq!(body["data"][0]["id"], "smollm2-a");
+        assert_eq!(body["data"][0]["display_name"], "smollm2-a");
+    }
+
+    #[test]
+    fn public_model_alias_rewrites_request_to_internal_model_name() {
+        let models = vec!["Falcon-H1-1.5B-Instruct-Q4_K_M".to_string()];
+        let descriptors = vec![catalog_model_ref_descriptor(&models[0])];
+        let body = serde_json::json!({
+            "model": "tiiuae/Falcon-H1-1.5B-Instruct-GGUF:Q4_K_M",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let body_bytes = serde_json::to_vec(&body).unwrap();
+        let mut raw = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+            body_bytes.len()
+        )
+        .into_bytes();
+        raw.extend_from_slice(&body_bytes);
+        let mut request = BufferedHttpRequest {
+            raw,
+            method: "POST".to_string(),
+            path: "/v1/chat/completions".to_string(),
+            body_json: Some(body),
+            body_json_attempted: true,
+            body_bytes: Some(body_bytes),
+            body_len_bytes: 0,
+            completion_tokens: None,
+            model_name: Some("tiiuae/Falcon-H1-1.5B-Instruct-GGUF:Q4_K_M".to_string()),
+            request_object_request_ids: Vec::new(),
+            response_adapter: ResponseAdapter::None,
+        };
+
+        rewrite_public_model_alias(&mut request, &models, &descriptors);
+
+        assert_eq!(request.model_name.as_deref(), Some(models[0].as_str()));
+        assert_eq!(request.body_json.as_ref().unwrap()["model"], models[0]);
     }
 
     fn build_chunked_request(body: &[u8], chunks: &[usize]) -> Vec<u8> {
@@ -3639,7 +3695,7 @@ mod tests {
         assert_eq!(request.method, "POST");
         assert_eq!(request.path, "/v1/chat/completions");
         assert_eq!(request.model_name.as_deref(), Some("qwen"));
-        assert_eq!(request.session_hint.as_deref(), Some("alice"));
+
         assert!(request.body_json.is_none());
     }
 
@@ -3674,7 +3730,7 @@ mod tests {
         let request = read_request_from_parts(vec![request]).await;
 
         assert_eq!(request.model_name.as_deref(), Some("auto"));
-        assert_eq!(request.session_hint.as_deref(), Some("sess-42"));
+
         assert!(request.body_json.is_none());
     }
 
@@ -3752,7 +3808,7 @@ mod tests {
         client.await.unwrap();
         let request = server.await.unwrap();
         assert_eq!(request.model_name.as_deref(), Some("qwen"));
-        assert_eq!(request.session_hint.as_deref(), Some("bob"));
+
         let raw = String::from_utf8(request.raw).unwrap();
         assert!(!raw.contains("Expect: 100-continue"));
         assert!(raw.contains("Connection: close"));
@@ -3773,8 +3829,8 @@ mod tests {
     }
 
     /// `probe_http_response_local` uses a much longer timeout (10 min)
-    /// than `probe_http_response` (5 min), because local llama-server
-    /// prefill can legitimately take minutes under load.
+    /// than `probe_http_response` (5 min), because local prefill can
+    /// legitimately take minutes under load.
     ///
     /// This test sends a response after a 2s delay and verifies that
     /// `probe_http_response_local` waits for it (well within its 10-min
@@ -3866,5 +3922,47 @@ mod tests {
         let before = raw.clone();
         inject_mesh_hooks_flag(&mut raw, true);
         assert_eq!(raw, before, "GET with no body should be unchanged");
+    }
+
+    #[test]
+    fn test_rewrite_model_field_updates_body_and_content_length() {
+        let mut request = BufferedHttpRequest {
+            raw: b"POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 45\r\n\r\n{\"model\":\"auto\",\"messages\":[],\"mesh_hooks\":true}".to_vec(),
+            method: "POST".to_string(),
+            path: "/v1/chat/completions".to_string(),
+            body_json: None,
+            body_json_attempted: false,
+            body_bytes: None,
+            body_len_bytes: 45,
+            completion_tokens: None,
+            model_name: Some("auto".to_string()),
+            request_object_request_ids: Vec::new(),
+            response_adapter: ResponseAdapter::None,
+        };
+
+        rewrite_model_field(&mut request, "SmolLM2-135M-Instruct-Q8_0");
+
+        let body_start = request
+            .raw
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        let body: serde_json::Value = serde_json::from_slice(&request.raw[body_start..]).unwrap();
+        assert_eq!(body["model"], "SmolLM2-135M-Instruct-Q8_0");
+        assert_eq!(body["mesh_hooks"], true);
+        assert_eq!(
+            request.model_name.as_deref(),
+            Some("SmolLM2-135M-Instruct-Q8_0")
+        );
+
+        let cl_line = std::str::from_utf8(&request.raw[..body_start])
+            .unwrap()
+            .lines()
+            .find(|line| line.to_ascii_lowercase().starts_with("content-length:"))
+            .unwrap();
+        let declared: usize = cl_line.split(':').nth(1).unwrap().trim().parse().unwrap();
+        assert_eq!(declared, request.raw.len() - body_start);
+        assert_eq!(declared, request.body_len_bytes);
     }
 }

@@ -23,9 +23,11 @@ use super::snapshots::{
 use super::subscriptions::{
     RuntimeDataDirty, RuntimeDataSubscriptionState, RuntimeDataSubscriptions,
 };
+use super::RuntimeLlamaRuntimeSnapshot;
+#[cfg(test)]
 use super::{
     RuntimeLlamaMetricItem, RuntimeLlamaMetricsSnapshot, RuntimeLlamaRuntimeItems,
-    RuntimeLlamaRuntimeSnapshot, RuntimeLlamaSlotItem, RuntimeLlamaSlotsSnapshot,
+    RuntimeLlamaSlotItem, RuntimeLlamaSlotsSnapshot,
 };
 use crate::api::status::{
     build_gpus, build_ownership_payload, LocalInstance, MeshModelPayload, NodeState, PeerPayload,
@@ -37,6 +39,7 @@ use crate::network::metrics::RoutingCollectorSnapshot;
 use crate::plugin::PluginEndpointSummary;
 use crate::runtime::instance::LocalInstanceSnapshot;
 use crate::runtime::wakeable::{WakeableInventoryEntry, WakeableState};
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::watch;
 
@@ -122,6 +125,7 @@ impl RuntimeDataCollector {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn replace_llama_metrics_snapshot(
         &self,
         snapshot: RuntimeLlamaMetricsSnapshot,
@@ -140,6 +144,7 @@ impl RuntimeDataCollector {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn replace_llama_slots_snapshot(&self, snapshot: RuntimeLlamaSlotsSnapshot) -> bool {
         self.update_runtime_status(RuntimeDataDirty::RUNTIME, |runtime_status| {
             let next_items =
@@ -347,8 +352,26 @@ impl RuntimeDataCollector {
             }
         }
 
-        let models = input
-            .catalog
+        let mut catalog = input.catalog;
+        let mut catalog_names = catalog
+            .iter()
+            .map(|entry| entry.model_name.clone())
+            .collect::<HashSet<_>>();
+        for model_name in input
+            .served_models
+            .iter()
+            .chain(input.my_hosted_models.iter())
+        {
+            if model_name.trim().is_empty() || !catalog_names.insert(model_name.clone()) {
+                continue;
+            }
+            catalog.push(mesh::MeshCatalogEntry {
+                model_name: model_name.clone(),
+                descriptor: None,
+            });
+        }
+
+        let models = catalog
             .iter()
             .map(|entry| {
                 let name = &entry.model_name;
@@ -492,44 +515,7 @@ impl RuntimeDataCollector {
                             Some(quant)
                         })
                     });
-                let topology_moe = descriptor
-                    .and_then(|descriptor| descriptor.topology.as_ref())
-                    .and_then(|topology| topology.moe.as_ref());
-                let moe = capabilities.moe
-                    || topology_moe.is_some()
-                    || metadata.map(|m| m.is_moe).unwrap_or(false);
-                let expert_count = topology_moe
-                    .map(|moe| moe.expert_count)
-                    .or_else(|| metadata.map(|m| m.expert_count).filter(|count| *count > 0))
-                    .or_else(|| {
-                        catalog_entry
-                            .and_then(|m| m.moe.as_ref())
-                            .map(|m| m.n_expert)
-                    });
-                let used_expert_count = topology_moe
-                    .map(|moe| moe.used_expert_count)
-                    .or_else(|| {
-                        metadata
-                            .map(|m| m.used_expert_count)
-                            .filter(|count| *count > 0)
-                    })
-                    .or_else(|| {
-                        catalog_entry
-                            .and_then(|m| m.moe.as_ref())
-                            .map(|m| m.n_expert_used)
-                    });
-                let ranking_source = topology_moe
-                    .and_then(|moe| moe.ranking_source.as_ref())
-                    .cloned();
-                let ranking_origin = topology_moe
-                    .and_then(|moe| moe.ranking_origin.as_ref())
-                    .cloned();
-                let ranking_prompt_count = topology_moe.and_then(|moe| moe.ranking_prompt_count);
-                let ranking_tokens = topology_moe.and_then(|moe| moe.ranking_tokens);
-                let ranking_layer_scope = topology_moe
-                    .and_then(|moe| moe.ranking_layer_scope.as_ref())
-                    .cloned();
-                let draft_model = catalog_entry.and_then(|m| m.draft.clone());
+                let draft_model = catalog_entry.and_then(crate::models::catalog_model_draft_ref);
                 let source_page_url =
                     identity
                         .and_then(source_page_url_from_identity)
@@ -602,14 +588,6 @@ impl RuntimeDataCollector {
                     reasoning_status,
                     tool_use,
                     tool_use_status,
-                    moe,
-                    expert_count,
-                    used_expert_count,
-                    ranking_source,
-                    ranking_origin,
-                    ranking_prompt_count,
-                    ranking_tokens,
-                    ranking_layer_scope,
                     draft_model,
                     request_count,
                     last_active_secs_ago,
@@ -672,6 +650,7 @@ impl RuntimeDataCollector {
     }
 }
 
+#[cfg(test)]
 fn build_llama_runtime_items(
     metrics: &RuntimeLlamaMetricsSnapshot,
     slots: &RuntimeLlamaSlotsSnapshot,
@@ -902,9 +881,7 @@ fn build_local_instances(
 }
 
 fn find_catalog_model(name: &str) -> Option<&'static crate::models::catalog::CatalogModel> {
-    crate::models::catalog::MODEL_CATALOG
-        .iter()
-        .find(|m| m.name == name || m.file.strip_suffix(".gguf").unwrap_or(m.file.as_str()) == name)
+    crate::models::find_catalog_model_exact(name)
 }
 
 fn is_huggingface_repository_like(repository: &str) -> bool {

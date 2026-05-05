@@ -6,11 +6,11 @@ use crate::cli::models::ModelSearchSort;
 use crate::cli::models::ModelsCommand;
 use crate::cli::terminal_progress::{clear_stderr_line, start_spinner, DeterminateProgressLine};
 use crate::models::{
-    catalog, delete, download_model_ref_with_progress_details, find_catalog_model_exact,
-    installed_model_capabilities, load_model_usage_record_for_path, model_usage_cache_dir,
-    plan_model_cleanup, scan_installed_models, search_catalog_models, search_huggingface,
-    show_exact_model, show_model_variants_with_progress, ModelCleanupPlan, ModelCleanupResult,
-    SearchArtifactFilter, SearchProgress, SearchSort, ShowVariantsProgress,
+    catalog, catalog_model_ref, delete, download_model_ref_with_progress_details,
+    find_catalog_model_exact, installed_model_capabilities, load_model_usage_record_for_path,
+    model_usage_cache_dir, plan_model_cleanup, scan_installed_models, search_catalog_models,
+    search_huggingface, show_exact_model, show_model_variants_with_progress, ModelCleanupPlan,
+    ModelCleanupResult, SearchArtifactFilter, SearchProgress, SearchSort, ShowVariantsProgress,
 };
 use anyhow::{anyhow, bail, Result};
 use serde_json::json;
@@ -141,7 +141,7 @@ fn build_installed_rows() -> Vec<InstalledRow> {
             let display_name = crate::models::installed_model_display_name(&name);
             let catalog_model = find_catalog_model_exact(&name);
             let model_ref = if let Some(model) = catalog_model {
-                model.name.clone()
+                catalog_model_ref(model)
             } else if let Some(identity) = crate::models::huggingface_identity_for_path(&path) {
                 crate::models::installed_model_huggingface_ref(&identity)
             } else {
@@ -307,6 +307,7 @@ pub async fn dispatch_models_command(command: &ModelsCommand) -> Result<()> {
             yes,
             json,
         } => run_model_cleanup(unused_since.as_deref(), *yes, *json)?,
+        ModelsCommand::Prune { yes, json } => run_model_prune(*yes, *json)?,
         ModelsCommand::Search {
             query,
             gguf,
@@ -343,6 +344,43 @@ pub async fn dispatch_models_command(command: &ModelsCommand) -> Result<()> {
         ModelsCommand::Delete { model, yes, json } => {
             run_model_delete(model.as_str(), *yes, *json).await?
         }
+    }
+    Ok(())
+}
+
+fn run_model_prune(yes: bool, json_output: bool) -> Result<()> {
+    let cache_dir = crate::inference::skippy::materialized_stage_cache_dir();
+    if !yes {
+        if json_output {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "dry_run": true,
+                    "cache_dir": cache_dir,
+                    "apply": "mesh-llm models prune --yes",
+                }))?
+            );
+        } else {
+            println!("🧹 Derived stage cache prune preview");
+            println!("📁 Cache: {}", cache_dir.display());
+            println!("Apply with:");
+            println!("  mesh-llm models prune --yes");
+        }
+        return Ok(());
+    }
+    let removed = crate::inference::skippy::prune_unpinned_materialized_stages()?;
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "dry_run": false,
+                "cache_dir": cache_dir,
+                "removed_files": removed,
+            }))?
+        );
+    } else {
+        println!("✅ Derived stage cache pruned");
+        println!("Removed files: {}", removed);
     }
     Ok(())
 }
@@ -516,7 +554,10 @@ pub async fn run_model_delete(model: &str, yes: bool, json_output: bool) -> Resu
         return formatter.render_delete_preview(&resolved);
     }
 
-    let result = delete::delete_model_by_identifier(model).await?;
+    let removed_derived_cache_files =
+        crate::inference::skippy::remove_materialized_stages_for_sources(&paths)?;
+    let mut result = delete::delete_model_by_identifier(model).await?;
+    result.removed_derived_cache_files = removed_derived_cache_files;
     let formatter = models_formatter(json_output);
     formatter.render_delete_result(&result)
 }

@@ -5,8 +5,8 @@ use super::formatters::{
     variant_selector_label, ConsoleFormatter, InstalledRow, ModelsFormatter, SearchFormatter,
 };
 use crate::models::{
-    catalog, DeleteResult as CliDeleteResult, ModelDetails, ResolvedModel as CliResolvedModel,
-    SearchArtifactFilter, SearchHit, SearchSort,
+    catalog, catalog_model_draft_ref, catalog_model_ref, DeleteResult as CliDeleteResult,
+    ModelDetails, ResolvedModel as CliResolvedModel, SearchArtifactFilter, SearchHit, SearchSort,
 };
 use anyhow::Result;
 use std::fmt::Write as FmtWrite;
@@ -54,7 +54,9 @@ impl SearchFormatter for ConsoleFormatter {
         }
         writeln!(&mut output)?;
         for model in results.iter().take(limit) {
+            let model_ref = catalog_model_ref(model);
             writeln!(&mut output, "• {}  {}", model.name, model.size)?;
+            writeln!(&mut output, "  ref: {}", model_ref)?;
             writeln!(&mut output, "  {}", model.description)?;
             if let Some(fit) = fit_hint_for_size_label(&model.size) {
                 writeln!(&mut output, "  {}", fit)?;
@@ -176,9 +178,11 @@ impl ModelsFormatter for ConsoleFormatter {
         writeln!(&mut output)?;
         for model in models {
             let model_capabilities = catalog_model_capabilities(model);
+            let model_ref = catalog_model_ref(model);
             writeln!(&mut output, "• {}  {}", model.name, model.size)?;
+            writeln!(&mut output, "  ref: {}", model_ref)?;
             writeln!(&mut output, "  {}", model.description)?;
-            if let Some(draft) = model.draft.as_deref() {
+            if let Some(draft) = catalog_model_draft_ref(model) {
                 writeln!(&mut output, "  🧠 Draft: {}", draft)?;
             }
             if let Some(label) = model_capabilities.vision_label() {
@@ -189,9 +193,6 @@ impl ModelsFormatter for ConsoleFormatter {
             }
             if let Some(label) = model_capabilities.reasoning_label() {
                 writeln!(&mut output, "  🧠 Reasoning: {}", label)?;
-            }
-            if model.moe.is_some() {
-                writeln!(&mut output, "  🧩 MoE: yes")?;
             }
             writeln!(&mut output)?;
         }
@@ -278,9 +279,6 @@ impl ModelsFormatter for ConsoleFormatter {
                 if let Some(draft) = model.draft.as_deref() {
                     writeln!(&mut output, "   🧠 draft: {}", draft)?;
                 }
-                if model.moe.is_some() {
-                    writeln!(&mut output, "   🧩 MoE: yes")?;
-                }
             }
             writeln!(&mut output)?;
         }
@@ -325,19 +323,6 @@ impl ModelsFormatter for ConsoleFormatter {
         }
         if let Some(label) = details.capabilities.reasoning_label() {
             println!("  🧠 reasoning ({label})");
-        }
-        if let Some(moe) = details.moe.clone() {
-            println!(
-                "🧩 MoE: {} experts, top-{}, min per node {}{}",
-                moe.n_expert,
-                moe.n_expert_used,
-                moe.min_experts_per_node,
-                if moe.ranking.is_empty() {
-                    ", no embedded ranking".to_string()
-                } else {
-                    format!(", ranking {}", moe.ranking.len())
-                }
-            );
         }
         println!("📥 Download:");
         if model_kind_code(details.kind) == "mlx" {
@@ -451,6 +436,10 @@ impl ModelsFormatter for ConsoleFormatter {
         );
         println!("Metadata files removed: {}", result.removed_metadata_files);
         println!("Usage records purged: {}", result.removed_usage_records);
+        println!(
+            "Derived stage cache files removed: {}",
+            result.removed_derived_cache_files
+        );
         Ok(())
     }
 }

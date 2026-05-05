@@ -3,7 +3,6 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use crate::cli::benchmark::BenchmarkCommand;
-use crate::cli::moe::MoeCommand;
 use crate::cli::runtime::RuntimeCommand;
 use crate::crypto::TrustPolicy;
 
@@ -216,7 +215,6 @@ pub(crate) enum GpuCommand {
 pub(crate) mod benchmark;
 pub(crate) mod commands;
 pub mod models;
-pub(crate) mod moe;
 pub mod output;
 pub(crate) mod pager;
 pub(crate) mod runtime;
@@ -235,7 +233,7 @@ pub enum LogFormat {
     name = "mesh-llm",
     version = crate::VERSION,
     about = "Pool GPUs over the internet for LLM inference",
-    after_help = "Preferred runtime entrypoints:\n  mesh-llm serve\n  mesh-llm serve --model Qwen3-8B-Q4_K_M\n  mesh-llm client --auto\n  mesh-llm gpus\n\n`mesh-llm serve` loads startup models from ~/.mesh-llm/config.toml.\nRun with --help-advanced for all options.\n\nExternal backends (vLLM, TGI, Ollama):\n  Add to ~/.mesh-llm/config.toml:\n    [[plugin]]\n    name = \"openai-endpoint\"\n    url = \"http://gpu-box:8000/v1\"\n  Then: mesh-llm serve     (or: mesh-llm client  to skip llama.cpp)"
+    after_help = "Preferred runtime entrypoints:\n  mesh-llm serve\n  mesh-llm serve --model Qwen3-8B-Q4_K_M\n  mesh-llm client --auto\n  mesh-llm gpus\n\n`mesh-llm serve` loads startup models from ~/.mesh-llm/config.toml.\nRun with --help-advanced for all options.\n\nExternal backends (vLLM, TGI, Ollama):\n  Add to ~/.mesh-llm/config.toml:\n    [[plugin]]\n    name = \"openai-endpoint\"\n    url = \"http://gpu-box:8000/v1\"\n  Then: mesh-llm serve     (or: mesh-llm client  for client-only mode)"
 )]
 pub(crate) struct Cli {
     #[command(subcommand)]
@@ -269,7 +267,7 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub(crate) gguf: Vec<PathBuf>,
 
-    /// Explicit mmproj sidecar to pass to llama-server for the primary served model.
+    /// Explicit mmproj sidecar for the primary served model.
     #[arg(long, hide = true)]
     pub(crate) mmproj: Option<PathBuf>,
 
@@ -348,19 +346,19 @@ pub(crate) struct Cli {
     #[arg(long = "no-enumerate-host", hide = true)]
     pub(crate) no_enumerate_host: bool,
 
-    /// Path to rpc-server, llama-server, and llama-moe-split binaries.
+    /// Path to bundled mesh support binaries.
     #[arg(long, hide = true)]
     pub(crate) bin_dir: Option<PathBuf>,
 
     /// Override which bundled llama.cpp flavor to use.
     #[arg(long, value_enum)]
-    pub(crate) llama_flavor: Option<crate::inference::launch::BinaryFlavor>,
+    pub(crate) llama_flavor: Option<crate::system::backend::BinaryFlavor>,
 
-    /// Device for rpc-server (e.g. MTL0, CUDA0, ROCm0, Vulkan0, CPU).
+    /// Device override for local backend selection.
     #[arg(long, hide = true)]
     pub(crate) device: Option<String>,
 
-    /// Tensor split ratios for llama-server (e.g. "0.8,0.2").
+    /// Deprecated tensor split override retained for CLI compatibility.
     #[arg(long, hide = true)]
     pub(crate) tensor_split: Option<String>,
 
@@ -446,11 +444,6 @@ pub(crate) enum Command {
         json: bool,
         #[command(subcommand)]
         command: Option<GpuCommand>,
-    },
-    /// Plan, analyze, and contribute MoE expert rankings.
-    Moe {
-        #[command(subcommand)]
-        command: MoeCommand,
     },
     /// Inspect and manage local runtime-served models.
     #[command(hide = true)]
@@ -557,7 +550,7 @@ pub(crate) enum Command {
         #[arg(long)]
         write: bool,
     },
-    /// Stop all running mesh-llm, llama-server, and rpc-server processes.
+    /// Stop running mesh-llm processes.
     Stop,
     /// Blackboard — post, search, and read messages shared across the mesh.
     ///
@@ -826,7 +819,6 @@ fn shell_display(arg: &OsString) -> String {
 mod tests {
     use super::*;
     use crate::cli::models::{ModelSearchSort, ModelsCommand};
-    use crate::cli::moe::MoeAnalyzeCommand;
     use clap::{error::ErrorKind, CommandFactory, Parser};
 
     #[test]
@@ -974,65 +966,6 @@ mod tests {
             Command::Gpus { json, command } => {
                 assert!(!json);
                 assert!(command.is_none());
-            }
-            other => panic!("unexpected command: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn moe_analyze_full_accepts_share_flag() {
-        let cli = Cli::parse_from([
-            "mesh-llm",
-            "moe",
-            "analyze",
-            "full",
-            "Qwen/Qwen3",
-            "--share",
-            "--dataset-repo",
-            "meshllm/custom-rankings",
-        ]);
-
-        match cli.command.expect("moe command expected") {
-            Command::Moe {
-                command:
-                    MoeCommand::Analyze {
-                        command:
-                            MoeAnalyzeCommand::Full {
-                                share,
-                                hf_job,
-                                model,
-                                ..
-                            },
-                    },
-            } => {
-                assert!(share);
-                assert_eq!(model, "Qwen/Qwen3");
-                assert_eq!(hf_job.dataset_repo, "meshllm/custom-rankings");
-            }
-            other => panic!("unexpected command: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn moe_analyze_micro_accepts_share_flag() {
-        let cli = Cli::parse_from([
-            "mesh-llm",
-            "moe",
-            "analyze",
-            "micro",
-            "Qwen/Qwen3",
-            "--share",
-        ]);
-
-        match cli.command.expect("moe command expected") {
-            Command::Moe {
-                command:
-                    MoeCommand::Analyze {
-                        command: MoeAnalyzeCommand::Micro { share, model, .. },
-                    },
-            } => {
-                assert!(share);
-                assert_eq!(model, "Qwen/Qwen3");
             }
             other => panic!("unexpected command: {other:?}"),
         }

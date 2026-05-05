@@ -88,7 +88,6 @@ pub struct PeerInfo {
     pub available_models: Vec<String>,
     pub requested_models: Vec<String>,
     pub last_seen: std::time::Instant,
-    pub moe_recovered_at: Option<std::time::Instant>,
     pub version: Option<String>,
     pub gpu_name: Option<String>,
     pub hostname: Option<String>,
@@ -122,12 +121,6 @@ impl PeerInfo {
         } else {
             self.is_assigned_model(model)
         }
-    }
-
-    pub fn moe_recovery_ready(&self) -> bool {
-        self.moe_recovered_at
-            .map(|t| t.elapsed().as_secs() >= 30)
-            .unwrap_or(true)
     }
 
     pub fn advertised_context_length(&self, model: &str) -> Option<u32> {
@@ -269,6 +262,25 @@ fn identity_from_model_source(source: &str) -> Option<ServedModelIdentity> {
         return None;
     }
 
+    if let Some((repo_id, revision, selector)) = parse_model_ref_source(trimmed) {
+        let canonical_ref = format_model_ref(&repo_id, revision.as_deref(), selector.as_deref());
+        return Some(ServedModelIdentity {
+            model_name: String::new(),
+            is_primary: false,
+            source_kind: ModelSourceKind::HuggingFace,
+            canonical_ref: Some(canonical_ref.clone()),
+            repository: Some(repo_id),
+            revision,
+            artifact: selector,
+            local_file_name: None,
+            identity_hash: Some(identity_hash_for(&canonical_ref)),
+        });
+    }
+
+    if is_explicit_local_path(trimmed) {
+        return Some(local_gguf_identity_from_source(trimmed));
+    }
+
     if let Some((repo_id, revision, file)) = parse_hf_resolve_url_parts(trimmed) {
         let canonical_ref = format_hf_canonical_ref(&repo_id, revision.as_deref(), &file);
         return Some(ServedModelIdentity {
@@ -314,26 +326,9 @@ fn identity_from_model_source(source: &str) -> Option<ServedModelIdentity> {
     }
 
     if trimmed.ends_with(".gguf")
-        || trimmed.starts_with('/')
-        || trimmed.starts_with("./")
-        || trimmed.starts_with("../")
         || (trimmed.contains('/') && !trimmed.ends_with('/') && trimmed.split('/').count() != 2)
     {
-        let local_file_name = std::path::Path::new(trimmed)
-            .file_name()
-            .and_then(|value| value.to_str())
-            .map(str::to_string);
-        return Some(ServedModelIdentity {
-            model_name: String::new(),
-            is_primary: false,
-            source_kind: ModelSourceKind::LocalGguf,
-            canonical_ref: None,
-            repository: None,
-            revision: None,
-            artifact: None,
-            local_file_name,
-            identity_hash: None,
-        });
+        return Some(local_gguf_identity_from_source(trimmed));
     }
 
     Some(ServedModelIdentity {
@@ -349,7 +344,97 @@ fn identity_from_model_source(source: &str) -> Option<ServedModelIdentity> {
     })
 }
 
+fn parse_model_ref_source(input: &str) -> Option<(String, Option<String>, Option<String>)> {
+    if input.starts_with("http://")
+        || input.starts_with("https://")
+        || is_explicit_local_path(input)
+    {
+        return None;
+    }
+    let (org, tail) = input.split_once('/')?;
+    if org.is_empty() || tail.is_empty() || tail.contains('/') || org.contains(':') {
+        return None;
+    }
+    let (repo, revision, selector) = parse_repo_tail_selector_and_revision(tail)?;
+    Some((format!("{org}/{repo}"), revision, selector))
+}
+
+fn parse_repo_tail_selector_and_revision(
+    tail: &str,
+) -> Option<(String, Option<String>, Option<String>)> {
+    let at_pos = tail.find('@');
+    let colon_pos = tail.find(':');
+    match (at_pos, colon_pos) {
+        (Some(at), Some(colon)) if at < colon => nonempty_model_ref_parts(
+            &tail[..at],
+            Some(&tail[at + 1..colon]),
+            Some(&tail[colon + 1..]),
+        ),
+        (Some(at), Some(colon)) if colon < at => nonempty_model_ref_parts(
+            &tail[..colon],
+            Some(&tail[at + 1..]),
+            Some(&tail[colon + 1..at]),
+        ),
+        (Some(at), None) => nonempty_model_ref_parts(&tail[..at], Some(&tail[at + 1..]), None),
+        (None, Some(colon)) => {
+            nonempty_model_ref_parts(&tail[..colon], None, Some(&tail[colon + 1..]))
+        }
+        (None, None) => nonempty_model_ref_parts(tail, None, None),
+        _ => None,
+    }
+}
+
+fn nonempty_model_ref_parts(
+    repo: &str,
+    revision: Option<&str>,
+    selector: Option<&str>,
+) -> Option<(String, Option<String>, Option<String>)> {
+    if repo.is_empty() || revision.is_some_and(str::is_empty) || selector.is_some_and(str::is_empty)
+    {
+        return None;
+    }
+    Some((
+        repo.to_string(),
+        revision.map(str::to_string),
+        selector.map(str::to_string),
+    ))
+}
+
+fn format_model_ref(repo: &str, revision: Option<&str>, selector: Option<&str>) -> String {
+    match (revision, selector) {
+        (Some(revision), Some(selector)) => format!("{repo}@{revision}:{selector}"),
+        (Some(revision), None) => format!("{repo}@{revision}"),
+        (None, Some(selector)) => format!("{repo}:{selector}"),
+        (None, None) => repo.to_string(),
+    }
+}
+
+fn is_explicit_local_path(source: &str) -> bool {
+    source.starts_with('/') || source.starts_with("./") || source.starts_with("../")
+}
+
+fn local_gguf_identity_from_source(source: &str) -> ServedModelIdentity {
+    let local_file_name = std::path::Path::new(source)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(str::to_string);
+    ServedModelIdentity {
+        model_name: String::new(),
+        is_primary: false,
+        source_kind: ModelSourceKind::LocalGguf,
+        canonical_ref: None,
+        repository: None,
+        revision: None,
+        artifact: None,
+        local_file_name,
+        identity_hash: None,
+    }
+}
+
 fn parse_hf_ref_parts(input: &str) -> Option<(String, Option<String>, String)> {
+    if is_explicit_local_path(input) {
+        return None;
+    }
     let parts: Vec<&str> = input.splitn(3, '/').collect();
     if parts.len() != 3 {
         return None;
@@ -358,6 +443,9 @@ fn parse_hf_ref_parts(input: &str) -> Option<(String, Option<String>, String)> {
         Some((repo, rev)) => (repo, Some(rev.to_string())),
         None => (parts[1], None),
     };
+    if parts[0].is_empty() || repo_tail.is_empty() || parts[2].is_empty() {
+        return None;
+    }
     Some((
         format!("{}/{}", parts[0], repo_tail),
         revision,

@@ -523,14 +523,6 @@ async fn send_request_and_read_response(addr: SocketAddr, parts: Vec<Vec<u8>>) -
     String::from_utf8(response).unwrap()
 }
 
-async fn connected_tcp_pair() -> (TcpStream, TcpStream) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let client = TcpStream::connect(addr).await.unwrap();
-    let (server, _) = listener.accept().await.unwrap();
-    (client, server)
-}
-
 #[tokio::test]
 async fn test_api_proxy_integration_fragmented_post_body() {
     let (upstream_port, upstream_rx, upstream_handle) =
@@ -588,89 +580,6 @@ async fn test_api_proxy_integration_chunked_body() {
 
     proxy_handle.abort();
     let _ = upstream_handle.await;
-}
-
-#[tokio::test]
-async fn test_moe_remote_failure_removes_peer_for_faildown() {
-    let node = mesh::Node::new_for_tests(mesh::NodeRole::Worker)
-        .await
-        .unwrap();
-    let peer_id = iroh::EndpointId::from(
-        iroh::SecretKey::from_bytes(&{
-            let mut bytes = [0u8; 32];
-            bytes[0] = 42;
-            bytes
-        })
-        .public(),
-    );
-    node.insert_test_peer(mesh::PeerInfo {
-        id: peer_id,
-        addr: iroh::EndpointAddr {
-            id: peer_id,
-            addrs: Default::default(),
-        },
-        tunnel_port: None,
-        role: mesh::NodeRole::Host { http_port: 9337 },
-        first_joined_mesh_ts: None,
-        models: vec![],
-        vram_bytes: 0,
-        rtt_ms: None,
-        model_source: None,
-        serving_models: vec!["Qwen3-Coder-Next-Q4_K_M".to_string()],
-        hosted_models: vec!["Qwen3-Coder-Next-Q4_K_M".to_string()],
-        hosted_models_known: true,
-        available_models: vec![],
-        requested_models: vec![],
-        explicit_model_interests: vec![],
-        last_seen: std::time::Instant::now(),
-        last_mentioned: std::time::Instant::now(),
-        moe_recovered_at: None,
-        version: None,
-        gpu_name: None,
-        hostname: None,
-        is_soc: None,
-        gpu_vram: None,
-        gpu_reserved_bytes: None,
-        gpu_mem_bandwidth_gbps: None,
-        gpu_compute_tflops_fp32: None,
-        gpu_compute_tflops_fp16: None,
-        available_model_metadata: vec![],
-        experts_summary: None,
-        available_model_sizes: HashMap::new(),
-        served_model_descriptors: vec![],
-        served_model_runtime: vec![],
-        owner_attestation: None,
-        owner_summary: crate::crypto::OwnershipSummary::default(),
-    })
-    .await;
-
-    let (client, mut observer) = connected_tcp_pair().await;
-    let request =
-        b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}";
-
-    let routed = crate::network::proxy::route_to_target(
-        node.clone(),
-        client,
-        None,
-        election::InferenceTarget::MoeRemote(peer_id),
-        request,
-        crate::network::proxy::ResponseAdapter::None,
-    )
-    .await;
-
-    assert!(!routed);
-    assert!(
-        !node.has_test_peer(peer_id).await,
-        "failed MoE shard should be removed so election can fail down"
-    );
-    let metrics = node.routing_metrics_snapshot();
-    assert_eq!(metrics.request_count, 1);
-    assert_eq!(metrics.attempt_unavailable_count, 1);
-
-    let mut response = Vec::new();
-    observer.read_to_end(&mut response).await.unwrap();
-    let response = String::from_utf8(response).unwrap();
-    assert!(response.starts_with("HTTP/1.1 503"));
 }
 
 #[tokio::test]
@@ -1415,10 +1324,11 @@ async fn test_api_proxy_integration_pipeline_fallback_uses_direct_proxy() {
     let raw = String::from_utf8(strong_rx.await.unwrap()).unwrap();
 
     assert!(response.starts_with("HTTP/1.1 200 OK"));
-    assert!(raw.contains("\"model\":\"auto\""));
+    assert!(raw.contains(&format!("\"model\":\"{strong_model}\"")));
+    assert!(!raw.contains("\"model\":\"auto\""));
     assert!(!raw.contains("[Task Plan from"));
     assert!(raw.contains("\"Review this codebase, design a system-level fix for the HTTP proxy, debug the fragmented request bug, implement the code changes, update the tests, and explain the trade-offs around buffering, chunked transfer encoding, and connection reuse.\""));
-    // model=auto must inject mesh_hooks flag so llama-server enables hook callbacks
+    // model=auto must inject mesh_hooks so the serving runtime enables hook callbacks.
     assert!(
         raw.contains("\"mesh_hooks\":true"),
         "model=auto should inject mesh_hooks:true into the forwarded body"

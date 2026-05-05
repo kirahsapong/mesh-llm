@@ -26,6 +26,7 @@ async fn make_test_node(role: super::NodeRole) -> Result<Node> {
     let (inflight_change_tx, _) = watch::channel(0u64);
     let (tunnel_tx, _tunnel_rx) = tokio::sync::mpsc::channel(8);
     let (tunnel_http_tx, _tunnel_http_rx) = tokio::sync::mpsc::channel(8);
+    let (stage_transport_tx, _stage_transport_rx) = tokio::sync::mpsc::channel(8);
     let runtime_data_producer = crate::runtime_data::RuntimeDataCollector::new().producer(
         crate::runtime_data::RuntimeDataSource {
             scope: "routing",
@@ -75,6 +76,10 @@ async fn make_test_node(role: super::NodeRole) -> Result<Node> {
         runtime_data_producer,
         tunnel_tx,
         tunnel_http_tx,
+        stage_transport_tx,
+        stage_control_tx: Arc::new(Mutex::new(None)),
+        stage_transport_bridges: Arc::new(Mutex::new(HashMap::new())),
+        stage_topologies: Arc::new(Mutex::new(StageTopologyState::default())),
         plugin_manager: Arc::new(Mutex::new(None)),
         display_name: Arc::new(Mutex::new(None)),
         owner_attestation: Arc::new(Mutex::new(None)),
@@ -531,6 +536,33 @@ fn protocol_from_alpn_defaults_to_v1() {
 }
 
 #[test]
+fn identity_from_model_source_treats_absolute_gguf_as_local() {
+    let identity =
+        identity_from_model_source("/home/jdumay/models/smollm2-a.gguf").expect("identity");
+
+    assert_eq!(identity.source_kind, ModelSourceKind::LocalGguf);
+    assert_eq!(identity.local_file_name.as_deref(), Some("smollm2-a.gguf"));
+    assert_eq!(identity.repository, None);
+}
+
+#[test]
+fn parse_hf_ref_parts_rejects_absolute_paths() {
+    assert!(parse_hf_ref_parts("/home/jdumay/models/smollm2-a.gguf").is_none());
+}
+
+#[test]
+fn identity_from_model_source_keeps_huggingface_refs() {
+    let identity =
+        identity_from_model_source("tiiuae/Falcon-H1-1.5B-Instruct-GGUF:Q4_K_M").expect("identity");
+
+    assert_eq!(identity.source_kind, ModelSourceKind::HuggingFace);
+    assert_eq!(
+        identity.canonical_ref.as_deref(),
+        Some("tiiuae/Falcon-H1-1.5B-Instruct-GGUF:Q4_K_M")
+    );
+}
+
+#[test]
 fn control_frame_roundtrip() {
     let frame = make_valid_gossip_frame();
     let encoded = encode_control_frame(STREAM_GOSSIP, &frame);
@@ -549,7 +581,6 @@ fn make_test_peer_info(peer_id: EndpointId) -> PeerInfo {
             id: peer_id,
             addrs: Default::default(),
         },
-        tunnel_port: None,
         role: super::NodeRole::Worker,
         first_joined_mesh_ts: None,
         models: vec![],
@@ -564,7 +595,6 @@ fn make_test_peer_info(peer_id: EndpointId) -> PeerInfo {
         explicit_model_interests: vec![],
         last_seen: std::time::Instant::now(),
         last_mentioned: std::time::Instant::now(),
-        moe_recovered_at: None,
         version: None,
         gpu_name: None,
         hostname: None,
@@ -581,40 +611,6 @@ fn make_test_peer_info(peer_id: EndpointId) -> PeerInfo {
         served_model_runtime: vec![],
         owner_attestation: None,
         owner_summary: OwnershipSummary::default(),
-    }
-}
-
-fn make_test_moe_descriptor(model_name: &str, identity_hash: &str) -> ServedModelDescriptor {
-    ServedModelDescriptor {
-        identity: ServedModelIdentity {
-            model_name: model_name.to_string(),
-            is_primary: true,
-            source_kind: ModelSourceKind::HuggingFace,
-            canonical_ref: Some(format!("hf://{identity_hash}")),
-            repository: Some("Qwen".to_string()),
-            revision: Some("main".to_string()),
-            artifact: Some(format!("{model_name}.gguf")),
-            local_file_name: Some(format!("{model_name}.gguf")),
-            identity_hash: Some(identity_hash.to_string()),
-        },
-        capabilities: crate::models::ModelCapabilities {
-            moe: true,
-            ..Default::default()
-        },
-        topology: Some(crate::models::ModelTopology {
-            moe: Some(crate::models::ModelMoeInfo {
-                expert_count: 512,
-                used_expert_count: 10,
-                min_experts_per_node: Some(160),
-                source: Some("test".to_string()),
-                ranking_source: None,
-                ranking_origin: None,
-                ranking: Vec::new(),
-                ranking_prompt_count: None,
-                ranking_tokens: None,
-                ranking_layer_scope: None,
-            }),
-        }),
     }
 }
 
@@ -784,57 +780,7 @@ fn stale_dispatcher_cannot_remove_replacement_connection() {
 }
 
 #[test]
-fn shared_exact_moe_identity_uses_stricter_heartbeat_without_inbound_grace() {
-    let mut peer = make_test_peer_info(make_test_endpoint_id(7));
-    peer.served_model_descriptors = vec![make_test_moe_descriptor(
-        "Qwen3-Coder-Next-Q4_K_M",
-        "same-model",
-    )];
-    let local_descriptors = vec![make_test_moe_descriptor(
-        "Qwen3-Coder-Next-Q4_K_M",
-        "same-model",
-    )];
-    let local_runtime = vec![];
-
-    let policy =
-        heartbeat_failure_policy_for_peer(&local_descriptors, &local_runtime, &peer, false);
-
-    assert_eq!(
-        policy,
-        HeartbeatFailurePolicy {
-            allow_recent_inbound_grace: false,
-            failure_threshold: 2,
-        }
-    );
-}
-
-#[test]
-fn non_matching_or_non_moe_peers_keep_default_heartbeat_grace() {
-    let mut peer = make_test_peer_info(make_test_endpoint_id(8));
-    peer.served_model_descriptors = vec![make_test_moe_descriptor(
-        "Qwen3-Coder-Next-Q4_K_M",
-        "remote-model",
-    )];
-    let local_descriptors = vec![make_test_moe_descriptor(
-        "Qwen3-Coder-Next-Q4_K_M",
-        "local-model",
-    )];
-    let local_runtime = vec![];
-
-    let policy =
-        heartbeat_failure_policy_for_peer(&local_descriptors, &local_runtime, &peer, false);
-
-    assert_eq!(
-        policy,
-        HeartbeatFailurePolicy {
-            allow_recent_inbound_grace: true,
-            failure_threshold: 2,
-        }
-    );
-}
-
-#[test]
-fn relay_only_non_moe_peers_get_extra_heartbeat_cycle() {
+fn relay_only_peers_get_extra_heartbeat_cycle() {
     let peer = make_test_peer_info(make_test_endpoint_id(12));
     let local_descriptors = vec![];
     let local_runtime = vec![];
@@ -848,86 +794,6 @@ fn relay_only_non_moe_peers_get_extra_heartbeat_cycle() {
             failure_threshold: 3,
         }
     );
-}
-
-#[test]
-fn shared_exact_moe_startup_relaxes_heartbeat_during_convergence() {
-    let mut peer = make_test_peer_info(make_test_endpoint_id(11));
-    peer.served_model_descriptors = vec![make_test_moe_descriptor(
-        "Qwen3-Coder-Next-Q4_K_M",
-        "same-model",
-    )];
-    let local_descriptors = vec![make_test_moe_descriptor(
-        "Qwen3-Coder-Next-Q4_K_M",
-        "same-model",
-    )];
-    let local_runtime = vec![ModelRuntimeDescriptor {
-        model_name: "Qwen3-Coder-Next-Q4_K_M".to_string(),
-        identity_hash: Some("same-model".to_string()),
-        context_length: None,
-        ready: false,
-    }];
-
-    let policy =
-        heartbeat_failure_policy_for_peer(&local_descriptors, &local_runtime, &peer, false);
-
-    assert_eq!(
-        policy,
-        HeartbeatFailurePolicy {
-            allow_recent_inbound_grace: true,
-            failure_threshold: 4,
-        }
-    );
-}
-
-#[test]
-fn recovered_moe_peer_stays_out_of_active_placement_until_probation_expires() {
-    let mut peer = make_test_peer_info(make_test_endpoint_id(9));
-    peer.serving_models = vec!["Qwen3-Coder-Next-Q4_K_M".to_string()];
-    peer.served_model_descriptors = vec![make_test_moe_descriptor(
-        "Qwen3-Coder-Next-Q4_K_M",
-        "same-model",
-    )];
-    let local_descriptors = vec![make_test_moe_descriptor(
-        "Qwen3-Coder-Next-Q4_K_M",
-        "same-model",
-    )];
-
-    peer.moe_recovered_at = Some(std::time::Instant::now());
-    assert!(!peer_is_eligible_for_active_moe(
-        &local_descriptors,
-        &peer,
-        "Qwen3-Coder-Next-Q4_K_M"
-    ));
-
-    peer.moe_recovered_at = Some(
-        std::time::Instant::now() - std::time::Duration::from_secs(MOE_RECOVERY_PROBATION_SECS + 1),
-    );
-    assert!(peer_is_eligible_for_active_moe(
-        &local_descriptors,
-        &peer,
-        "Qwen3-Coder-Next-Q4_K_M"
-    ));
-}
-
-#[test]
-fn requested_model_peer_is_eligible_for_active_moe_during_startup() {
-    let mut peer = make_test_peer_info(make_test_endpoint_id(10));
-    peer.requested_models = vec!["Qwen3-Coder-Next-Q4_K_M".to_string()];
-    peer.served_model_descriptors = vec![make_test_moe_descriptor(
-        "Qwen3-Coder-Next-Q4_K_M",
-        "same-model",
-    )];
-    let local_descriptors = vec![make_test_moe_descriptor(
-        "Qwen3-Coder-Next-Q4_K_M",
-        "same-model",
-    )];
-
-    assert!(peer_is_eligible_for_active_moe(
-        &local_descriptors,
-        &peer,
-        "Qwen3-Coder-Next-Q4_K_M"
-    ));
 }
 
 #[test]
@@ -2858,7 +2724,6 @@ fn make_test_peer(id: EndpointId, rtt_ms: Option<u32>, vram_gb: u64) -> PeerInfo
             id,
             addrs: Default::default(),
         },
-        tunnel_port: None,
         role: super::NodeRole::Worker,
         first_joined_mesh_ts: None,
         models: vec![],
@@ -2873,7 +2738,6 @@ fn make_test_peer(id: EndpointId, rtt_ms: Option<u32>, vram_gb: u64) -> PeerInfo
         explicit_model_interests: vec![],
         last_seen: std::time::Instant::now(),
         last_mentioned: std::time::Instant::now(),
-        moe_recovered_at: None,
         version: None,
         gpu_name: None,
         hostname: None,
@@ -3299,6 +3163,7 @@ async fn make_test_node_with_owner(
     let (inflight_change_tx, _) = watch::channel(0u64);
     let (tunnel_tx, _tunnel_rx) = tokio::sync::mpsc::channel(8);
     let (tunnel_http_tx, _tunnel_http_rx) = tokio::sync::mpsc::channel(8);
+    let (stage_transport_tx, _stage_transport_rx) = tokio::sync::mpsc::channel(8);
     let revision = config_state.revision();
     let owner_attestation = sign_node_ownership(
         owner_keypair,
@@ -3364,6 +3229,10 @@ async fn make_test_node_with_owner(
         runtime_data_producer,
         tunnel_tx,
         tunnel_http_tx,
+        stage_transport_tx,
+        stage_control_tx: Arc::new(Mutex::new(None)),
+        stage_transport_bridges: Arc::new(Mutex::new(HashMap::new())),
+        stage_topologies: Arc::new(Mutex::new(StageTopologyState::default())),
         plugin_manager: Arc::new(Mutex::new(None)),
         display_name: Arc::new(Mutex::new(None)),
         owner_attestation: Arc::new(Mutex::new(Some(owner_attestation))),
@@ -3684,6 +3553,11 @@ async fn config_subscribe_rejects_pinned_snapshot_for_older_peer() -> Result<()>
                     ctx_size: Some(8192),
                     gpu_id: Some("pci:0000:65:00.0".into()),
                     parallel: None,
+                    cache_type_k: None,
+                    cache_type_v: None,
+                    batch: None,
+                    ubatch: None,
+                    flash_attention: None,
                 }],
                 plugins: vec![],
             },
@@ -3782,6 +3656,11 @@ async fn config_subscribe_rejects_pinned_snapshot_for_malformed_peer_version() -
                     ctx_size: Some(8192),
                     gpu_id: Some("pci:0000:65:00.0".into()),
                     parallel: None,
+                    cache_type_k: None,
+                    cache_type_v: None,
+                    batch: None,
+                    ubatch: None,
+                    flash_attention: None,
                 }],
                 plugins: vec![],
             },
@@ -3878,6 +3757,11 @@ async fn config_subscribe_allows_pinned_snapshot_for_same_release_prerelease_pee
                     ctx_size: Some(8192),
                     gpu_id: Some("pci:0000:65:00.0".into()),
                     parallel: None,
+                    cache_type_k: None,
+                    cache_type_v: None,
+                    batch: None,
+                    ubatch: None,
+                    flash_attention: None,
                 }],
                 plugins: vec![],
             },
@@ -4053,6 +3937,11 @@ async fn config_subscribe_closes_when_revision_becomes_pinned_for_malformed_peer
                     ctx_size: Some(8192),
                     gpu_id: Some("pci:0000:65:00.0".into()),
                     parallel: None,
+                    cache_type_k: None,
+                    cache_type_v: None,
+                    batch: None,
+                    ubatch: None,
+                    flash_attention: None,
                 }],
                 plugins: vec![],
             },
@@ -4153,6 +4042,11 @@ async fn config_subscribe_closes_when_revision_becomes_pinned_for_older_peer() -
                     ctx_size: Some(8192),
                     gpu_id: Some("pci:0000:65:00.0".into()),
                     parallel: None,
+                    cache_type_k: None,
+                    cache_type_v: None,
+                    batch: None,
+                    ubatch: None,
+                    flash_attention: None,
                 }],
                 plugins: vec![],
             },
@@ -4254,6 +4148,11 @@ async fn config_subscribe_keeps_stream_open_when_revision_becomes_pinned_for_sam
                     ctx_size: Some(8192),
                     gpu_id: Some("pci:0000:65:00.0".into()),
                     parallel: None,
+                    cache_type_k: None,
+                    cache_type_v: None,
+                    batch: None,
+                    ubatch: None,
+                    flash_attention: None,
                 }],
                 plugins: vec![],
             },
@@ -4660,6 +4559,11 @@ fn pinned_gpu_runtime_push_rejects_invalid_pushed_pinned_config_before_apply() {
             ctx_size: Some(8192),
             gpu_id: Some("pci:0000:b3:00.0".into()),
             parallel: None,
+            cache_type_k: None,
+            cache_type_v: None,
+            batch: None,
+            ubatch: None,
+            flash_attention: None,
         }],
         ..crate::plugin::MeshConfig::default()
     };
@@ -4701,6 +4605,11 @@ fn pinned_gpu_runtime_push_accepts_valid_pushed_pinned_config() {
             ctx_size: Some(8192),
             gpu_id: Some("uuid:GPU-123".into()),
             parallel: None,
+            cache_type_k: None,
+            cache_type_v: None,
+            batch: None,
+            ubatch: None,
+            flash_attention: None,
         }],
         ..crate::plugin::MeshConfig::default()
     };
@@ -4738,6 +4647,11 @@ fn pinned_gpu_runtime_push_rejects_resolved_gpu_without_backend_device() {
             ctx_size: Some(8192),
             gpu_id: Some("uuid:GPU-123".into()),
             parallel: None,
+            cache_type_k: None,
+            cache_type_v: None,
+            batch: None,
+            ubatch: None,
+            flash_attention: None,
         }],
         ..crate::plugin::MeshConfig::default()
     };
@@ -4764,4 +4678,289 @@ fn pinned_gpu_runtime_push_rejects_resolved_gpu_without_backend_device() {
 
     assert!(message.contains("failed pinned GPU preflight"));
     assert!(message.contains("without a backend_device"));
+}
+
+fn test_stage_status(
+    node_id: EndpointId,
+    stage_id: &str,
+    stage_index: u32,
+    bind_addr: &str,
+    state: crate::inference::skippy::StageRuntimeState,
+) -> StageRuntimeStatus {
+    StageRuntimeStatus {
+        topology_id: "topology-a".to_string(),
+        run_id: "run-a".to_string(),
+        model_id: "model-a".to_string(),
+        backend: "skippy".to_string(),
+        package_ref: Some("gguf:///model.gguf".to_string()),
+        manifest_sha256: Some("direct-gguf:1:model.gguf".to_string()),
+        source_model_path: Some("/model.gguf".to_string()),
+        source_model_sha256: None,
+        source_model_bytes: Some(1),
+        materialized_path: None,
+        materialized_pinned: false,
+        projector_path: None,
+        stage_id: stage_id.to_string(),
+        stage_index,
+        node_id: Some(node_id),
+        layer_start: stage_index * 12,
+        layer_end: (stage_index + 1) * 12,
+        state,
+        bind_addr: bind_addr.to_string(),
+        activation_width: 896,
+        wire_dtype: crate::inference::skippy::StageWireDType::F16,
+        selected_device: None,
+        ctx_size: 512,
+        lane_count: 4,
+        n_batch: None,
+        n_ubatch: None,
+        flash_attn_type: skippy_protocol::FlashAttentionType::Auto,
+        error: None,
+        shutdown_generation: 1,
+    }
+}
+
+#[test]
+fn stage_status_updates_materialized_topology_endpoint() {
+    let node_id = EndpointId::from(SecretKey::from_bytes(&[0x31; 32]).public());
+    let mut state = StageTopologyState::default();
+    state.record_topology(StageTopologyInstance {
+        topology_id: "topology-a".to_string(),
+        run_id: "run-a".to_string(),
+        model_id: "model-a".to_string(),
+        package_ref: "gguf:///model.gguf".to_string(),
+        manifest_sha256: "direct-gguf:1:model.gguf".to_string(),
+        stages: vec![StageAssignment {
+            stage_id: "stage-1".to_string(),
+            stage_index: 1,
+            node_id,
+            layer_start: 12,
+            layer_end: 24,
+            endpoint: StageEndpoint {
+                bind_addr: "127.0.0.1:0".to_string(),
+            },
+        }],
+    });
+
+    state.record_status(test_stage_status(
+        node_id,
+        "stage-1",
+        1,
+        "127.0.0.1:51234",
+        crate::inference::skippy::StageRuntimeState::Ready,
+    ));
+
+    let topology = state.topologies.values().next().unwrap();
+    assert_eq!(topology.stages[0].endpoint.bind_addr, "127.0.0.1:51234");
+}
+
+#[test]
+fn public_stage_topologies_hide_worker_only_load_fragments() {
+    let node_id = EndpointId::from(SecretKey::from_bytes(&[0x32; 32]).public());
+    let mut state = StageTopologyState::default();
+    state.record_topology(StageTopologyInstance {
+        topology_id: "topology-a".to_string(),
+        run_id: "run-a".to_string(),
+        model_id: "model-a".to_string(),
+        package_ref: "gguf:///model.gguf".to_string(),
+        manifest_sha256: "direct-gguf:1:model.gguf".to_string(),
+        stages: vec![StageAssignment {
+            stage_id: "stage-1".to_string(),
+            stage_index: 1,
+            node_id,
+            layer_start: 12,
+            layer_end: 24,
+            endpoint: StageEndpoint {
+                bind_addr: "127.0.0.1:0".to_string(),
+            },
+        }],
+    });
+    state.record_status(test_stage_status(
+        node_id,
+        "stage-1",
+        1,
+        "127.0.0.1:51234",
+        crate::inference::skippy::StageRuntimeState::Ready,
+    ));
+
+    assert!(state.visible_topologies().is_empty());
+    assert_eq!(state.runtime_statuses().len(), 1);
+}
+
+#[test]
+fn full_stage_topology_remains_visible_after_status_updates() {
+    let host_id = EndpointId::from(SecretKey::from_bytes(&[0x33; 32]).public());
+    let worker_id = EndpointId::from(SecretKey::from_bytes(&[0x34; 32]).public());
+    let mut state = StageTopologyState::default();
+    state.record_topology(StageTopologyInstance {
+        topology_id: "topology-a".to_string(),
+        run_id: "run-a".to_string(),
+        model_id: "model-a".to_string(),
+        package_ref: "gguf:///model.gguf".to_string(),
+        manifest_sha256: "direct-gguf:1:model.gguf".to_string(),
+        stages: vec![
+            StageAssignment {
+                stage_id: "stage-0".to_string(),
+                stage_index: 0,
+                node_id: host_id,
+                layer_start: 0,
+                layer_end: 12,
+                endpoint: StageEndpoint {
+                    bind_addr: "127.0.0.1:50000".to_string(),
+                },
+            },
+            StageAssignment {
+                stage_id: "stage-1".to_string(),
+                stage_index: 1,
+                node_id: worker_id,
+                layer_start: 12,
+                layer_end: 24,
+                endpoint: StageEndpoint {
+                    bind_addr: "127.0.0.1:0".to_string(),
+                },
+            },
+        ],
+    });
+    state.record_status(test_stage_status(
+        worker_id,
+        "stage-1",
+        1,
+        "127.0.0.1:51234",
+        crate::inference::skippy::StageRuntimeState::Ready,
+    ));
+
+    let visible = state.visible_topologies();
+    assert_eq!(visible.len(), 1);
+    assert_eq!(visible[0].stages[1].endpoint.bind_addr, "127.0.0.1:51234");
+}
+
+#[test]
+fn active_stage_topology_replaces_previous_generation_for_model() {
+    let host_id = EndpointId::from(SecretKey::from_bytes(&[0x36; 32]).public());
+    let first_worker_id = EndpointId::from(SecretKey::from_bytes(&[0x37; 32]).public());
+    let second_worker_id = EndpointId::from(SecretKey::from_bytes(&[0x38; 32]).public());
+    let mut state = StageTopologyState::default();
+    state.activate_topology(StageTopologyInstance {
+        topology_id: "topology-a".to_string(),
+        run_id: "run-a".to_string(),
+        model_id: "model-a".to_string(),
+        package_ref: "gguf:///model.gguf".to_string(),
+        manifest_sha256: "direct-gguf:1:model.gguf".to_string(),
+        stages: vec![
+            StageAssignment {
+                stage_id: "stage-0".to_string(),
+                stage_index: 0,
+                node_id: host_id,
+                layer_start: 0,
+                layer_end: 12,
+                endpoint: StageEndpoint {
+                    bind_addr: "127.0.0.1:50000".to_string(),
+                },
+            },
+            StageAssignment {
+                stage_id: "stage-1".to_string(),
+                stage_index: 1,
+                node_id: first_worker_id,
+                layer_start: 12,
+                layer_end: 24,
+                endpoint: StageEndpoint {
+                    bind_addr: "127.0.0.1:0".to_string(),
+                },
+            },
+        ],
+    });
+    state.record_status(test_stage_status(
+        first_worker_id,
+        "stage-1",
+        1,
+        "127.0.0.1:51234",
+        crate::inference::skippy::StageRuntimeState::Ready,
+    ));
+
+    state.activate_topology(StageTopologyInstance {
+        topology_id: "topology-b".to_string(),
+        run_id: "run-b".to_string(),
+        model_id: "model-a".to_string(),
+        package_ref: "gguf:///model.gguf".to_string(),
+        manifest_sha256: "direct-gguf:1:model.gguf".to_string(),
+        stages: vec![
+            StageAssignment {
+                stage_id: "stage-0".to_string(),
+                stage_index: 0,
+                node_id: host_id,
+                layer_start: 0,
+                layer_end: 8,
+                endpoint: StageEndpoint {
+                    bind_addr: "127.0.0.1:50001".to_string(),
+                },
+            },
+            StageAssignment {
+                stage_id: "stage-1".to_string(),
+                stage_index: 1,
+                node_id: second_worker_id,
+                layer_start: 8,
+                layer_end: 24,
+                endpoint: StageEndpoint {
+                    bind_addr: "127.0.0.1:0".to_string(),
+                },
+            },
+        ],
+    });
+
+    let visible = state.visible_topologies();
+    assert_eq!(visible.len(), 1);
+    assert_eq!(visible[0].topology_id, "topology-b");
+    assert!(state.runtime_statuses().is_empty());
+}
+
+#[test]
+fn empty_stage_status_snapshots_are_ignored() {
+    let node_id = EndpointId::from(SecretKey::from_bytes(&[0x39; 32]).public());
+    let mut state = StageTopologyState::default();
+    let mut status = test_stage_status(
+        node_id,
+        "stage-1",
+        1,
+        "127.0.0.1:51234",
+        crate::inference::skippy::StageRuntimeState::Ready,
+    );
+    status.topology_id.clear();
+    status.run_id.clear();
+    status.stage_id.clear();
+
+    state.record_status(status);
+
+    assert!(state.runtime_statuses().is_empty());
+}
+
+#[test]
+fn active_stage_refresh_marks_missing_stage_failed() {
+    let node_id = EndpointId::from(SecretKey::from_bytes(&[0x35; 32]).public());
+    let mut state = StageTopologyState::default();
+    state.record_status(test_stage_status(
+        node_id,
+        "stage-1",
+        1,
+        "127.0.0.1:51234",
+        crate::inference::skippy::StageRuntimeState::Ready,
+    ));
+    let cached = state.active_statuses().into_iter().next().unwrap();
+    state.record_status(stage_runtime_status_from_snapshot(
+        cached.node_id,
+        stage_snapshot_from_runtime_status(
+            &cached,
+            crate::inference::skippy::StageRuntimeState::Failed,
+            Some("stage status missing from runtime".to_string()),
+        ),
+    ));
+
+    let status = state.runtime_statuses().into_iter().next().unwrap();
+    assert_eq!(
+        status.state,
+        crate::inference::skippy::StageRuntimeState::Failed
+    );
+    assert_eq!(
+        status.error.as_deref(),
+        Some("stage status missing from runtime")
+    );
 }
