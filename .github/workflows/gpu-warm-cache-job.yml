@@ -53,6 +53,9 @@ jobs:
       LLAMA_STAGE_BUILD_DIR: ${{ inputs.cache_path }}
       LLAMA_STAGE_BACKEND: ${{ inputs.backend }}
       MESH_LLM_SKIP_UI: "1"
+    defaults:
+      run:
+        shell: bash
 
     steps:
       - name: Install base packages
