@@ -36,7 +36,7 @@ pub(crate) use kv_cache::KvCachePolicy;
 pub(crate) use materialization::{
     configure_materialized_stage_cache, materialize_stage_config, materialize_stage_load,
     materialized_stage_cache_dir, prune_unpinned_materialized_stages,
-    remove_materialized_stages_for_sources, MaterializedStagePin,
+    remove_materialized_stages_for_sources,
 };
 pub(crate) use package::{synthetic_direct_gguf_package, SkippyPackageIdentity};
 pub(crate) use stage::{
@@ -208,7 +208,7 @@ pub(crate) struct SkippyModelHandle {
     config: StageConfig,
     started_at_unix_nanos: i64,
     status: Arc<Mutex<HandleState>>,
-    _materialized_pin: Option<MaterializedStagePin>,
+    _materialized_pin: Option<materialization::MaterializedStagePin>,
 }
 
 pub(crate) struct SkippyHttpHandle {
