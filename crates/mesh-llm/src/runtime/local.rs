@@ -145,9 +145,8 @@ pub(super) struct LocalRuntimeModelStartSpec<'a> {
     pub(super) parallel_override: Option<usize>,
 }
 
-#[allow(clippy::large_enum_variant)]
 pub(super) enum SplitRuntimeStart {
-    Started(SplitRuntimeGenerationHandle),
+    Started(Box<SplitRuntimeGenerationHandle>),
     Standby { coordinator: iroh::EndpointId },
 }
 
@@ -539,7 +538,7 @@ pub(super) async fn start_runtime_split_model(
         event_tx: coordinator_tx,
     }));
 
-    Ok(SplitRuntimeStart::Started(loaded))
+    Ok(SplitRuntimeStart::Started(Box::new(loaded)))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

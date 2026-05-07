@@ -81,6 +81,7 @@ pub(crate) struct StagePackageInfo {
     pub(crate) source_model_bytes: Option<u64>,
     pub(crate) layer_count: u32,
     pub(crate) activation_width: u32,
+    pub(crate) projector_path: Option<String>,
     pub(crate) layers: Vec<StagePackageLayerInfo>,
 }
 
@@ -609,6 +610,10 @@ fn stage_package_info(package_ref: &str, info: LayerPackageInfo) -> Result<Stage
         source_model_bytes: info.source_model_bytes,
         layer_count: info.layer_count,
         activation_width,
+        projector_path: info
+            .projectors
+            .first()
+            .map(|projector| projector.path.to_string_lossy().to_string()),
         layers: info
             .layers
             .into_iter()
@@ -739,6 +744,17 @@ mod tests {
             std::env::set_var(key, value);
         } else {
             std::env::remove_var(key);
+        }
+    }
+
+    struct EnvRestore {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            restore_env(self.key, self.previous.take());
         }
     }
 
@@ -941,6 +957,10 @@ mod tests {
     #[serial]
     fn materialized_stage_preview_matches_source_removal_candidates() {
         let prev_xdg = std::env::var_os("XDG_CACHE_HOME");
+        let _xdg_restore = EnvRestore {
+            key: "XDG_CACHE_HOME",
+            previous: prev_xdg,
+        };
 
         let temp = tempfile::tempdir().unwrap();
         std::env::set_var("XDG_CACHE_HOME", temp.path());
@@ -974,8 +994,6 @@ mod tests {
         assert!(!artifact.exists());
         assert!(!index_path.exists());
         fs::remove_dir(unreadable_index_path).unwrap();
-
-        restore_env("XDG_CACHE_HOME", prev_xdg);
     }
 
     /// Integration test: resolves package metadata without downloading layer files from HF.
