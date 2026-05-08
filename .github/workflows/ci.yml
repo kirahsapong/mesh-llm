@@ -231,6 +231,86 @@ jobs:
       cache_key_prefix: ''
       workflow_cache_file: .github/workflows/ci.yml
 
+  agent_live_smokes:
+    needs: [changes, linux]
+    if: ${{ (vars.MESH_AGENT_BASE_URL != '' || vars.MESH_OPENCODE_BASE_URL != '') && (github.event_name == 'workflow_dispatch' || needs.changes.outputs.rust == 'true') }}
+    runs-on: self-hosted
+    timeout-minutes: 45
+    env:
+      MESH_AGENT_BASE_URL: ${{ vars.MESH_AGENT_BASE_URL || vars.MESH_OPENCODE_BASE_URL }}
+      MESH_AGENT_MODEL: ${{ vars.MESH_AGENT_MODEL || vars.MESH_OPENCODE_MODEL }}
+      MESH_OPENCODE_BASE_URL: ${{ vars.MESH_AGENT_BASE_URL || vars.MESH_OPENCODE_BASE_URL }}
+      MESH_OPENCODE_MODEL: ${{ vars.MESH_AGENT_MODEL || vars.MESH_OPENCODE_MODEL }}
+      AGENT_SMOKE_LONG_PROMPT_CHARS: ${{ vars.AGENT_SMOKE_LONG_PROMPT_CHARS || vars.OPENCODE_SMOKE_LONG_PROMPT_CHARS || '65536' }}
+      OPENCODE_SMOKE_LONG_PROMPT_CHARS: ${{ vars.OPENCODE_SMOKE_LONG_PROMPT_CHARS || '65536' }}
+      OPENCODE_DISABLE_AUTOUPDATE: "true"
+      OPENCODE_DISABLE_PRUNE: "true"
+      OPENCODE_DISABLE_LSP_DOWNLOAD: "true"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - name: Install agent CLIs
+        run: |
+          corepack enable
+          corepack prepare pnpm@10 --activate
+          export PNPM_HOME="$HOME/.local/share/pnpm"
+          mkdir -p "$PNPM_HOME"
+          echo "PNPM_HOME=$PNPM_HOME" >> "$GITHUB_ENV"
+          echo "$PNPM_HOME" >> "$GITHUB_PATH"
+          pnpm add --global opencode-ai@latest @earendil-works/pi-coding-agent@latest
+          opencode --version
+          pi --version
+      - name: Install Goose
+        run: |
+          curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | CONFIGURE=false bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Check Goose
+        run: goose --version
+      - name: OpenCode configured mesh coding smoke
+        run: scripts/ci-opencode-smoke.sh
+      - name: Pi configured mesh coding smoke
+        run: scripts/ci-pi-smoke.sh
+      - name: Goose configured mesh coding smoke
+        run: scripts/ci-goose-smoke.sh
+
+  two_node_client_serving_smoke:
+    needs: [changes, linux]
+    if: ${{ needs.linux.result == 'success' && (github.event_name == 'workflow_dispatch' || needs.changes.outputs.rust == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install smoke dependencies
+        run: sudo apt-get update && sudo apt-get install -y curl jq lsof
+      - uses: actions/download-artifact@v7
+        with:
+          name: ci-linux-inference-binaries
+          path: ci-artifacts/linux
+      - name: Stage binary
+        run: |
+          mkdir -p target/debug
+          cp ci-artifacts/linux/mesh-llm target/debug/mesh-llm
+          chmod +x target/debug/mesh-llm
+      - name: Cache integration model
+        id: cache-two-node-model
+        uses: actions/cache/restore@v5
+        with:
+          path: ~/.models/${{ env.MODEL_FILE }}
+          key: ${{ env.CACHE_NAMESPACE }}-${{ runner.os }}-two-node-model-${{ env.MODEL_FILE }}-${{ hashFiles('.github/cache-version.txt', '.github/workflows/ci.yml') }}
+      - name: Download integration model
+        if: steps.cache-two-node-model.outputs.cache-hit != 'true'
+        run: mkdir -p ~/.models && curl -fSL "$MODEL_URL" -o "$HOME/.models/$MODEL_FILE"
+      - name: Save integration model cache
+        if: ${{ github.ref == 'refs/heads/main' && steps.cache-two-node-model.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v5
+        with:
+          path: ~/.models/${{ env.MODEL_FILE }}
+          key: ${{ steps.cache-two-node-model.outputs.cache-primary-key }}
+      - name: Two-node client/serving smoke
+        run: scripts/ci-two-node-client-serving-smoke.sh target/debug/mesh-llm ci-artifacts/linux "$HOME/.models/$MODEL_FILE"
+
   native_sdk_smoke:
     needs: [changes, linux, inference_smoke_tests]
     if: ${{ needs.inference_smoke_tests.result == 'success' && (github.event_name == 'workflow_dispatch' || needs.changes.outputs.sdk == 'true') }}
