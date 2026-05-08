@@ -13,4 +13,3 @@ This crate includes:
 Keep distributed mesh membership, request routing, API routes, CLI dispatch, and
 host runtime orchestration outside this crate. Those layers may consume system
 facts, but this crate should stay focused on local platform behavior.
-

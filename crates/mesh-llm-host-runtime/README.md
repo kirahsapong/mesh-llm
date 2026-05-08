@@ -21,4 +21,3 @@ pure/shared ownership in narrower crates such as `mesh-llm-types`,
 `mesh-llm-protocol`, `mesh-llm-routing`, `mesh-llm-identity`,
 `mesh-llm-system`, `mesh-llm-ui`, `model-*`, `openai-frontend`, and
 `skippy-*`.
-
