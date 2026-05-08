@@ -2,16 +2,22 @@ use std::collections::HashMap;
 
 use anyhow::{anyhow, bail, Result};
 use skippy_topology::{
-    infer_family_capability, plan_weighted_contiguous, BoundaryDecision, DiagnosticSeverity,
-    LayerSpec, NodeSpec, PlannerPolicy, TopologyPlanRequest,
+    infer_family_capability, plan_package_aware_contiguous_with_signals, BoundaryDecision,
+    DiagnosticSeverity, LayerSpec, NodePlacementSignal, NodeSpec, PlannerPolicy,
+    TopologyPlanRequest,
 };
 
-use super::materialization::StagePackageInfo;
+use super::{materialization::StagePackageInfo, package::SkippyPackageIdentity};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StageTopologyParticipant {
     pub(crate) node_id: iroh::EndpointId,
     pub(crate) vram_bytes: u64,
+    pub(crate) cached_slice_bytes: u64,
+    pub(crate) missing_artifact_bytes: u64,
+    pub(crate) rtt_ms: Option<u32>,
+    pub(crate) artifact_transfer_supported: bool,
+    pub(crate) availability_score: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -21,6 +27,7 @@ pub(crate) struct MeshStagePlan {
     pub(crate) node_id: iroh::EndpointId,
     pub(crate) layer_start: u32,
     pub(crate) layer_end: u32,
+    pub(crate) parameter_bytes: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -60,14 +67,25 @@ pub(crate) fn plan_package_topology(
             .iter()
             .map(|participant| NodeSpec {
                 node_id: participant.node_id.to_string(),
-                cached_slice_bytes: 0,
+                cached_slice_bytes: participant.cached_slice_bytes,
                 vram_bytes: participant.vram_bytes,
             })
             .collect(),
         family,
         policy: PlannerPolicy::default(),
     };
-    let plan = plan_weighted_contiguous(&request)?;
+    let placement_signals = participants
+        .iter()
+        .map(|participant| NodePlacementSignal {
+            node_id: participant.node_id.to_string(),
+            cached_slice_bytes: participant.cached_slice_bytes,
+            missing_artifact_bytes: participant.missing_artifact_bytes,
+            rtt_ms: participant.rtt_ms,
+            artifact_transfer_supported: participant.artifact_transfer_supported,
+            availability_score: participant.availability_score,
+        })
+        .collect::<Vec<_>>();
+    let plan = plan_package_aware_contiguous_with_signals(&request, &placement_signals)?;
 
     let rejected = plan
         .boundaries
@@ -107,6 +125,7 @@ pub(crate) fn plan_package_topology(
                 node_id,
                 layer_start: stage.layer_start,
                 layer_end: stage.layer_end,
+                parameter_bytes: stage.parameter_bytes,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -121,6 +140,33 @@ pub(crate) fn plan_package_topology(
             .map(|diagnostic| diagnostic.message)
             .collect(),
     })
+}
+
+pub(crate) fn plan_package_identity_topology(
+    topology_id: &str,
+    model_id: &str,
+    package: &SkippyPackageIdentity,
+    participants: &[StageTopologyParticipant],
+) -> Result<MeshTopologyPlan> {
+    let package_dir = package
+        .source_model_path
+        .parent()
+        .map(ToOwned::to_owned)
+        .unwrap_or_default();
+    let package = StagePackageInfo {
+        package_ref: package.package_ref.clone(),
+        package_dir,
+        manifest_sha256: package.manifest_sha256.clone(),
+        model_id: model_id.to_string(),
+        source_model_path: package.source_model_path.to_string_lossy().to_string(),
+        source_model_sha256: package.source_model_sha256.clone(),
+        source_model_bytes: Some(package.source_model_bytes),
+        layer_count: package.layer_count,
+        activation_width: package.activation_width,
+        projector_path: None,
+        layers: Vec::new(),
+    };
+    plan_package_topology(topology_id, &package, participants)
 }
 
 fn layer_specs(package: &StagePackageInfo) -> Vec<LayerSpec> {
@@ -165,6 +211,18 @@ mod tests {
         SecretKey::from_bytes(&bytes).public()
     }
 
+    fn participant(node_id: iroh::EndpointId, vram_bytes: u64) -> StageTopologyParticipant {
+        StageTopologyParticipant {
+            node_id,
+            vram_bytes,
+            cached_slice_bytes: 0,
+            missing_artifact_bytes: 0,
+            rtt_ms: None,
+            artifact_transfer_supported: false,
+            availability_score: 0,
+        }
+    }
+
     fn package(layer_count: u32) -> StagePackageInfo {
         StagePackageInfo {
             package_ref: "hf://Mesh-LLM/demo-package".to_string(),
@@ -198,18 +256,9 @@ mod tests {
             "topology-a",
             &package(12),
             &[
-                StageTopologyParticipant {
-                    node_id: id_a,
-                    vram_bytes: 60,
-                },
-                StageTopologyParticipant {
-                    node_id: id_b,
-                    vram_bytes: 30,
-                },
-                StageTopologyParticipant {
-                    node_id: id_c,
-                    vram_bytes: 30,
-                },
+                participant(id_a, 60),
+                participant(id_b, 30),
+                participant(id_c, 30),
             ],
         )
         .unwrap();
@@ -251,18 +300,9 @@ mod tests {
             "topology-a",
             &package(2),
             &[
-                StageTopologyParticipant {
-                    node_id: id_a,
-                    vram_bytes: 10,
-                },
-                StageTopologyParticipant {
-                    node_id: id_b,
-                    vram_bytes: 10,
-                },
-                StageTopologyParticipant {
-                    node_id: id_c,
-                    vram_bytes: 10,
-                },
+                participant(id_a, 10),
+                participant(id_b, 10),
+                participant(id_c, 10),
             ],
         )
         .unwrap();
@@ -288,5 +328,27 @@ mod tests {
             .stages
             .iter()
             .all(|stage| stage.layer_start < stage.layer_end));
+    }
+
+    #[test]
+    fn topology_adapter_prefers_cached_peer_for_equal_capacity() {
+        let id_a = make_id(1);
+        let id_b = make_id(2);
+
+        let mut cold = participant(id_a, 40);
+        cold.missing_artifact_bytes = 32;
+        let mut warm = participant(id_b, 40);
+        warm.cached_slice_bytes = 64;
+        warm.artifact_transfer_supported = true;
+
+        let plan = plan_package_topology("topology-a", &package(8), &[cold, warm]).unwrap();
+
+        assert_eq!(plan.stages.len(), 2);
+        assert_eq!(plan.stages[0].node_id, id_b);
+        assert_eq!(
+            (plan.stages[0].layer_start, plan.stages[0].layer_end),
+            (0, 4)
+        );
+        assert_eq!(plan.stages[1].node_id, id_a);
     }
 }
