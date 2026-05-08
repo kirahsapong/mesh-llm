@@ -4078,6 +4078,7 @@ dependencies = [
  "mesh-llm-types",
  "mesh-llm-ui",
  "model-artifact",
+ "model-package",
  "model-ref",
  "model-resolver",
  "nostr-sdk",
@@ -4294,6 +4295,25 @@ dependencies = [
  "model-artifact",
  "model-ref",
  "serde",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "model-package"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "chrono",
+ "futures",
+ "huggingface-hub",
+ "model-hf",
+ "model-ref",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "tokio",
 ]

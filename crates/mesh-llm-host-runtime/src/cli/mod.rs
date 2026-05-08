@@ -600,6 +600,77 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: BenchmarkCommand,
     },
+    /// Prepare a model for distributed inference by splitting it into
+    /// per-layer files on HF compute.
+    ///
+    /// Submits an HF Job that builds skippy-model-package from source,
+    /// splits the model, publishes the layer package, and updates the
+    /// meshllm/catalog.
+    #[command(name = "model-prepare", hide = true, alias = "model-package")]
+    ModelPrepare {
+        /// Source HuggingFace model ref (e.g. unsloth/Qwen3-235B-A22B-GGUF:UD-Q4_K_XL).
+        source_repo: Option<String>,
+
+        /// Quantization variant (deprecated; prefer source refs like repo:Q4_K_M).
+        #[arg(long)]
+        quant: Option<String>,
+
+        /// Target repo for the layer package (auto-derived if omitted).
+        #[arg(long)]
+        target: Option<String>,
+
+        /// Override model ID in the manifest.
+        #[arg(long)]
+        model_id: Option<String>,
+
+        /// HF Job hardware flavor. Use auto for the default CPU splitter baseline.
+        #[arg(long, default_value = "auto")]
+        flavor: String,
+
+        /// Requested job timeout; raised automatically by model-size minimums.
+        #[arg(long, default_value = "1h")]
+        timeout: String,
+
+        /// Branch or tag of mesh-llm to build in the job [default: main].
+        #[arg(long, default_value = "main")]
+        mesh_llm_ref: String,
+
+        /// Explicitly keep this as a dry run. This is the default unless --confirm is set.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Actually submit the HF Job. Without this, the command only prints plan, spec, and max cost.
+        #[arg(long)]
+        confirm: bool,
+
+        /// Stream job logs after submission until completion.
+        #[arg(long)]
+        follow: bool,
+
+        /// Emit JSON output.
+        #[arg(long)]
+        json: bool,
+
+        /// Check status of a previously submitted job.
+        #[arg(long)]
+        status: Option<String>,
+
+        /// Fetch logs for a previously submitted job.
+        #[arg(long)]
+        logs: Option<String>,
+
+        /// Cancel a running job.
+        #[arg(long)]
+        cancel: Option<String>,
+
+        /// List recent model-package jobs.
+        #[arg(long)]
+        list: bool,
+
+        /// Upload the latest job script to the meshllm bucket (requires org access).
+        #[arg(long)]
+        update_script: bool,
+    },
     /// Manage owner identity and keystore.
     Auth {
         #[command(subcommand)]
