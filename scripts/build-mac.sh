@@ -7,10 +7,13 @@ SCRIPT_DIR="${0:A:h}"
 REPO_ROOT="${SCRIPT_DIR:h}"
 
 LLAMA_DIR="${MESH_LLM_LLAMA_DIR:-$REPO_ROOT/.deps/llama.cpp}"
+LLAMA_BUILD_ROOT="${MESH_LLM_LLAMA_BUILD_ROOT:-$REPO_ROOT/.deps/llama-build}"
 MESH_DIR="$REPO_ROOT/crates/mesh-llm"
 UI_DIR="$REPO_ROOT/crates/mesh-llm-ui"
 
 rustc_wrapper=""
+build_profile="${MESH_LLM_BUILD_PROFILE:-release}"
+build_profile="${build_profile:l}"
 
 configure_rust_cache() {
     if (( $+commands[sccache] )); then
@@ -19,7 +22,7 @@ configure_rust_cache() {
     fi
 }
 
-export LLAMA_STAGE_BUILD_DIR="${LLAMA_STAGE_BUILD_DIR:-${SKIPPY_LLAMA_BUILD_DIR:-$LLAMA_DIR/build-stage-abi-metal}}"
+export LLAMA_STAGE_BUILD_DIR="${LLAMA_STAGE_BUILD_DIR:-${SKIPPY_LLAMA_BUILD_DIR:-$LLAMA_BUILD_ROOT/build-stage-abi-metal}}"
 
 echo "Preparing patched llama.cpp ABI checkout..."
 LLAMA_WORKDIR="$LLAMA_DIR" "$SCRIPT_DIR/prepare-llama.sh" "${MESH_LLM_LLAMA_PIN_SHA:-pinned}"
@@ -36,11 +39,29 @@ if [[ -d "$MESH_DIR" ]]; then
     fi
 
     configure_rust_cache
-    if [[ -n "$rustc_wrapper" ]]; then
-        (cd "$REPO_ROOT" && RUSTC_WRAPPER="$rustc_wrapper" cargo build --release -p mesh-llm)
-    else
-        (cd "$REPO_ROOT" && cargo build --release -p mesh-llm)
-    fi
-
-    echo "Mesh binary: target/release/mesh-llm"
+    case "$build_profile" in
+        dev|debug)
+            echo "Building mesh-llm (profile: dev, bin only)..."
+            if [[ -n "$rustc_wrapper" ]]; then
+                (cd "$REPO_ROOT" && RUSTC_WRAPPER="$rustc_wrapper" cargo build -p mesh-llm --bin mesh-llm)
+            else
+                (cd "$REPO_ROOT" && cargo build -p mesh-llm --bin mesh-llm)
+            fi
+            echo "Mesh binary: target/debug/mesh-llm"
+            ;;
+        release)
+            echo "Building mesh-llm (profile: release)..."
+            if [[ -n "$rustc_wrapper" ]]; then
+                (cd "$REPO_ROOT" && RUSTC_WRAPPER="$rustc_wrapper" cargo build --release -p mesh-llm)
+            else
+                (cd "$REPO_ROOT" && cargo build --release -p mesh-llm)
+            fi
+            echo "Mesh binary: target/release/mesh-llm"
+            ;;
+        *)
+            echo "unsupported MESH_LLM_BUILD_PROFILE: $build_profile" >&2
+            echo "expected one of: dev, debug, release" >&2
+            exit 1
+            ;;
+    esac
 fi
