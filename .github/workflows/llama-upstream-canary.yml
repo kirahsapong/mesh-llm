@@ -69,34 +69,26 @@ jobs:
             .deps/llama.cpp \
             > /tmp/llama-upstream-pr.md
 
-      - name: Push upstream pin branch
+      - name: Commit upstream pin to main
         if: steps.sha.outputs.changed == 'true'
-        env:
-          BRANCH: automation/update-llama-upstream
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git checkout -B "$BRANCH"
           git add third_party/llama.cpp/upstream.txt
           if git diff --cached --quiet; then
             echo "No upstream pin changes to commit."
             exit 0
           fi
           git commit -m "Update llama.cpp upstream pin"
-          remote_sha="$(git ls-remote --heads origin "$BRANCH" | awk '{print $1}')"
-          if [[ -n "$remote_sha" ]]; then
-            git push --force-with-lease="refs/heads/$BRANCH:$remote_sha" origin "$BRANCH:$BRANCH"
-          else
-            git push origin "$BRANCH:$BRANCH"
-          fi
+          git push origin HEAD:refs/heads/main
 
-      - name: Report upstream pin branch
+      - name: Report upstream pin update
         if: steps.sha.outputs.changed == 'true'
         run: |
           {
             echo "## llama.cpp upstream pin update"
             echo
-            echo "Pushed \`automation/update-llama-upstream\`."
+            echo "Pushed the validated upstream pin to \`main\`."
             echo
             cat /tmp/llama-upstream-pr.md
           } >> "$GITHUB_STEP_SUMMARY"
