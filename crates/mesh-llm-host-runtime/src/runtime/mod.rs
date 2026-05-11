@@ -4286,15 +4286,12 @@ async fn run_auto(
             let rediscover_relays = nostr_relays(&cli.nostr_relay);
             let rediscover_relay_urls = cli.relay.clone();
             let rediscover_mesh_name = cli.mesh_name.clone();
-            tokio::spawn(async move {
-                nostr_rediscovery(
-                    rediscover_node,
-                    rediscover_relays,
-                    rediscover_relay_urls,
-                    rediscover_mesh_name,
-                )
-                .await;
-            });
+            tokio::spawn(Box::pin(nostr_rediscovery(
+                rediscover_node,
+                rediscover_relays,
+                rediscover_relay_urls,
+                rediscover_mesh_name,
+            )));
         }
     } else {
         // Originator — generate mesh_id
@@ -4324,15 +4321,12 @@ async fn run_auto(
             let rediscover_relays = nostr_relays(&cli.nostr_relay);
             let rediscover_relay_urls = cli.relay.clone();
             let rediscover_mesh_name = cli.mesh_name.clone();
-            tokio::spawn(async move {
-                nostr_rediscovery(
-                    rediscover_node,
-                    rediscover_relays,
-                    rediscover_relay_urls,
-                    rediscover_mesh_name,
-                )
-                .await;
-            });
+            tokio::spawn(Box::pin(nostr_rediscovery(
+                rediscover_node,
+                rediscover_relays,
+                rediscover_relay_urls,
+                rediscover_mesh_name,
+            )));
         }
     }
 
@@ -4641,18 +4635,15 @@ async fn run_auto(
     let proxy_rx = target_rx.clone();
     let proxy_affinity = affinity_router.clone();
     let api_control_tx = control_tx.clone();
-    let api_proxy_handle = tokio::spawn(async move {
-        api_proxy(
-            proxy_node,
-            api_port,
-            proxy_rx,
-            api_control_tx,
-            Some(api_listener),
-            cli.listen_all,
-            proxy_affinity,
-        )
-        .await;
-    });
+    let api_proxy_handle = tokio::spawn(Box::pin(api_proxy(
+        proxy_node,
+        api_port,
+        proxy_rx,
+        api_control_tx,
+        Some(api_listener),
+        cli.listen_all,
+        proxy_affinity,
+    )));
 
     // Console (optional)
     let mut console_server_handle = None;
@@ -4776,44 +4767,41 @@ async fn run_auto(
     let dashboard_context_usage_for_primary_task = dashboard_context_usage.clone();
     let runtime_instance_registry_for_primary_task = runtime_instance_registry.clone();
     let primary_startup_load_gate = startup_load_gate.clone();
-    let primary_task = tokio::spawn(async move {
-        startup_local_model_loop(StartupLocalModelTask {
-            node: node2,
-            tunnel_mgr: tunnel_mgr2,
-            target_tx: primary_target_tx,
-            model_path: model2,
-            model_ref: primary_model_ref,
-            model_name: model_name_for_election,
-            instance_id: primary_task_instance_id,
-            primary_model_name: primary_model_name_for_advertise,
-            mmproj_path: primary_mmproj,
-            ctx_size: primary_ctx_size,
-            pinned_gpu: primary_pinned_gpu,
-            cache_type_k: primary_cache_type_k,
-            cache_type_v: primary_cache_type_v,
-            n_batch: primary_n_batch,
-            n_ubatch: primary_n_ubatch,
-            flash_attention: primary_flash_attention,
-            slots: primary_slots,
-            parallel_override: primary_parallel_override,
-            split: startup_split,
-            survey_telemetry: survey_telemetry_for_primary,
-            survey_launch_kind: survey::SurveyLaunchKind::Startup,
-            stop_rx: primary_stop_rx,
-            dashboard_processes: dashboard_processes_for_primary_task,
-            dashboard_context_usage: dashboard_context_usage_for_primary_task,
-            runtime_instance_registry: runtime_instance_registry_for_primary_task,
-            console_state: console_state_for_election,
-            api_port,
-            startup_ready_reporter: primary_startup_ready_reporter,
-            startup_load_gate: primary_startup_load_gate,
-            input_handler_enabled,
-            interactive_started,
-            interactive_control_tx,
-            interactive_console_state,
-        })
-        .await;
-    });
+    let primary_task = tokio::spawn(Box::pin(startup_local_model_loop(StartupLocalModelTask {
+        node: node2,
+        tunnel_mgr: tunnel_mgr2,
+        target_tx: primary_target_tx,
+        model_path: model2,
+        model_ref: primary_model_ref,
+        model_name: model_name_for_election,
+        instance_id: primary_task_instance_id,
+        primary_model_name: primary_model_name_for_advertise,
+        mmproj_path: primary_mmproj,
+        ctx_size: primary_ctx_size,
+        pinned_gpu: primary_pinned_gpu,
+        cache_type_k: primary_cache_type_k,
+        cache_type_v: primary_cache_type_v,
+        n_batch: primary_n_batch,
+        n_ubatch: primary_n_ubatch,
+        flash_attention: primary_flash_attention,
+        slots: primary_slots,
+        parallel_override: primary_parallel_override,
+        split: startup_split,
+        survey_telemetry: survey_telemetry_for_primary,
+        survey_launch_kind: survey::SurveyLaunchKind::Startup,
+        stop_rx: primary_stop_rx,
+        dashboard_processes: dashboard_processes_for_primary_task,
+        dashboard_context_usage: dashboard_context_usage_for_primary_task,
+        runtime_instance_registry: runtime_instance_registry_for_primary_task,
+        console_state: console_state_for_election,
+        api_port,
+        startup_ready_reporter: primary_startup_ready_reporter,
+        startup_load_gate: primary_startup_load_gate,
+        input_handler_enabled,
+        interactive_started,
+        interactive_control_tx,
+        interactive_console_state,
+    })));
     managed_models.insert(
         primary_instance_id,
         ManagedModelController {
@@ -4871,8 +4859,8 @@ async fn run_auto(
             let runtime_instance_registry_for_extra_task = runtime_instance_registry.clone();
             let extra_control_tx = control_tx.clone();
             let extra_survey_telemetry = survey_telemetry.clone();
-            let extra_task = tokio::spawn(async move {
-                startup_local_model_loop(StartupLocalModelTask {
+            let extra_task =
+                tokio::spawn(Box::pin(startup_local_model_loop(StartupLocalModelTask {
                     node: extra_node,
                     tunnel_mgr: extra_tunnel,
                     target_tx: extra_target_tx,
@@ -4906,9 +4894,7 @@ async fn run_auto(
                     interactive_started: Arc::new(AtomicBool::new(true)),
                     interactive_control_tx: extra_control_tx,
                     interactive_console_state: None,
-                })
-                .await;
-            });
+                })));
             managed_models.insert(
                 extra_instance_id,
                 ManagedModelController {
@@ -4933,21 +4919,18 @@ async fn run_auto(
                 if let Some(ref cs) = console_state {
                     bridge_publication_state(cs.clone(), status_rx);
                 }
-                Some(tokio::spawn(async move {
-                    nostr::publish_loop(
-                        pub_node,
-                        nostr_keys,
-                        nostr::PublishLoopConfig {
-                            relays,
-                            name: pub_name,
-                            region: pub_region,
-                            max_clients: pub_max_clients,
-                            interval_secs: 60,
-                            status_tx: Some(status_tx),
-                        },
-                    )
-                    .await;
-                }))
+                Some(tokio::spawn(Box::pin(nostr::publish_loop(
+                    pub_node,
+                    nostr_keys,
+                    nostr::PublishLoopConfig {
+                        relays,
+                        name: pub_name,
+                        region: pub_region,
+                        max_clients: pub_max_clients,
+                        interval_secs: 60,
+                        status_tx: Some(status_tx),
+                    },
+                ))))
             }
             Err(e) => {
                 let _ = emit_event(OutputEvent::Warning {
@@ -5508,21 +5491,18 @@ async fn run_passive(
                 let pub_max_clients = cli.max_clients;
                 let (status_tx, status_rx) = tokio::sync::watch::channel(None);
                 passive_publication_rx = Some(status_rx);
-                tokio::spawn(async move {
-                    nostr::publish_loop(
-                        pub_node,
-                        nostr_keys,
-                        nostr::PublishLoopConfig {
-                            relays,
-                            name: pub_name,
-                            region: pub_region,
-                            max_clients: pub_max_clients,
-                            interval_secs: 60,
-                            status_tx: Some(status_tx),
-                        },
-                    )
-                    .await;
-                });
+                tokio::spawn(Box::pin(nostr::publish_loop(
+                    pub_node,
+                    nostr_keys,
+                    nostr::PublishLoopConfig {
+                        relays,
+                        name: pub_name,
+                        region: pub_region,
+                        max_clients: pub_max_clients,
+                        interval_secs: 60,
+                        status_tx: Some(status_tx),
+                    },
+                )));
             }
             Err(e) => {
                 let _ = emit_event(OutputEvent::Warning {
@@ -5736,9 +5716,9 @@ async fn run_passive(
                 tracing::info!("Connection from {addr}");
                 let node = node.clone();
                 let affinity = affinity_router.clone();
-                tokio::spawn(crate::network::proxy::handle_mesh_request(
+                tokio::spawn(Box::pin(crate::network::proxy::handle_mesh_request(
                     node, tcp_stream, true, affinity,
-                ));
+                )));
             }
             Some(model_name) = promote_rx.recv() => {
                 return Ok(Some(model_name));
