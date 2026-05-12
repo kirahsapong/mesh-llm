@@ -1,6 +1,13 @@
 use super::context_planning::{
     plan_runtime_resources, RuntimeResourcePlan, RuntimeResourcePlanInput,
 };
+#[cfg(test)]
+use super::split_planning::{format_aggregate_split_capacity_error, validate_split_capacity};
+use super::split_planning::{
+    format_gb, plan_runtime_slice_topology_with_resources, split_participant_exclusion_labels,
+    split_participant_labels, split_participants_for_stages, split_stage_plan_labels,
+    RuntimeSliceStagePlan, SplitTopologyResourceInputs,
+};
 use crate::api;
 use crate::inference::{election, skippy};
 use crate::mesh::{self, NodeRole};
@@ -10,6 +17,7 @@ use crate::runtime_data::{
     RuntimeLlamaEndpointStatus, RuntimeLlamaSlotSnapshot, RuntimeLlamaSlotsSnapshot,
 };
 use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
 use skippy_protocol::{FlashAttentionType, LoadMode, PeerConfig, StageConfig};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -17,8 +25,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const SPLIT_PARTICIPANT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const SPLIT_PARTICIPANT_STABLE_FOR: Duration = Duration::from_secs(2);
-const SPLIT_DEFAULT_MIN_PARTICIPANTS: usize = 2;
+pub(super) const SPLIT_DEFAULT_MIN_PARTICIPANTS: usize = 2;
 const SPLIT_INITIAL_SHUTDOWN_GENERATION: u64 = 1;
+const SPLIT_COORDINATOR_LEASE_SECS: u64 = 4 * 60 * 60;
 const RUNTIME_MODEL_FIT_HEADROOM_NUMERATOR: u64 = 11;
 const RUNTIME_MODEL_FIT_HEADROOM_DENOMINATOR: u64 = 10;
 
@@ -120,6 +129,10 @@ fn current_time_unix_ms() -> u64 {
         .as_millis() as u64
 }
 
+fn split_coordinator_lease_until_unix_ms() -> u64 {
+    current_time_unix_ms().saturating_add(SPLIT_COORDINATOR_LEASE_SECS.saturating_mul(1000))
+}
+
 pub(super) struct ManagedModelController {
     pub(super) model_name: String,
     pub(super) stop_tx: tokio::sync::watch::Sender<bool>,
@@ -129,6 +142,7 @@ pub(super) struct ManagedModelController {
 pub(super) struct LocalRuntimeModelStartSpec<'a> {
     pub(super) node: &'a mesh::Node,
     pub(super) model_path: &'a Path,
+    pub(super) model_bytes: u64,
     pub(super) mmproj_override: Option<&'a Path>,
     pub(super) ctx_size_override: Option<u32>,
     pub(super) pinned_gpu: Option<&'a crate::runtime::StartupPinnedGpuTarget>,
@@ -137,7 +151,6 @@ pub(super) struct LocalRuntimeModelStartSpec<'a> {
     pub(super) n_batch_override: Option<u32>,
     pub(super) n_ubatch_override: Option<u32>,
     pub(super) flash_attention_override: FlashAttentionType,
-    pub(super) slots: usize,
     pub(super) parallel_override: Option<usize>,
 }
 
@@ -379,7 +392,7 @@ pub(super) async fn start_runtime_local_model(
     } else {
         None
     };
-    let model_bytes = layer_package
+    let total_model_bytes = layer_package
         .as_ref()
         .map(|package| package.source_model_bytes)
         .unwrap_or_else(|| election::total_model_bytes(spec.model_path));
@@ -387,7 +400,19 @@ pub(super) async fn start_runtime_local_model(
         .pinned_gpu
         .map(|gpu| gpu.vram_bytes)
         .unwrap_or_else(|| spec.node.vram_bytes());
-    let required_bytes = runtime_model_required_bytes(model_bytes);
+
+    // For split/layer-package models, compute the local share of model weights
+    // and the layer fraction so the context planner budgets correctly.
+    // At planning time the exact layer assignment is not yet known, so we
+    // estimate the local fraction from the VRAM ratio: this node's VRAM
+    // divided by total mesh VRAM (local + peers).
+    // This is the local (solo) load path — the entire model is loaded on
+    // this node.  Fractional scaling only applies in the split path
+    // (start_runtime_split_model).
+    let local_model_bytes = total_model_bytes;
+    let local_layer_fraction: Option<f64> = None;
+
+    let required_bytes = runtime_model_required_bytes(local_model_bytes);
     anyhow::ensure!(
         my_vram >= required_bytes,
         "runtime load only supports models that fit locally on this node; model requires {}, local capacity is {}",
@@ -395,7 +420,7 @@ pub(super) async fn start_runtime_local_model(
         format_gb(my_vram)
     );
 
-    let kv_cache = skippy::KvCachePolicy::for_model_size(model_bytes);
+    let kv_cache = skippy::KvCachePolicy::for_model_size(total_model_bytes);
     let effective_cache_type_k = spec
         .cache_type_k_override
         .unwrap_or(kv_cache.cache_type_k());
@@ -406,19 +431,35 @@ pub(super) async fn start_runtime_local_model(
         effective_cache_type_k,
         effective_cache_type_v,
     )
-    .unwrap_or_else(models::gguf::GgufKvCacheQuant::f16);
-    let compact_meta = if layer_package.is_some() {
-        None
-    } else {
-        models::gguf::scan_gguf_compact_meta(spec.model_path)
+    .unwrap_or(models::gguf::GgufKvCacheQuant::Q8_0);
+
+    // For layer packages, try to read GGUF metadata from the shared metadata
+    // file inside the package.  This carries the model's native context length,
+    // head counts, and KV dimensions needed for accurate KV budget planning.
+    // Runs on a blocking thread because the underlying calls do filesystem I/O
+    // (stat, open, read GGUF headers).
+    let compact_meta = {
+        let package_clone = layer_package.clone();
+        let model_path = spec.model_path.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            if let Some(ref package) = package_clone {
+                scan_layer_package_metadata(package)
+            } else {
+                models::gguf::scan_gguf_compact_meta(&model_path)
+            }
+        })
+        .await
+        .ok()
+        .flatten()
     };
     let plan = plan_runtime_resources(RuntimeResourcePlanInput {
         ctx_size_override: spec.ctx_size_override,
         parallel_override: spec.parallel_override,
-        model_bytes,
+        model_bytes: local_model_bytes,
         vram_bytes: my_vram,
         metadata: compact_meta.as_ref(),
         kv_cache_quant,
+        local_layer_fraction,
     });
 
     if let Some(package) = layer_package {
@@ -426,6 +467,33 @@ pub(super) async fn start_runtime_local_model(
     } else {
         start_runtime_skippy_model(spec, model_name, plan).await
     }
+}
+
+/// Try to extract GGUF architecture metadata from a layer package's shared
+/// metadata file.  Layer packages store a `shared/metadata.gguf` that carries
+/// the model's KV pairs (context_length, head counts, etc.) without any tensor
+/// data.  This gives the context planner the information it needs for accurate
+/// KV cache budget calculations on split models.
+fn scan_layer_package_metadata(
+    package: &skippy::SkippyPackageIdentity,
+) -> Option<models::gguf::GgufCompactMeta> {
+    // The source_model_path in a layer package identity points to the original
+    // GGUF.  But for HF layer packages the source model is not downloaded
+    // locally.  Instead, look for the shared metadata file in the package dir.
+    //
+    // The package_ref looks like "hf://meshllm/Qwen3-layers@rev" which resolves
+    // to a local cache directory.  Try to find shared/metadata.gguf there.
+    let package_ref = &package.package_ref;
+    let local_ref = skippy::resolve_hf_package_to_local(package_ref, 0, 0, false, false).ok()?;
+    let metadata_path = std::path::Path::new(&local_ref).join("shared/metadata.gguf");
+    if metadata_path.is_file() {
+        return models::gguf::scan_gguf_compact_meta(&metadata_path);
+    }
+    // Fallback: try scanning the source model directly (works for local packages).
+    if package.source_model_path.is_file() {
+        return models::gguf::scan_gguf_compact_meta(&package.source_model_path);
+    }
+    None
 }
 
 pub(super) fn runtime_model_planning_bytes(model_path: &Path) -> Result<u64> {
@@ -488,14 +556,56 @@ pub(super) async fn start_runtime_split_model(
     .await?;
     let run_id = format!("mesh-split-{}", now_unix_nanos());
     let topology_id = format!("topology-{run_id}");
-    let planned_participants = participant_snapshot.participants.clone();
-    let stages = plan_runtime_slice_topology_with_exclusions(
+    let compact_meta = {
+        let pkg = package.clone();
+        tokio::task::spawn_blocking(move || scan_layer_package_metadata(&pkg))
+            .await
+            .ok()
+            .flatten()
+    }
+    .context("split topology planning requires GGUF metadata")?;
+    let split_kv_policy = skippy::KvCachePolicy::for_model_size(package.source_model_bytes);
+    let kv_cache_quant =
+        if spec.cache_type_k_override.is_some() || spec.cache_type_v_override.is_some() {
+            let k = spec
+                .cache_type_k_override
+                .unwrap_or(split_kv_policy.cache_type_k());
+            let v = spec
+                .cache_type_v_override
+                .unwrap_or(split_kv_policy.cache_type_v());
+            models::gguf::GgufKvCacheQuant::from_llama_args(k, v).unwrap_or(
+                models::gguf::GgufKvCacheQuant::from_llama_args(
+                    split_kv_policy.cache_type_k(),
+                    split_kv_policy.cache_type_v(),
+                )
+                .unwrap_or(models::gguf::GgufKvCacheQuant::Q8_0),
+            )
+        } else {
+            models::gguf::GgufKvCacheQuant::from_llama_args(
+                split_kv_policy.cache_type_k(),
+                split_kv_policy.cache_type_v(),
+            )
+            .unwrap_or(models::gguf::GgufKvCacheQuant::Q8_0)
+        };
+    let kv_bytes_per_token = kv_cache_quant
+        .kv_cache_bytes_per_token(&compact_meta)
+        .context("split topology planning requires KV cache byte metadata")?;
+    let planned_topology = plan_runtime_slice_topology_with_resources(
         &topology_id,
         model_ref,
         &package,
-        &planned_participants,
+        &participant_snapshot.participants,
         &participant_snapshot.excluded,
+        SplitTopologyResourceInputs {
+            native_context_length: compact_meta.context_length,
+            kv_bytes_per_token,
+            ctx_size_override: spec.ctx_size_override,
+            parallel_override: spec.parallel_override,
+        },
     )?;
+    let stages = planned_topology.stages;
+    let planned_participants =
+        split_participants_for_stages(&participant_snapshot.participants, &stages);
     anyhow::ensure!(
         split_stages_meet_minimum(&stages),
         "split runtime needs at least two stage participants"
@@ -503,13 +613,44 @@ pub(super) async fn start_runtime_split_model(
     let stage0 = stages
         .first()
         .context("split topology did not produce stage 0")?;
+    tracing::info!(
+        model_ref,
+        topology_id,
+        run_id,
+        context_length = planned_topology.context_length,
+        parallel_lanes = planned_topology.slots,
+        local_node = %spec.node.id().fmt_short(),
+        elected_coordinator = %stage0.node_id.fmt_short(),
+        stages = ?split_stage_plan_labels(&stages),
+        participants = ?split_participant_labels(&planned_participants),
+        excluded = ?split_participant_exclusion_labels(&participant_snapshot.excluded),
+        "split topology planned; elected coordinator from stage 0"
+    );
     if stage0.node_id != spec.node.id() {
+        tracing::info!(
+            model_ref,
+            topology_id,
+            run_id,
+            local_node = %spec.node.id().fmt_short(),
+            elected_coordinator = %stage0.node_id.fmt_short(),
+            "split topology election selected a remote coordinator; local node entering standby"
+        );
         return Ok(SplitRuntimeStart::Standby {
             coordinator: stage0.node_id,
         });
     }
+    tracing::info!(
+        model_ref,
+        topology_id,
+        run_id,
+        local_node = %spec.node.id().fmt_short(),
+        context_length = planned_topology.context_length,
+        parallel_lanes = planned_topology.slots,
+        "split topology election selected local node as coordinator"
+    );
 
-    let ctx_size = spec.ctx_size_override.unwrap_or(4096);
+    let ctx_size = planned_topology.context_length;
+    let slots = planned_topology.slots;
     let projector_path = spec
         .mmproj_override
         .map(Path::to_path_buf)
@@ -537,7 +678,7 @@ pub(super) async fn start_runtime_split_model(
         n_ubatch_override: spec.n_ubatch_override,
         flash_attention_override: spec.flash_attention_override,
         pinned_gpu: spec.pinned_gpu,
-        slots: spec.slots,
+        slots,
     })
     .await?;
     let (coordinator_tx, coordinator_rx) = tokio::sync::mpsc::channel(1);
@@ -551,13 +692,19 @@ pub(super) async fn start_runtime_split_model(
         active,
         projector_path,
         ctx_size,
+        topology_resources: SplitTopologyResourceInputs {
+            native_context_length: compact_meta.context_length,
+            kv_bytes_per_token,
+            ctx_size_override: spec.ctx_size_override,
+            parallel_override: spec.parallel_override,
+        },
         cache_type_k_override: spec.cache_type_k_override.map(str::to_string),
         cache_type_v_override: spec.cache_type_v_override.map(str::to_string),
         n_batch_override: spec.n_batch_override,
         n_ubatch_override: spec.n_ubatch_override,
         flash_attention_override: spec.flash_attention_override,
         pinned_gpu: spec.pinned_gpu.cloned(),
-        slots: spec.slots,
+        slots,
         event_tx: coordinator_tx,
     }));
 
@@ -565,19 +712,23 @@ pub(super) async fn start_runtime_split_model(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct SplitParticipant {
-    node_id: iroh::EndpointId,
-    vram_bytes: u64,
+pub(super) struct SplitParticipant {
+    pub(super) node_id: iroh::EndpointId,
+    pub(super) vram_bytes: u64,
     first_joined_mesh_ts: Option<u64>,
-    cached_slice_bytes: u64,
-    missing_artifact_bytes: u64,
-    rtt_ms: Option<u32>,
-    artifact_transfer_supported: bool,
+    pub(super) cached_slice_bytes: u64,
+    pub(super) missing_artifact_bytes: u64,
+    pub(super) rtt_ms: Option<u32>,
+    pub(super) artifact_transfer_supported: bool,
     availability_score: u32,
 }
 
 impl SplitParticipant {
-    fn new(node_id: iroh::EndpointId, vram_bytes: u64, first_joined_mesh_ts: Option<u64>) -> Self {
+    pub(super) fn new(
+        node_id: iroh::EndpointId,
+        vram_bytes: u64,
+        first_joined_mesh_ts: Option<u64>,
+    ) -> Self {
         Self {
             node_id,
             vram_bytes,
@@ -617,6 +768,7 @@ impl SplitParticipant {
         self
     }
 
+    #[cfg(test)]
     fn to_topology_participant(self) -> skippy::StageTopologyParticipant {
         skippy::StageTopologyParticipant {
             node_id: self.node_id,
@@ -662,60 +814,13 @@ struct SplitParticipantSnapshot {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct SplitParticipantExclusion {
-    node_id: iroh::EndpointId,
-    reason: SplitParticipantExclusionReason,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct SplitCapacityReadinessReport {
-    required_bytes: u64,
-    available_bytes: u64,
-    missing_bytes: u64,
-    participants: Vec<SplitParticipant>,
-    excluded: Vec<SplitParticipantExclusion>,
-}
-
-impl SplitCapacityReadinessReport {
-    fn new(
-        required_bytes: u64,
-        available_bytes: u64,
-        participants: &[SplitParticipant],
-        excluded: &[SplitParticipantExclusion],
-    ) -> Self {
-        Self {
-            required_bytes,
-            available_bytes,
-            missing_bytes: required_bytes.saturating_sub(available_bytes),
-            participants: participants.to_vec(),
-            excluded: excluded.to_vec(),
-        }
-    }
-
-    fn error_message(&self, model_ref: &str) -> String {
-        let mut message = format!(
-            "aggregate split capacity for {model_ref} requires {}, mesh has {} across {} participant(s), short by {}",
-            format_gb(self.required_bytes),
-            format_gb(self.available_bytes),
-            self.participants.len(),
-            format_gb(self.missing_bytes)
-        );
-        if !self.participants.is_empty() {
-            message.push_str("; participants [");
-            message.push_str(&split_participant_labels(&self.participants).join(", "));
-            message.push(']');
-        }
-        if !self.excluded.is_empty() {
-            message.push_str("; excluded [");
-            message.push_str(&split_participant_exclusion_labels(&self.excluded).join(", "));
-            message.push(']');
-        }
-        message
-    }
+pub(super) struct SplitParticipantExclusion {
+    pub(super) node_id: iroh::EndpointId,
+    pub(super) reason: SplitParticipantExclusionReason,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SplitParticipantExclusionReason {
+pub(super) enum SplitParticipantExclusionReason {
     Client,
     MissingVram,
     MissingModelInterest,
@@ -723,7 +828,7 @@ enum SplitParticipantExclusionReason {
 }
 
 impl SplitParticipantExclusionReason {
-    const fn as_str(self) -> &'static str {
+    pub(super) const fn as_str(self) -> &'static str {
         match self {
             Self::Client => "client",
             Self::MissingVram => "missing_vram",
@@ -787,6 +892,8 @@ async fn load_split_runtime_generation_inner(
         spec.node.id().fmt_short()
     );
 
+    claim_split_coordinator_lease(spec.node, spec.model_ref, spec.package, spec.generation).await?;
+
     let mut ready_by_stage: HashMap<String, skippy::StageStatusSnapshot> = HashMap::new();
     let mut downstream: Option<skippy::StagePeerDescriptor> = None;
     let kv_cache = skippy::KvCachePolicy::for_model_size(spec.package.source_model_bytes);
@@ -801,11 +908,7 @@ async fn load_split_runtime_generation_inner(
         .to_string();
     let resolved_flash_attn_type =
         effective_flash_attention(spec.flash_attention_override, &effective_cache_type_v);
-    tracing::info!(
-        model = spec.model_ref,
-        "KV cache: {}",
-        kv_cache.label(spec.package.source_model_bytes)
-    );
+    tracing::info!(model = spec.model_ref, "KV cache: {}", kv_cache.label());
 
     // Use LayerPackage mode when we have an hf:// distributable package ref,
     // otherwise fall back to RuntimeSlice (requires full GGUF on each node).
@@ -864,6 +967,9 @@ async fn load_split_runtime_generation_inner(
             cache_type_v: effective_cache_type_v.clone(),
             flash_attn_type: resolved_flash_attn_type,
             shutdown_generation: spec.generation.generation,
+            coordinator_term: spec.generation.coordinator_term,
+            coordinator_id: Some(spec.node.id()),
+            lease_until_unix_ms: spec.generation.lease_until_unix_ms,
             load_mode: load_mode.clone(),
             upstream: None,
             downstream: downstream.clone(),
@@ -1006,6 +1112,141 @@ async fn load_split_runtime_generation_inner(
     })
 }
 
+async fn claim_split_coordinator_lease(
+    node: &mesh::Node,
+    model_ref: &str,
+    package: &skippy::SkippyPackageIdentity,
+    generation: &SplitTopologyGeneration,
+) -> Result<()> {
+    let claim = split_coordinator_claim(node.id(), model_ref, package, generation);
+    let required_accepts = skippy_coordinator::quorum_requirement(generation.stages.len());
+    let mut accepted = 0usize;
+    let mut accepted_nodes = Vec::new();
+    let mut errors = Vec::new();
+    tracing::info!(
+        model_ref,
+        topology_id = generation.topology_id,
+        run_id = generation.run_id,
+        generation = generation.generation,
+        coordinator_term = generation.coordinator_term,
+        coordinator = %node.id().fmt_short(),
+        planned_stages = generation.stages.len(),
+        required_accepts,
+        stages = ?split_stage_plan_labels(&generation.stages),
+        participants = ?split_participant_labels(&generation.participants),
+        "claiming split topology coordinator lease"
+    );
+
+    for stage in &generation.stages {
+        let request = skippy::StageControlRequest::Claim(claim.clone());
+        let response = if stage.node_id == node.id() {
+            node.send_local_stage_control(request).await
+        } else {
+            node.send_stage_control(stage.node_id, request).await
+        };
+        match response {
+            Ok(skippy::StageControlResponse::ClaimAccepted(ack)) if ack.accepted => {
+                accepted += 1;
+                accepted_nodes.push(stage.node_id);
+                tracing::debug!(
+                    model_ref,
+                    topology_id = generation.topology_id,
+                    generation = generation.generation,
+                    stage_id = stage.stage_id,
+                    stage_node = %stage.node_id.fmt_short(),
+                    "split topology coordinator claim accepted by stage"
+                );
+            }
+            Ok(skippy::StageControlResponse::ClaimAccepted(ack)) => {
+                let error = ack.error.unwrap_or_else(|| "unknown rejection".to_string());
+                tracing::warn!(
+                    model_ref,
+                    topology_id = generation.topology_id,
+                    generation = generation.generation,
+                    stage_id = stage.stage_id,
+                    stage_node = %stage.node_id.fmt_short(),
+                    error = %error,
+                    "split topology coordinator claim rejected by stage"
+                );
+                errors.push(format!(
+                    "{} rejected claim: {}",
+                    stage.node_id.fmt_short(),
+                    error
+                ));
+            }
+            Ok(other) => {
+                tracing::warn!(
+                    model_ref,
+                    topology_id = generation.topology_id,
+                    generation = generation.generation,
+                    stage_id = stage.stage_id,
+                    stage_node = %stage.node_id.fmt_short(),
+                    response = ?other,
+                    "split topology coordinator claim returned unexpected response"
+                );
+                errors.push(format!(
+                    "{} returned unexpected claim response: {other:?}",
+                    stage.node_id.fmt_short()
+                ));
+            }
+            Err(err) => {
+                tracing::warn!(
+                    model_ref,
+                    topology_id = generation.topology_id,
+                    generation = generation.generation,
+                    stage_id = stage.stage_id,
+                    stage_node = %stage.node_id.fmt_short(),
+                    error = %err,
+                    "split topology coordinator claim failed for stage"
+                );
+                errors.push(format!(
+                    "{} claim failed: {err:#}",
+                    stage.node_id.fmt_short()
+                ));
+            }
+        }
+    }
+
+    anyhow::ensure!(
+        accepted >= required_accepts,
+        "coordinator claim for {model_ref} accepted by {accepted}/{} planned stage(s), need {required_accepts}: {}",
+        generation.stages.len(),
+        errors.join("; ")
+    );
+    tracing::info!(
+        model_ref,
+        topology_id = generation.topology_id,
+        run_id = generation.run_id,
+        generation = generation.generation,
+        coordinator_term = generation.coordinator_term,
+        accepted,
+        required_accepts,
+        accepted_nodes = ?split_node_labels(&accepted_nodes),
+        "split topology coordinator lease quorum reached"
+    );
+    Ok(())
+}
+
+fn split_coordinator_claim(
+    coordinator_id: iroh::EndpointId,
+    model_ref: &str,
+    package: &skippy::SkippyPackageIdentity,
+    generation: &SplitTopologyGeneration,
+) -> skippy::StageCoordinatorClaim {
+    skippy::StageCoordinatorClaim {
+        model_id: model_ref.to_string(),
+        package_ref: package.package_ref.clone(),
+        manifest_sha256: package.manifest_sha256.clone(),
+        topology_id: generation.topology_id.clone(),
+        run_id: generation.run_id.clone(),
+        coordinator_id: coordinator_id.to_string(),
+        coordinator_term: generation.coordinator_term,
+        participant_set_hash: split_participant_set_hash(&generation.participants),
+        topology_hash: split_topology_hash(&generation.stages),
+        lease_until_unix_ms: generation.lease_until_unix_ms,
+    }
+}
+
 fn stage_load_model_path(load_mode: LoadMode, package_ref: &str, model_path: &Path) -> String {
     match load_mode {
         LoadMode::LayerPackage => package_ref.to_string(),
@@ -1016,20 +1257,12 @@ fn stage_load_model_path(load_mode: LoadMode, package_ref: &str, model_path: &Pa
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct RuntimeSliceStagePlan {
-    stage_id: String,
-    stage_index: u32,
-    node_id: iroh::EndpointId,
-    layer_start: u32,
-    layer_end: u32,
-    parameter_bytes: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 struct SplitTopologyGeneration {
     topology_id: String,
     run_id: String,
     generation: u64,
+    coordinator_term: u64,
+    lease_until_unix_ms: u64,
     participants: Vec<SplitParticipant>,
     stages: Vec<RuntimeSliceStagePlan>,
 }
@@ -1046,6 +1279,8 @@ impl SplitTopologyGeneration {
             topology_id,
             run_id,
             generation,
+            coordinator_term: now_unix_nanos().max(1) as u64,
+            lease_until_unix_ms: split_coordinator_lease_until_unix_ms(),
             participants,
             stages,
         }
@@ -1061,6 +1296,7 @@ struct SplitTopologyCoordinator {
     active: SplitTopologyGeneration,
     projector_path: Option<String>,
     ctx_size: u32,
+    topology_resources: SplitTopologyResourceInputs,
     cache_type_k_override: Option<String>,
     cache_type_v_override: Option<String>,
     n_batch_override: Option<u32>,
@@ -1315,14 +1551,19 @@ impl SplitTopologyCoordinator {
             return true;
         };
 
-        match split_replan_decision(&self.active, &candidate) {
+        let (replan_decision, replan_decision_reason) =
+            split_replan_decision_with_reason(&self.active, &candidate);
+        match replan_decision {
             SplitReplanDecision::Keep => {
                 tracing::debug!(
                     model_ref = self.model_ref,
                     reason,
+                    decision_reason = replan_decision_reason,
                     active_generation = self.active.generation,
                     active_stages = self.active.stages.len(),
                     candidate_stages = candidate.stages.len(),
+                    active_participants = self.active.participants.len(),
+                    candidate_participants = candidate.participants.len(),
                     "split topology replan skipped; candidate is not materially better"
                 );
             }
@@ -1330,6 +1571,7 @@ impl SplitTopologyCoordinator {
                 tracing::info!(
                     model_ref = self.model_ref,
                     reason,
+                    decision_reason = replan_decision_reason,
                     active_topology_id = self.active.topology_id,
                     active_generation = self.active.generation,
                     candidate_topology_id = candidate.topology_id,
@@ -1359,12 +1601,21 @@ impl SplitTopologyCoordinator {
         let generation = self.active.generation.saturating_add(1);
         let run_id = format!("mesh-split-{}-g{}", now_unix_nanos(), generation);
         let topology_id = format!("topology-{run_id}");
-        let stages = plan_runtime_slice_topology(
+        let resources = SplitTopologyResourceInputs {
+            ctx_size_override: Some(self.ctx_size),
+            parallel_override: Some(self.slots),
+            ..self.topology_resources
+        };
+        let planned = plan_runtime_slice_topology_with_resources(
             &topology_id,
             &self.model_ref,
             &self.package,
             planned_participants,
+            &[],
+            resources,
         )?;
+        let stages = planned.stages;
+        let participants = split_participants_for_stages(planned_participants, &stages);
         anyhow::ensure!(
             split_stages_meet_minimum(&stages),
             "split runtime needs at least two stage participants"
@@ -1373,7 +1624,7 @@ impl SplitTopologyCoordinator {
             topology_id,
             run_id,
             generation,
-            planned_participants.to_vec(),
+            participants,
             stages,
         ))
     }
@@ -1384,10 +1635,14 @@ impl SplitTopologyCoordinator {
             .as_ref()
             .map(|gpu| gpu.vram_bytes)
             .unwrap_or_else(|| self.node.vram_bytes());
-        model_fits_runtime_capacity(
-            election::total_model_bytes(&self.model_path),
-            local_capacity,
-        )
+        // Use the package's source model bytes when available — layer-package
+        // refs use `hf://` pseudo-paths that `total_model_bytes` cannot stat.
+        let model_bytes = if self.package.source_model_bytes > 0 {
+            self.package.source_model_bytes
+        } else {
+            election::total_model_bytes(&self.model_path)
+        };
+        model_fits_runtime_capacity(model_bytes, local_capacity)
     }
 
     async fn load_and_publish_candidate(
@@ -1494,27 +1749,41 @@ impl SplitTopologyCoordinator {
     }
 }
 
+#[cfg(test)]
 fn split_replan_decision(
     active: &SplitTopologyGeneration,
     candidate: &SplitTopologyGeneration,
 ) -> SplitReplanDecision {
+    split_replan_decision_with_reason(active, candidate).0
+}
+
+fn split_replan_decision_with_reason(
+    active: &SplitTopologyGeneration,
+    candidate: &SplitTopologyGeneration,
+) -> (SplitReplanDecision, &'static str) {
     if split_active_stage_participant_missing(active, &candidate.participants) {
-        return SplitReplanDecision::Candidate;
+        return (
+            SplitReplanDecision::Candidate,
+            "active_stage_participant_missing",
+        );
     }
     if candidate.stages.len() > active.stages.len() {
-        return SplitReplanDecision::Candidate;
+        return (SplitReplanDecision::Candidate, "candidate_has_more_stages");
     }
     if candidate.participants.len() > active.participants.len()
         && candidate.stages.len() == active.stages.len()
     {
-        return SplitReplanDecision::Candidate;
+        return (
+            SplitReplanDecision::Candidate,
+            "candidate_has_more_participants",
+        );
     }
     if split_stage_node_signature(&candidate.stages) != split_stage_node_signature(&active.stages)
         && split_stage_balance_score(&candidate.stages) < split_stage_balance_score(&active.stages)
     {
-        return SplitReplanDecision::Candidate;
+        return (SplitReplanDecision::Candidate, "candidate_improves_balance");
     }
-    SplitReplanDecision::Keep
+    (SplitReplanDecision::Keep, "candidate_not_materially_better")
 }
 
 fn split_loss_recovery_decision(
@@ -1616,6 +1885,7 @@ async fn stop_split_generation(
             run_id: generation.run_id.clone(),
             stage_id: stage.stage_id.clone(),
             shutdown_generation,
+            coordinator_term: generation.coordinator_term,
         };
         let result = if stage.node_id == node.id() {
             node.send_local_stage_control(skippy::StageControlRequest::Stop(stop))
@@ -1944,21 +2214,31 @@ fn split_participant_signature(participants: &[SplitParticipant]) -> SplitPartic
         .collect()
 }
 
-fn split_participant_labels(participants: &[SplitParticipant]) -> Vec<String> {
-    participants
-        .iter()
-        .map(|participant| {
-            format!(
-                "{}:{} cached={} missing={} rtt={}ms transfer={}",
-                participant.node_id.fmt_short(),
-                format_gb(participant.vram_bytes),
-                format_gb(participant.cached_slice_bytes),
-                format_gb(participant.missing_artifact_bytes),
-                participant.rtt_ms.unwrap_or_default(),
-                participant.artifact_transfer_supported
-            )
-        })
-        .collect()
+fn split_participant_set_hash(participants: &[SplitParticipant]) -> String {
+    let mut hasher = Sha256::new();
+    for participant in split_participant_signature(participants) {
+        hasher.update(participant.0.as_bytes());
+        hasher.update(participant.1.to_le_bytes());
+        hasher.update(participant.2.to_le_bytes());
+        hasher.update(participant.3.to_le_bytes());
+        hasher.update(participant.4.unwrap_or_default().to_le_bytes());
+        hasher.update([u8::from(participant.5)]);
+        hasher.update(participant.6.to_le_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn split_topology_hash(stages: &[RuntimeSliceStagePlan]) -> String {
+    let mut hasher = Sha256::new();
+    for stage in stages {
+        hasher.update(stage.stage_id.as_bytes());
+        hasher.update(stage.stage_index.to_le_bytes());
+        hasher.update(stage.node_id.to_string().as_bytes());
+        hasher.update(stage.layer_start.to_le_bytes());
+        hasher.update(stage.layer_end.to_le_bytes());
+        hasher.update(stage.parameter_bytes.to_le_bytes());
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 fn split_node_labels(nodes: &[iroh::EndpointId]) -> Vec<String> {
@@ -1968,19 +2248,7 @@ fn split_node_labels(nodes: &[iroh::EndpointId]) -> Vec<String> {
         .collect()
 }
 
-fn split_participant_exclusion_labels(excluded: &[SplitParticipantExclusion]) -> Vec<String> {
-    excluded
-        .iter()
-        .map(|exclusion| {
-            format!(
-                "{}:{}",
-                exclusion.node_id.fmt_short(),
-                exclusion.reason.as_str()
-            )
-        })
-        .collect()
-}
-
+#[cfg(test)]
 fn plan_runtime_slice_topology(
     topology_id: &str,
     model_ref: &str,
@@ -1990,6 +2258,7 @@ fn plan_runtime_slice_topology(
     plan_runtime_slice_topology_with_exclusions(topology_id, model_ref, package, participants, &[])
 }
 
+#[cfg(test)]
 fn plan_runtime_slice_topology_with_exclusions(
     topology_id: &str,
     model_ref: &str,
@@ -2044,82 +2313,6 @@ fn plan_runtime_slice_topology_with_exclusions(
         "planned split runtime topology"
     );
     Ok(stages)
-}
-
-fn validate_split_capacity(
-    model_ref: &str,
-    package: &skippy::SkippyPackageIdentity,
-    participants: &[SplitParticipant],
-    stages: &[RuntimeSliceStagePlan],
-    excluded: &[SplitParticipantExclusion],
-) -> Result<()> {
-    let total_vram_bytes = participants
-        .iter()
-        .map(|participant| participant.vram_bytes)
-        .sum::<u64>();
-    let required_total_bytes = runtime_model_required_bytes(package.source_model_bytes);
-    anyhow::ensure!(
-        total_vram_bytes >= required_total_bytes,
-        "{}",
-        format_aggregate_split_capacity_error(
-            model_ref,
-            required_total_bytes,
-            total_vram_bytes,
-            participants,
-            excluded
-        )
-    );
-
-    let vram_by_node = participants
-        .iter()
-        .map(|participant| (participant.node_id, participant.vram_bytes))
-        .collect::<HashMap<_, _>>();
-    for stage in stages {
-        let node_vram = vram_by_node
-            .get(&stage.node_id)
-            .copied()
-            .unwrap_or_default();
-        let required_stage_bytes = runtime_model_required_bytes(stage.parameter_bytes);
-        anyhow::ensure!(
-            node_vram >= required_stage_bytes,
-            "{} assigned to {} for {model_ref} requires {}, which exceeds node capacity {}",
-            stage.stage_id,
-            stage.node_id.fmt_short(),
-            format_gb(required_stage_bytes),
-            format_gb(node_vram)
-        );
-    }
-    Ok(())
-}
-
-fn format_aggregate_split_capacity_error(
-    model_ref: &str,
-    required_bytes: u64,
-    available_bytes: u64,
-    participants: &[SplitParticipant],
-    excluded: &[SplitParticipantExclusion],
-) -> String {
-    SplitCapacityReadinessReport::new(required_bytes, available_bytes, participants, excluded)
-        .error_message(model_ref)
-}
-
-fn format_gb(bytes: u64) -> String {
-    format!("{:.1}GB", bytes as f64 / 1e9)
-}
-
-fn split_stage_plan_labels(stages: &[RuntimeSliceStagePlan]) -> Vec<String> {
-    stages
-        .iter()
-        .map(|stage| {
-            format!(
-                "{}:{}:{}..{}",
-                stage.stage_id,
-                stage.node_id.fmt_short(),
-                stage.layer_start,
-                stage.layer_end
-            )
-        })
-        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2357,8 +2550,7 @@ async fn start_runtime_skippy_model(
 )> {
     let port = alloc_local_port().await?;
     let context_length = plan.context_length;
-    let model_bytes = election::total_model_bytes(spec.model_path);
-    let kv_cache = skippy::KvCachePolicy::for_model_size(model_bytes);
+    let kv_cache = skippy::KvCachePolicy::for_model_size(spec.model_bytes);
     let effective_cache_type_k = spec
         .cache_type_k_override
         .unwrap_or(kv_cache.cache_type_k());
@@ -2369,8 +2561,10 @@ async fn start_runtime_skippy_model(
         effective_flash_attention(spec.flash_attention_override, effective_cache_type_v);
     tracing::info!(
         model = model_name,
-        "KV cache: {}",
-        kv_cache.label(model_bytes)
+        "KV cache: {} K + {} V, {}K context",
+        effective_cache_type_k.to_ascii_uppercase(),
+        effective_cache_type_v.to_ascii_uppercase(),
+        context_length / 1024,
     );
     let projector_path = spec
         .mmproj_override
@@ -2444,8 +2638,10 @@ async fn start_runtime_layer_package_model(
         effective_flash_attention(spec.flash_attention_override, &effective_cache_type_v);
     tracing::info!(
         model = model_name,
-        "KV cache: {}",
-        kv_cache.label(package.source_model_bytes)
+        "KV cache: {} K + {} V, {}K context",
+        effective_cache_type_k.to_ascii_uppercase(),
+        effective_cache_type_v.to_ascii_uppercase(),
+        context_length / 1024,
     );
     let projector_path = spec
         .mmproj_override
@@ -2780,6 +2976,9 @@ mod tests {
             flash_attn_type: load.flash_attn_type,
             error: None,
             shutdown_generation: load.shutdown_generation,
+            coordinator_term: load.coordinator_term,
+            coordinator_id: load.coordinator_id,
+            lease_until_unix_ms: load.lease_until_unix_ms,
         }
     }
 
@@ -2813,6 +3012,9 @@ mod tests {
             flash_attn_type: FlashAttentionType::Auto,
             error: None,
             shutdown_generation: stop.shutdown_generation,
+            coordinator_term: stop.coordinator_term,
+            coordinator_id: None,
+            lease_until_unix_ms: 0,
         }
     }
 
@@ -2836,6 +3038,9 @@ mod tests {
             bind_addr: None,
             error: None,
             shutdown_generation: load.shutdown_generation,
+            coordinator_term: load.coordinator_term,
+            coordinator_id: load.coordinator_id,
+            lease_until_unix_ms: load.lease_until_unix_ms,
         }
     }
 
@@ -3152,9 +3357,12 @@ mod tests {
         .to_string();
 
         assert!(error.contains("aggregate split capacity"));
-        assert!(error.contains("requires 5.3GB"));
+        // Validation uses raw model weight (4.8GB) without the old 10%
+        // headroom that was removed to avoid double-counting the topology
+        // planner's own VRAM budget.
+        assert!(error.contains("requires 4.8GB"));
         assert!(error.contains("has 4.0GB"));
-        assert!(error.contains("short by 1.3GB"));
+        assert!(error.contains("short by 0.8GB"));
         assert!(error.contains("participants ["));
         assert!(error.contains(&format!("{}:2.0GB", make_id(1).fmt_short())));
         assert!(error.contains(&format!("{}:2.0GB", make_id(2).fmt_short())));
@@ -3162,9 +3370,13 @@ mod tests {
 
     #[test]
     fn split_topology_planner_rejects_stage_that_exceeds_participant_capacity() {
+        // Node 2 has 150 bytes but the planner assigns it at least 2 layers
+        // (200 bytes), which exceeds its capacity.  The previous version of
+        // this test used 200 bytes for node 2 which passes now that the old
+        // 10% headroom is no longer applied on top of the planner budget.
         let participants = vec![
             SplitParticipant::new(make_id(1), 900, None),
-            SplitParticipant::new(make_id(2), 200, None),
+            SplitParticipant::new(make_id(2), 150, None),
         ];
         let package = skippy::SkippyPackageIdentity {
             source_model_bytes: 1_000,
@@ -3242,7 +3454,9 @@ mod tests {
         .expect_err("aggregate split capacity should be enforced")
         .to_string();
 
-        assert!(error.contains("short by 1.3GB"));
+        // Raw model weight (4.8GB) minus aggregate VRAM (4.0GB) = 0.8GB
+        // shortfall, without the old 10% headroom.
+        assert!(error.contains("short by 0.8GB"));
         assert!(error.contains("excluded ["));
         assert!(error.contains(&format!(
             "{}:missing_model_interest",
@@ -3384,6 +3598,15 @@ mod tests {
                             test_inventory_from_request(inventory),
                         ))
                     }
+                    skippy::StageControlRequest::Claim(claim) => {
+                        Ok(skippy::StageControlResponse::ClaimAccepted(
+                            skippy::StageCoordinatorClaimAck {
+                                accepted: true,
+                                claim: claim.clone(),
+                                error: None,
+                            },
+                        ))
+                    }
                     skippy::StageControlRequest::Load(load) if load.stage_id == "stage-1" => {
                         Err(anyhow::anyhow!("injected stage load failure"))
                     }
@@ -3425,7 +3648,7 @@ mod tests {
             ],
         );
 
-        let error = match load_split_runtime_generation(SplitGenerationLoadSpec {
+        let error = match Box::pin(load_split_runtime_generation(SplitGenerationLoadSpec {
             node: &node,
             model_ref: "Qwen",
             model_path: Path::new("/models/qwen.gguf"),
@@ -3440,7 +3663,7 @@ mod tests {
             n_batch_override: None,
             n_ubatch_override: None,
             flash_attention_override: FlashAttentionType::Auto,
-        })
+        }))
         .await
         {
             Ok(_) => panic!("candidate split generation load unexpectedly succeeded"),
@@ -3454,6 +3677,11 @@ mod tests {
         );
 
         let requests = requests.lock().unwrap();
+        let claim_count = requests
+            .iter()
+            .filter(|request| matches!(request, skippy::StageControlRequest::Claim(_)))
+            .count();
+        assert_eq!(claim_count, generation.stages.len());
         let load_stage_ids = requests
             .iter()
             .filter_map(|request| match request {
@@ -3526,6 +3754,10 @@ mod tests {
             split_replan_decision(&active, &candidate),
             SplitReplanDecision::Candidate
         );
+        assert_eq!(
+            split_replan_decision_with_reason(&active, &candidate),
+            (SplitReplanDecision::Candidate, "candidate_has_more_stages")
+        );
     }
 
     #[test]
@@ -3557,6 +3789,10 @@ mod tests {
         assert_eq!(
             split_replan_decision(&active, &candidate),
             SplitReplanDecision::Keep
+        );
+        assert_eq!(
+            split_replan_decision_with_reason(&active, &candidate),
+            (SplitReplanDecision::Keep, "candidate_not_materially_better")
         );
     }
 

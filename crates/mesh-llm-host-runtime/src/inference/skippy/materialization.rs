@@ -20,6 +20,8 @@ use crate::cli::terminal_progress::{start_spinner, SpinnerHandle};
 
 use super::StageLoadRequest;
 
+mod cache_resolution;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum StagePackageRef {
     LocalPackage(PathBuf),
@@ -819,7 +821,7 @@ pub(crate) fn resolve_hf_package_to_local(
         .join("snapshots")
         .join(&revision_cache_path);
     if direct_snapshot_dir.join("model-package.json").is_file() {
-        if let Some(local_ref) = verify_cached_hf_package_files(
+        if let Some(local_ref) = cache_resolution::resolve_cached_hf_package_snapshot(
             &direct_snapshot_dir,
             layer_start,
             layer_end,
@@ -839,7 +841,7 @@ pub(crate) fn resolve_hf_package_to_local(
             .join("snapshots")
             .join(commit_hash_path);
         if snapshot_dir.join("model-package.json").is_file() {
-            if let Some(local_ref) = verify_cached_hf_package_files(
+            if let Some(local_ref) = cache_resolution::resolve_cached_hf_package_snapshot(
                 &snapshot_dir,
                 layer_start,
                 layer_end,
@@ -850,8 +852,7 @@ pub(crate) fn resolve_hf_package_to_local(
             }
         }
     }
-
-    crate::models::run_hf_sync(move || {
+    let downloaded = crate::models::run_hf_sync(move || {
         download_hf_package_to_local_sync(
             &repo,
             &revision,
@@ -860,7 +861,57 @@ pub(crate) fn resolve_hf_package_to_local(
             include_embeddings,
             include_output,
         )
-    })
+    })?;
+
+    // Metadata-only probes (layer_start == layer_end == 0) download the
+    // manifest and shared metadata but no layer files.  The downloaded
+    // snapshot may be a skeleton whose hash must not propagate through
+    // topology configs and stage loads.  Re-scan the local cache for a
+    // snapshot that has at least one real layer artifact.
+    //
+    // Real stage loads (layer_start < layer_end) always download the
+    // requested layer range, so the downloaded snapshot is guaranteed to
+    // have the needed files — no fallback scan needed.
+    let is_metadata_only = layer_start == 0 && layer_end == 0;
+    if is_metadata_only {
+        let downloaded_dir = std::path::Path::new(&downloaded);
+        if downloaded_dir.join("model-package.json").is_file()
+            && cache_resolution::resolve_cached_hf_package_snapshot(
+                downloaded_dir,
+                layer_start,
+                layer_end,
+                include_embeddings,
+                include_output,
+            )?
+            .is_none()
+        {
+            // Downloaded snapshot is a skeleton — find one with real layers.
+            let cache_dir = crate::models::huggingface_hub_cache_dir();
+            for snapshot_dir in
+                cache_resolution::cached_package_snapshots(&cache_dir, &repo_folder)?
+            {
+                if snapshot_dir.as_path() == downloaded_dir {
+                    continue;
+                }
+                if let Ok(Some(better)) = cache_resolution::resolve_cached_hf_package_snapshot(
+                    &snapshot_dir,
+                    layer_start,
+                    layer_end,
+                    include_embeddings,
+                    include_output,
+                ) {
+                    tracing::debug!(
+                        downloaded = %downloaded,
+                        better = %better,
+                        "post-download: preferring cached snapshot with layer artifacts over skeleton"
+                    );
+                    return Ok(better);
+                }
+            }
+        }
+    }
+
+    Ok(downloaded)
 }
 
 fn download_hf_package_to_local_sync(
@@ -1507,6 +1558,9 @@ mod tests {
             cache_type_v: "f16".to_string(),
             flash_attn_type: FlashAttentionType::Auto,
             shutdown_generation: 1,
+            coordinator_term: 0,
+            coordinator_id: None,
+            lease_until_unix_ms: 0,
             load_mode: LoadMode::LayerPackage,
             upstream: None,
             downstream: None,
@@ -1834,6 +1888,48 @@ mod tests {
 
     #[test]
     #[serial]
+    /// With an explicit pinned revision that has all requested layers, the
+    /// cache lookup returns it directly without downloading or scanning other
+    /// snapshots.  A stale snapshot with different content must NOT be picked.
+    fn pinned_revision_resolves_directly_from_cache() {
+        let prev_hf_home = std::env::var_os("HF_HOME");
+        let prev_hf_cache = std::env::var_os("HF_HUB_CACHE");
+        let prev_huggingface_cache = std::env::var_os("HUGGINGFACE_HUB_CACHE");
+        let prev_xdg_cache = std::env::var_os("XDG_CACHE_HOME");
+
+        let temp = tempfile::tempdir().unwrap();
+        std::env::set_var("HF_HOME", temp.path().join("hf"));
+        std::env::set_var("XDG_CACHE_HOME", temp.path().join("mesh-cache"));
+        std::env::remove_var("HF_HUB_CACHE");
+        std::env::remove_var("HUGGINGFACE_HUB_CACHE");
+
+        let repo_cache = temp
+            .path()
+            .join("hf")
+            .join("hub")
+            .join("models--owner--repo");
+
+        // Create a complete snapshot at the pinned revision.
+        let pinned_snapshot = repo_cache.join("snapshots").join("abc123");
+        write_cached_package_snapshot(&pinned_snapshot, sha256_hex(b"layer"));
+
+        // Create a stale snapshot that also has layers — must NOT be used.
+        let stale_snapshot = repo_cache.join("snapshots").join("old-stale");
+        write_cached_package_snapshot(&stale_snapshot, sha256_hex(b"layer"));
+
+        let resolved =
+            resolve_hf_package_to_local("hf://owner/repo@abc123", 0, 0, false, false).unwrap();
+
+        assert_eq!(PathBuf::from(resolved), pinned_snapshot);
+
+        restore_env("HF_HOME", prev_hf_home);
+        restore_env("HF_HUB_CACHE", prev_hf_cache);
+        restore_env("HUGGINGFACE_HUB_CACHE", prev_huggingface_cache);
+        restore_env("XDG_CACHE_HOME", prev_xdg_cache);
+    }
+
+    #[test]
+    #[serial]
     fn hf_package_metadata_only_cache_resolution_uses_metadata_integrity_scope() {
         let prev_hf_home = std::env::var_os("HF_HOME");
         let prev_hf_cache = std::env::var_os("HF_HUB_CACHE");
@@ -1950,6 +2046,9 @@ mod tests {
             cache_type_v: "f16".to_string(),
             flash_attn_type: skippy_protocol::FlashAttentionType::Auto,
             shutdown_generation: 0,
+            coordinator_term: 0,
+            coordinator_id: None,
+            lease_until_unix_ms: 0,
             load_mode: LoadMode::LayerPackage,
             upstream: None,
             downstream: None,

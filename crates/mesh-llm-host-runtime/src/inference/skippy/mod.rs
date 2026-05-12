@@ -41,6 +41,7 @@ pub(crate) use materialization::{
     configure_materialized_stage_cache, is_layer_package_ref, materialize_stage_config,
     materialized_stage_cache_dir, materialized_stages_for_sources,
     prune_unpinned_materialized_stages, remove_materialized_stages_for_sources,
+    resolve_hf_package_to_local,
 };
 pub(crate) use package::{
     identity_from_layer_package, synthetic_direct_gguf_package, SkippyPackageIdentity,
@@ -48,11 +49,13 @@ pub(crate) use package::{
 pub(crate) use stage::{
     spawn_stage_control_loop, stage_load_timeout, LayerRange, SourceModelKind,
     StageCancelPrepareRequest, StageControlCommand, StageControlRequest, StageControlResponse,
-    StageInventoryRequest, StageLayerInventory, StageLoadRequest, StagePackagePrefetcher,
-    StagePeerDescriptor, StagePreparationState, StagePreparationStatus,
-    StagePrepareAcceptedResponse, StagePrepareRequest, StageReadyResponse, StageRuntimeState,
-    StageStatusAck, StageStatusFilter, StageStatusSnapshot, StageStopRequest, StageWireDType,
+    StageCoordinatorClaim, StageCoordinatorClaimAck, StageInventoryRequest, StageLayerInventory,
+    StageLoadRequest, StagePackagePrefetcher, StagePeerDescriptor, StagePreparationState,
+    StagePreparationStatus, StagePrepareAcceptedResponse, StagePrepareRequest, StageReadyResponse,
+    StageRuntimeState, StageStatusAck, StageStatusFilter, StageStatusSnapshot, StageStopRequest,
+    StageWireDType,
 };
+#[cfg(test)]
 pub(crate) use topology::{plan_package_identity_topology, StageTopologyParticipant};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

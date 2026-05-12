@@ -437,6 +437,8 @@ fn local_openai_backend(config: StageConfig) -> Result<StageOpenAiBackend> {
         speculative_window: 0,
         adaptive_speculative_window: false,
         generation_limit: Arc::new(Semaphore::new(1)),
+        generation_queue_depth: Arc::new(AtomicUsize::new(0)),
+        generation_queue_limit: 1,
         hook_policy: None,
         kv: None,
     })
@@ -615,6 +617,8 @@ async fn real_multimodal_split_smoke_when_fixture_is_set() -> Result<()> {
         speculative_window: 0,
         adaptive_speculative_window: false,
         generation_limit: Arc::new(Semaphore::new(1)),
+        generation_queue_depth: Arc::new(AtomicUsize::new(0)),
+        generation_queue_limit: 1,
         hook_policy: None,
         kv: None,
     };
@@ -1126,6 +1130,41 @@ fn model_matching_is_exact_for_mesh_style_ids() {
 }
 
 #[test]
+fn model_matching_normalizes_default_revision() {
+    // Advertised with @main, requested without (public display form)
+    ensure_requested_model(
+        "unsloth/Qwen3-32B-GGUF@main:UD-Q4_K_XL",
+        "unsloth/Qwen3-32B-GGUF:UD-Q4_K_XL",
+    )
+    .unwrap();
+
+    // Advertised without, requested with @main
+    ensure_requested_model(
+        "unsloth/Qwen3-32B-GGUF:UD-Q4_K_XL",
+        "unsloth/Qwen3-32B-GGUF@main:UD-Q4_K_XL",
+    )
+    .unwrap();
+
+    // Both with @main — exact match still works
+    ensure_requested_model(
+        "unsloth/Qwen3-32B-GGUF@main:UD-Q4_K_XL",
+        "unsloth/Qwen3-32B-GGUF@main:UD-Q4_K_XL",
+    )
+    .unwrap();
+
+    // Bare repo@main without selector
+    ensure_requested_model("org/repo@main", "org/repo").unwrap();
+
+    // Different quants still rejected
+    let error = ensure_requested_model(
+        "unsloth/Qwen3-32B-GGUF@main:UD-Q4_K_XL",
+        "unsloth/Qwen3-32B-GGUF:Q5_K_M",
+    )
+    .unwrap_err();
+    assert_eq!(error.body().error.code.as_deref(), Some("model_not_found"));
+}
+
+#[test]
 fn rejects_requests_that_exceed_context_window() {
     ensure_context_capacity(4, 4, 8).unwrap();
 
@@ -1152,4 +1191,30 @@ fn configured_default_max_tokens_remains_explicit() {
         error.body().error.code.as_deref(),
         Some("context_length_exceeded")
     );
+}
+
+#[test]
+fn strip_default_revision_removes_at_main_before_quant() {
+    assert_eq!(
+        super::strip_default_revision("org/repo@main:Q4"),
+        "org/repo:Q4"
+    );
+}
+
+#[test]
+fn strip_default_revision_removes_at_main_at_end() {
+    assert_eq!(super::strip_default_revision("org/repo@main"), "org/repo");
+}
+
+#[test]
+fn strip_default_revision_preserves_mainland() {
+    assert_eq!(
+        super::strip_default_revision("org/repo@mainland:Q4"),
+        "org/repo@mainland:Q4"
+    );
+}
+
+#[test]
+fn strip_default_revision_preserves_no_revision() {
+    assert_eq!(super::strip_default_revision("org/repo:Q4"), "org/repo:Q4");
 }

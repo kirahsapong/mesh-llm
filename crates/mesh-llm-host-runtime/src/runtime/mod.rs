@@ -5,6 +5,7 @@ pub mod instance;
 mod interactive;
 mod local;
 mod proxy;
+mod split_planning;
 mod survey;
 pub(crate) mod wakeable;
 
@@ -58,6 +59,7 @@ use zeroize::Zeroizing;
 const PRETTY_DASHBOARD_INVENTORY_CACHE_TTL: Duration = Duration::from_secs(5);
 const DASHBOARD_CONTEXT_USAGE_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 const DASHBOARD_FIRST_PAINT_TIMEOUT: Duration = Duration::from_secs(2);
+const SPLIT_STANDBY_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
 type DashboardContextUsage =
     Arc<tokio::sync::Mutex<HashMap<String, HashMap<DashboardContextUsageSource, u64>>>>;
@@ -1028,7 +1030,6 @@ struct StartupLocalModelTask {
     n_batch: Option<u32>,
     n_ubatch: Option<u32>,
     flash_attention: FlashAttentionType,
-    slots: usize,
     parallel_override: Option<usize>,
     split: bool,
     survey_telemetry: survey::SurveyTelemetry,
@@ -1065,7 +1066,6 @@ async fn startup_local_model_loop(params: StartupLocalModelTask) {
         n_batch,
         n_ubatch,
         flash_attention,
-        slots,
         parallel_override,
         split,
         survey_telemetry,
@@ -1090,21 +1090,6 @@ async fn startup_local_model_loop(params: StartupLocalModelTask) {
         None
     };
 
-    let startup_load_guard = startup_load_gate.lock().await;
-    let start_spec = LocalRuntimeModelStartSpec {
-        node: &node,
-        model_path: &model_path,
-        mmproj_override: mmproj_path.as_deref(),
-        ctx_size_override: ctx_size,
-        pinned_gpu: pinned_gpu.as_ref(),
-        cache_type_k_override: cache_type_k.as_deref(),
-        cache_type_v_override: cache_type_v.as_deref(),
-        n_batch_override: n_batch,
-        n_ubatch_override: n_ubatch,
-        flash_attention_override: flash_attention,
-        slots,
-        parallel_override,
-    };
     let local_capacity = pinned_gpu
         .as_ref()
         .map(|gpu| gpu.vram_bytes)
@@ -1140,7 +1125,21 @@ async fn startup_local_model_loop(params: StartupLocalModelTask) {
             reason: SplitRuntimeReason::LocalCapacity,
         } => survey::SurveyLaunchKind::MoeFallback,
     };
-    let launch_started = Instant::now();
+    let make_start_spec = || LocalRuntimeModelStartSpec {
+        node: &node,
+        model_path: &model_path,
+        model_bytes,
+        mmproj_override: mmproj_path.as_deref(),
+        ctx_size_override: ctx_size,
+        pinned_gpu: pinned_gpu.as_ref(),
+        cache_type_k_override: cache_type_k.as_deref(),
+        cache_type_v_override: cache_type_v.as_deref(),
+        n_batch_override: n_batch,
+        n_ubatch_override: n_ubatch,
+        flash_attention_override: flash_attention,
+        parallel_override,
+    };
+    let mut launch_started: Instant;
     let (
         mut loaded_name,
         handle,
@@ -1164,60 +1163,114 @@ async fn startup_local_model_loop(params: StartupLocalModelTask) {
                     )),
                 });
             }
-            match start_runtime_split_model(start_spec, &model_ref).await {
-                Ok(SplitRuntimeStart::Started(loaded)) => {
-                    let mut loaded = *loaded;
-                    (
-                        loaded.loaded_name,
-                        loaded.handle,
-                        loaded.death_rx,
-                        loaded.cleanup.take(),
-                        loaded.coordinator_rx.take(),
-                        loaded.coordinator_task.take(),
-                    )
-                }
-                Ok(SplitRuntimeStart::Standby { coordinator }) => {
-                    drop(startup_load_guard);
-                    let _ = emit_event(OutputEvent::Info {
-                        message: format!(
-                            "Split runtime coordinator is {}; standing by for stage assignment",
-                            coordinator.fmt_short()
-                        ),
-                        context: Some(format!("model={model_ref}")),
-                    });
-                    update_startup_target(&target_tx, &model_name, election::InferenceTarget::None);
-                    if let Some(cs) = console_state {
-                        cs.update(false, false).await;
+            let mut peer_rx = node.peer_change_rx.clone();
+            loop {
+                let startup_load_guard = startup_load_gate.lock().await;
+                launch_started = Instant::now();
+                match start_runtime_split_model(make_start_spec(), &model_ref).await {
+                    Ok(SplitRuntimeStart::Started(loaded)) => {
+                        drop(startup_load_guard);
+                        let mut loaded = *loaded;
+                        break (
+                            loaded.loaded_name,
+                            loaded.handle,
+                            loaded.death_rx,
+                            loaded.cleanup.take(),
+                            loaded.coordinator_rx.take(),
+                            loaded.coordinator_task.take(),
+                        );
                     }
-                    return;
-                }
-                Err(err) => {
-                    survey_telemetry.record_launch_failure(
-                        survey::SurveyModelSpec {
-                            model: &model_name,
-                            model_path: Some(&model_path),
-                            launch_kind,
-                            pinned_gpu: pinned_gpu.as_ref(),
-                            backend: None,
-                            context_length: ctx_size.map(u64::from),
-                        },
-                        launch_started.elapsed(),
-                        survey::classify_launch_failure(&err),
-                    );
-                    let _ = emit_event(OutputEvent::Error {
-                        message: format!("Failed to start model {model_name}: {err:#}"),
-                        context: Some(format!("model={model_name}")),
-                    });
-                    update_startup_target(&target_tx, &model_name, election::InferenceTarget::None);
-                    if let Some(cs) = console_state {
-                        cs.update(false, false).await;
+                    Ok(SplitRuntimeStart::Standby { coordinator }) => {
+                        drop(startup_load_guard);
+                        let _ = emit_event(OutputEvent::Info {
+                            message: format!(
+                                "Split runtime coordinator is {}; standing by for stage assignment",
+                                coordinator.fmt_short()
+                            ),
+                            context: Some(format!("model={model_ref}")),
+                        });
+                        update_startup_target(
+                            &target_tx,
+                            &model_name,
+                            election::InferenceTarget::None,
+                        );
+                        if let Some(cs) = console_state.as_ref() {
+                            cs.update(false, false).await;
+                        }
                     }
-                    return;
+                    Err(err) => {
+                        let err_msg = format!("{err:#}");
+                        let is_participant_shortage = err_msg
+                            .contains("at least two participating nodes")
+                            || err_msg.contains("at least two stage participants");
+                        if is_participant_shortage {
+                            // Transient: not enough peers yet — log as info and
+                            // fall through to the retry select so we try again
+                            // when a peer joins or the standby interval elapses.
+                            let _ = emit_event(OutputEvent::Info {
+                                message: format!("Split waiting for peers: {err_msg}"),
+                                context: Some(format!("model={model_name}")),
+                            });
+                        } else {
+                            // Fatal split failure — give up.
+                            survey_telemetry.record_launch_failure(
+                                survey::SurveyModelSpec {
+                                    model: &model_name,
+                                    model_path: Some(&model_path),
+                                    launch_kind,
+                                    pinned_gpu: pinned_gpu.as_ref(),
+                                    backend: None,
+                                    context_length: ctx_size.map(u64::from),
+                                },
+                                launch_started.elapsed(),
+                                survey::classify_launch_failure(&err),
+                            );
+                            let _ = emit_event(OutputEvent::Error {
+                                message: format!("Failed to start model {model_name}: {err:#}"),
+                                context: Some(format!("model={model_name}")),
+                            });
+                            update_startup_target(
+                                &target_tx,
+                                &model_name,
+                                election::InferenceTarget::None,
+                            );
+                            if let Some(cs) = console_state.as_ref() {
+                                cs.update(false, false).await;
+                            }
+                            return;
+                        }
+                    }
+                }
+
+                tokio::select! {
+                    result = peer_rx.changed() => {
+                        if result.is_err() {
+                            return;
+                        }
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                            result = stop_rx.changed() => {
+                                if result.is_err() || *stop_rx.borrow() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    _ = tokio::time::sleep(SPLIT_STANDBY_RETRY_INTERVAL) => {}
+                    result = stop_rx.changed() => {
+                        if result.is_err() || *stop_rx.borrow() {
+                            return;
+                        }
+                    }
                 }
             }
         }
         StartupRuntimePlan::Local => {
-            match start_runtime_local_model(start_spec, &model_ref).await {
+            let startup_load_guard = startup_load_gate.lock().await;
+            launch_started = Instant::now();
+            let start_result = start_runtime_local_model(make_start_spec(), &model_ref).await;
+            drop(startup_load_guard);
+            match start_result {
                 Ok((loaded_name, handle, death_rx)) => {
                     (loaded_name, handle, death_rx, None, None, None)
                 }
@@ -1239,7 +1292,7 @@ async fn startup_local_model_loop(params: StartupLocalModelTask) {
                         context: Some(format!("model={model_name}")),
                     });
                     update_startup_target(&target_tx, &model_name, election::InferenceTarget::None);
-                    if let Some(cs) = console_state {
+                    if let Some(cs) = console_state.as_ref() {
                         cs.update(false, false).await;
                     }
                     return;
@@ -1247,7 +1300,6 @@ async fn startup_local_model_loop(params: StartupLocalModelTask) {
             }
         }
     };
-    drop(startup_load_guard);
 
     let mut survey_loaded_model = survey_telemetry.model(survey::SurveyModelSpec {
         model: &loaded_name,
@@ -1397,6 +1449,7 @@ async fn startup_local_model_loop(params: StartupLocalModelTask) {
                         match start_runtime_local_model(LocalRuntimeModelStartSpec {
                             node: &node,
                             model_path: &model_path,
+                            model_bytes,
                             mmproj_override: mmproj_path.as_deref(),
                             ctx_size_override: ctx_size,
                             pinned_gpu: pinned_gpu.as_ref(),
@@ -1405,7 +1458,6 @@ async fn startup_local_model_loop(params: StartupLocalModelTask) {
                             n_batch_override: n_batch,
                             n_ubatch_override: n_ubatch,
                             flash_attention_override: flash_attention,
-                            slots,
                             parallel_override,
                         }, &model_ref)
                         .await
@@ -4190,6 +4242,7 @@ async fn run_auto(
     // Join mesh if --join was given or auto-discovery queued fallback candidates.
     if !cli.join.is_empty() || !auto_join_candidates.is_empty() {
         let mut joined = false;
+        let mut last_join_error: Option<String> = None;
         let join_attempts: Vec<(String, Option<String>)> = if !cli.join.is_empty() {
             cli.join
                 .iter()
@@ -4215,7 +4268,10 @@ async fn run_auto(
                     successful_join = Some((t.clone(), mesh_name.clone()));
                     break;
                 }
-                Err(e) => tracing::warn!("Failed to join via token: {e}"),
+                Err(e) => {
+                    tracing::warn!("Failed to join via token: {e}");
+                    last_join_error = Some(format!("{e:#}"));
+                }
             }
         }
 
@@ -4232,8 +4288,9 @@ async fn run_auto(
         }
 
         if !joined {
+            let reason = last_join_error.as_deref().unwrap_or("unknown");
             let _ = emit_event(OutputEvent::Warning {
-                message: "Failed to join any peer — running standalone".to_string(),
+                message: format!("Failed to join any peer — running standalone ({reason})"),
                 context: None,
             });
         }
@@ -4707,7 +4764,6 @@ async fn run_auto(
         .as_ref()
         .and_then(|m| m.parallel)
         .or(config.gpu.parallel);
-    let primary_slots = primary_parallel_override.unwrap_or(4);
     let model_name_for_election = model_name.clone();
     let primary_target_tx = target_tx.clone();
     let console_state_for_election = console_state.clone();
@@ -4784,7 +4840,6 @@ async fn run_auto(
         n_batch: primary_n_batch,
         n_ubatch: primary_n_ubatch,
         flash_attention: primary_flash_attention,
-        slots: primary_slots,
         parallel_override: primary_parallel_override,
         split: startup_split,
         survey_telemetry: survey_telemetry_for_primary,
@@ -4845,7 +4900,6 @@ async fn run_auto(
             let extra_model_name = extra_name.clone();
             let api_port_extra = api_port;
             let extra_parallel_override = extra_model.parallel.or(config.gpu.parallel);
-            let extra_slots = extra_parallel_override.unwrap_or(4);
             let extra_console_state = console_state.clone();
             let extra_startup_ready_reporter = startup_ready_reporter.clone();
             let extra_startup_load_gate = startup_load_gate.clone();
@@ -4877,7 +4931,6 @@ async fn run_auto(
                     n_batch: extra_n_batch,
                     n_ubatch: extra_n_ubatch,
                     flash_attention: extra_flash_attention,
-                    slots: extra_slots,
                     parallel_override: extra_parallel_override,
                     split: startup_split,
                     survey_telemetry: extra_survey_telemetry,
@@ -5027,18 +5080,25 @@ async fn run_auto(
                             let parallel_override = model_overrides
                                 .and_then(|m| m.parallel)
                                 .or(config.gpu.parallel);
-                            let slots = parallel_override.unwrap_or(4);
 
                             let instance_id =
                                 next_runtime_instance_id(&mut next_runtime_instance_sequence);
                             let requested_model = spec.clone();
                             add_serving_assignment(&node, &primary_model_name, &requested_model)
                                 .await;
+                            let runtime_model_bytes = {
+                                let p = model_path.clone();
+                                tokio::task::spawn_blocking(move || runtime_model_planning_bytes(&p))
+                                    .await
+                                    .unwrap_or(Ok(0))
+                                    .unwrap_or(0)
+                            };
                             let launch_started = Instant::now();
                             let (loaded_name, handle, death_rx) = match start_runtime_local_model(
                                 LocalRuntimeModelStartSpec {
                                     node: &node,
                                     model_path: &model_path,
+                                    model_bytes: runtime_model_bytes,
                                     mmproj_override: None,
                                     ctx_size_override: cli.ctx_size,
                                     pinned_gpu: None,
@@ -5051,7 +5111,6 @@ async fn run_auto(
                                     flash_attention_override: model_overrides
                                         .and_then(|m| m.flash_attention)
                                         .unwrap_or(FlashAttentionType::Auto),
-                                    slots,
                                     parallel_override,
                                 },
                                 &runtime_model_name,
@@ -6523,6 +6582,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    #[ignore = "downloads ~800MB from HuggingFace and depends on exact snapshot hash"]
     async fn resolve_model_accepts_short_catalog_name_from_hf_cache() {
         let prev_hub_cache = std::env::var_os("HF_HUB_CACHE");
         let prev_hf_home = std::env::var_os("HF_HOME");
@@ -7310,7 +7370,7 @@ mod tests {
     }
 
     #[test]
-    fn initial_pretty_session_mode_allows_dashboard_only_for_serve_surface() {
+    fn initial_pretty_session_mode_allows_dashboard_for_explicit_surface() {
         assert_eq!(
             initial_console_session_mode_for_surface(
                 Some(RuntimeSurface::Serve),
@@ -7324,7 +7384,7 @@ mod tests {
                 Some(RuntimeSurface::Client),
                 ConsoleSessionMode::InteractiveDashboard
             ),
-            ConsoleSessionMode::None
+            ConsoleSessionMode::InteractiveDashboard
         );
 
         assert_eq!(

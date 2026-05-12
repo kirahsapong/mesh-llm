@@ -63,7 +63,7 @@ fn current_time_unix_ms() -> u64 {
 
 const MIN_PINNED_GPU_CONFIG_PEER_VERSION: &str = "0.59.0";
 pub(super) const PEER_CONNECT_AND_GOSSIP_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(15);
+    std::time::Duration::from_secs(30);
 const ARTIFACT_TRANSFER_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const ARTIFACT_TRANSFER_READ_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const ARTIFACT_TRANSFER_BUFFER_BYTES: usize = 1024 * 1024;
@@ -1969,15 +1969,16 @@ impl Node {
         request: &crate::inference::skippy::StageControlRequest,
     ) -> std::time::Duration {
         match request {
-            crate::inference::skippy::StageControlRequest::Load(load) => {
-                crate::inference::skippy::stage_load_timeout(load)
-            }
-            crate::inference::skippy::StageControlRequest::Stop(_)
+            crate::inference::skippy::StageControlRequest::Claim(_)
+            | crate::inference::skippy::StageControlRequest::Stop(_)
             | crate::inference::skippy::StageControlRequest::Status(_)
             | crate::inference::skippy::StageControlRequest::Inventory(_)
             | crate::inference::skippy::StageControlRequest::CancelPrepare(_)
             | crate::inference::skippy::StageControlRequest::StatusUpdate(_) => {
                 std::time::Duration::from_secs(30)
+            }
+            crate::inference::skippy::StageControlRequest::Load(load) => {
+                crate::inference::skippy::stage_load_timeout(load)
             }
             crate::inference::skippy::StageControlRequest::Prepare(prepare) => {
                 crate::inference::skippy::stage_load_timeout(&prepare.load)
@@ -2227,31 +2228,10 @@ impl Node {
         let endpoint = builder.bind().await?;
         // Wait briefly for relay connection so the invite token includes the relay URL.
         // On sinkholed networks this times out and we proceed without relay (direct UDP only).
-        //
-        // We avoid `endpoint.online()` because iroh 0.98's implementation has a
-        // double-free in the `Flatten<IntoIter<Option<(RelayUrl, HomeRelayStatus)>>>`
-        // drop path, causing SIGABRT on some hardware (deterministically on Apple
-        // M3 Ultra / macOS 26.3).  Fixed on iroh main by PR #4149 which changed the
-        // type, but not yet released.  Instead we poll `watch_addr()` and wait until
-        // it advertises at least one relay address.
-        {
-            let mut watcher = endpoint.watch_addr();
-            let wait_relay = async {
-                loop {
-                    let addr = iroh::Watcher::get(&mut watcher);
-                    if addr.relay_urls().next().is_some() {
-                        return;
-                    }
-                    if iroh::Watcher::updated(&mut watcher).await.is_err() {
-                        std::future::pending::<()>().await;
-                    }
-                }
-            };
-            match tokio::time::timeout(std::time::Duration::from_secs(5), wait_relay).await {
-                Ok(()) => tracing::info!("Relay connected"),
-                Err(_) => {
-                    tracing::warn!("Relay connection timed out (5s) — proceeding without relay")
-                }
+        match tokio::time::timeout(std::time::Duration::from_secs(5), endpoint.online()).await {
+            Ok(()) => tracing::info!("Relay connected"),
+            Err(_) => {
+                tracing::warn!("Relay connection timed out (5s) — proceeding without relay")
             }
         }
 
@@ -2666,16 +2646,29 @@ impl Node {
         let addr: EndpointAddr =
             serde_json::from_slice(&json).context("invalid invite token JSON")?;
 
+        // Three attempts with increasing backoff.  Relay-only joins need
+        // WebSocket setup + QUIC handshake at high RTT — two attempts at
+        // 15s were not enough.  Three at 30s with 5s/10s gaps give ~105s
+        // total budget which covers all but the worst relay conditions.
+        let backoffs = [5, 10];
         self.state.lock().await.dead_peers.remove(&addr.id);
-        match self.connect_to_peer(addr.clone()).await {
-            Ok(()) => Ok(()),
-            Err(first_err) => {
-                tracing::info!("First join attempt failed ({first_err:#}), retrying in 5s...");
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                self.state.lock().await.dead_peers.remove(&addr.id);
-                self.connect_to_peer(addr).await
+        let mut last_err = match self.connect_to_peer(addr.clone()).await {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        };
+        for (attempt, delay_secs) in backoffs.iter().enumerate() {
+            tracing::info!(
+                "Join attempt {} failed ({last_err:#}), retrying in {delay_secs}s...",
+                attempt + 1
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(*delay_secs)).await;
+            self.state.lock().await.dead_peers.remove(&addr.id);
+            match self.connect_to_peer(addr.clone()).await {
+                Ok(()) => return Ok(()),
+                Err(e) => last_err = e,
             }
         }
+        Err(last_err)
     }
 
     /// Connect to a peer without gossip exchange — for passive nodes (clients/standby).
@@ -4525,17 +4518,60 @@ impl Node {
     ) -> anyhow::Result<()> {
         use prost::Message as _;
 
-        let buf = read_len_prefixed(&mut recv).await?;
+        let buf = read_len_prefixed(&mut recv).await.map_err(|e| {
+            tracing::warn!(
+                "handle_stage_control: read_len_prefixed failed from {}: {e}",
+                remote.fmt_short()
+            );
+            e
+        })?;
         let frame = skippy_protocol::proto::stage::StageControlRequest::decode(buf.as_slice())
-            .map_err(|e| anyhow::anyhow!("StageControlRequest decode error: {e}"))?;
-        skippy_protocol::validate_stage_control_request(&frame)
-            .map_err(|e| anyhow::anyhow!("StageControlRequest validation error: {e}"))?;
+            .map_err(|e| {
+                tracing::warn!(
+                    "handle_stage_control: decode failed from {}: {e}",
+                    remote.fmt_short()
+                );
+                anyhow::anyhow!("StageControlRequest decode error: {e}")
+            })?;
+        skippy_protocol::validate_stage_control_request(&frame).map_err(|e| {
+            tracing::warn!(
+                "handle_stage_control: validation failed from {}: {e}",
+                remote.fmt_short()
+            );
+            anyhow::anyhow!("StageControlRequest validation error: {e}")
+        })?;
         if frame.requester_id.as_slice() != remote.as_bytes() {
+            tracing::warn!(
+                "handle_stage_control: requester_id mismatch from {}",
+                remote.fmt_short()
+            );
             anyhow::bail!("stage control requester_id does not match QUIC peer identity");
         }
 
+        let request_kind = match &frame.command {
+            Some(skippy_stage_proto::stage_control_request::Command::ClaimCoordinator(_)) => {
+                "claim"
+            }
+            Some(skippy_stage_proto::stage_control_request::Command::LoadStage(_)) => "load",
+            Some(skippy_stage_proto::stage_control_request::Command::StopStage(_)) => "stop",
+            Some(skippy_stage_proto::stage_control_request::Command::PrepareStage(_)) => "prepare",
+            _ => "other",
+        };
+        tracing::debug!(
+            "handle_stage_control: received {request_kind} from {}",
+            remote.fmt_short()
+        );
+
         let mut request = stage_control_request_from_proto(frame)?;
-        self.prepare_stage_control_request(&mut request).await?;
+        self.prepare_stage_control_request(&mut request)
+            .await
+            .map_err(|e| {
+                tracing::warn!(
+                    "handle_stage_control: prepare failed for {request_kind} from {}: {e}",
+                    remote.fmt_short()
+                );
+                e
+            })?;
         if let crate::inference::skippy::StageControlRequest::Load(load) = &request {
             self.record_stage_topology(stage_topology_from_load(self.endpoint.id(), load))
                 .await;
@@ -4585,6 +4621,7 @@ impl Node {
         request: &mut crate::inference::skippy::StageControlRequest,
     ) -> anyhow::Result<()> {
         match request {
+            crate::inference::skippy::StageControlRequest::Claim(_) => {}
             crate::inference::skippy::StageControlRequest::Load(load) => {
                 if load.load_mode == skippy_protocol::LoadMode::RuntimeSlice
                     && load
@@ -5675,14 +5712,13 @@ impl Node {
                 .get(&peer_id)
                 .cloned();
             if let Some(conn) = conn {
-                let mut paths = conn.paths();
-                let path_list = iroh::Watcher::get(&mut paths);
-                for path_info in path_list {
+                let path_list = conn.paths();
+                for path_info in &path_list {
                     if path_info.is_selected() {
-                        let rtt_ms = match path_info.rtt() {
-                            Some(rtt) => rtt.as_millis() as u32,
-                            None => continue,
-                        };
+                        let rtt_ms = path_info.rtt().as_millis() as u32;
+                        if rtt_ms == 0 {
+                            continue;
+                        }
                         let path_type = if path_info.is_ip() { "direct" } else { "relay" };
                         if rtt_ms > 0 {
                             emit_mesh_info(format!(
@@ -5832,6 +5868,9 @@ fn stage_snapshot_from_runtime_status(
         flash_attn_type: status.flash_attn_type,
         error,
         shutdown_generation: status.shutdown_generation,
+        coordinator_term: 0,
+        coordinator_id: None,
+        lease_until_unix_ms: 0,
     }
 }
 
@@ -5865,6 +5904,9 @@ fn stage_control_request_to_proto(
     use skippy_stage_proto::stage_control_request::Command;
 
     let command = match request {
+        crate::inference::skippy::StageControlRequest::Claim(claim) => {
+            Command::ClaimCoordinator(stage_coordinator_claim_to_proto(claim))
+        }
         crate::inference::skippy::StageControlRequest::Load(load) => {
             Command::LoadStage(stage_load_to_proto(load))
         }
@@ -5874,6 +5916,7 @@ fn stage_control_request_to_proto(
                 run_id: stop.run_id,
                 stage_id: stop.stage_id,
                 shutdown_generation: stop.shutdown_generation,
+                coordinator_term: stop.coordinator_term,
             })
         }
         crate::inference::skippy::StageControlRequest::Status(status) => {
@@ -5948,6 +5991,9 @@ fn stage_load_to_proto(
         cache_type_v: load.cache_type_v,
         flash_attn_type: stage_flash_attn_type_to_proto(load.flash_attn_type) as i32,
         shutdown_generation: load.shutdown_generation,
+        coordinator_term: load.coordinator_term,
+        coordinator_id: load.coordinator_id.map(|id| id.to_string()),
+        lease_until_unix_ms: load.lease_until_unix_ms,
         load_mode: match load.load_mode {
             skippy_protocol::LoadMode::RuntimeSlice => {
                 skippy_stage_proto::StageLoadMode::RuntimeSlice as i32
@@ -5961,6 +6007,23 @@ fn stage_load_to_proto(
         },
         upstream: load.upstream.map(stage_peer_to_proto),
         downstream: load.downstream.map(stage_peer_to_proto),
+    }
+}
+
+fn stage_coordinator_claim_to_proto(
+    claim: crate::inference::skippy::StageCoordinatorClaim,
+) -> skippy_stage_proto::ClaimCoordinator {
+    skippy_stage_proto::ClaimCoordinator {
+        model_id: claim.model_id,
+        package_ref: claim.package_ref,
+        manifest_sha256: claim.manifest_sha256,
+        topology_id: claim.topology_id,
+        run_id: claim.run_id,
+        coordinator_id: claim.coordinator_id,
+        coordinator_term: claim.coordinator_term,
+        participant_set_hash: claim.participant_set_hash,
+        topology_hash: claim.topology_hash,
+        lease_until_unix_ms: claim.lease_until_unix_ms,
     }
 }
 
@@ -5993,6 +6056,11 @@ fn stage_control_request_from_proto(
         .command
         .ok_or_else(|| anyhow::anyhow!("missing stage control command"))?
     {
+        Command::ClaimCoordinator(claim) => {
+            Ok(crate::inference::skippy::StageControlRequest::Claim(
+                stage_coordinator_claim_from_proto(claim)?,
+            ))
+        }
         Command::LoadStage(load) => Ok(crate::inference::skippy::StageControlRequest::Load(
             stage_load_from_proto(load)?,
         )),
@@ -6002,6 +6070,7 @@ fn stage_control_request_from_proto(
                 run_id: stop.run_id,
                 stage_id: stop.stage_id,
                 shutdown_generation: stop.shutdown_generation,
+                coordinator_term: stop.coordinator_term,
             },
         )),
         Command::GetStageStatus(status) => {
@@ -6096,9 +6165,33 @@ fn stage_load_from_proto(
         cache_type_v: load.cache_type_v,
         flash_attn_type: stage_flash_attn_type_from_proto(load.flash_attn_type),
         shutdown_generation: load.shutdown_generation,
+        coordinator_term: load.coordinator_term,
+        coordinator_id: load
+            .coordinator_id
+            .map(|id| id.parse())
+            .transpose()
+            .context("invalid stage load coordinator_id")?,
+        lease_until_unix_ms: load.lease_until_unix_ms,
         load_mode: stage_load_mode_from_proto(load.load_mode),
         upstream: load.upstream.map(stage_peer_from_proto).transpose()?,
         downstream: load.downstream.map(stage_peer_from_proto).transpose()?,
+    })
+}
+
+fn stage_coordinator_claim_from_proto(
+    claim: skippy_stage_proto::ClaimCoordinator,
+) -> anyhow::Result<crate::inference::skippy::StageCoordinatorClaim> {
+    Ok(crate::inference::skippy::StageCoordinatorClaim {
+        model_id: claim.model_id,
+        package_ref: claim.package_ref,
+        manifest_sha256: claim.manifest_sha256,
+        topology_id: claim.topology_id,
+        run_id: claim.run_id,
+        coordinator_id: claim.coordinator_id,
+        coordinator_term: claim.coordinator_term,
+        participant_set_hash: claim.participant_set_hash,
+        topology_hash: claim.topology_hash,
+        lease_until_unix_ms: claim.lease_until_unix_ms,
     })
 }
 
@@ -6168,6 +6261,15 @@ fn stage_control_unavailable_response(
     request: crate::inference::skippy::StageControlRequest,
 ) -> crate::inference::skippy::StageControlResponse {
     let status = match request {
+        crate::inference::skippy::StageControlRequest::Claim(claim) => {
+            return crate::inference::skippy::StageControlResponse::ClaimAccepted(
+                crate::inference::skippy::StageCoordinatorClaimAck {
+                    accepted: false,
+                    claim,
+                    error: Some("stage control is not available".to_string()),
+                },
+            );
+        }
         crate::inference::skippy::StageControlRequest::Load(load) => {
             stage_status_from_load(&load, crate::inference::skippy::StageRuntimeState::Failed)
         }
@@ -6201,6 +6303,9 @@ fn stage_control_unavailable_response(
                 flash_attn_type: skippy_protocol::FlashAttentionType::Auto,
                 error: Some("stage control is not available".to_string()),
                 shutdown_generation: stop.shutdown_generation,
+                coordinator_term: stop.coordinator_term,
+                coordinator_id: None,
+                lease_until_unix_ms: 0,
             }
         }
         crate::inference::skippy::StageControlRequest::Status(_) => {
@@ -6296,6 +6401,9 @@ fn stage_status_from_load(
         flash_attn_type: load.flash_attn_type,
         error: Some("stage control is not available".to_string()),
         shutdown_generation: load.shutdown_generation,
+        coordinator_term: load.coordinator_term,
+        coordinator_id: load.coordinator_id,
+        lease_until_unix_ms: load.lease_until_unix_ms,
     }
 }
 
@@ -6321,6 +6429,9 @@ fn stage_preparation_status_from_load(
         bind_addr: None,
         error,
         shutdown_generation: load.shutdown_generation,
+        coordinator_term: load.coordinator_term,
+        coordinator_id: load.coordinator_id,
+        lease_until_unix_ms: load.lease_until_unix_ms,
     }
 }
 
@@ -6346,6 +6457,9 @@ fn stage_preparation_status_from_cancel(
         bind_addr: None,
         error,
         shutdown_generation: cancel.shutdown_generation,
+        coordinator_term: 0,
+        coordinator_id: None,
+        lease_until_unix_ms: 0,
     }
 }
 
@@ -6356,6 +6470,13 @@ fn stage_control_response_to_proto(
     use skippy_stage_proto::stage_control_response::Response;
 
     let response = match response {
+        crate::inference::skippy::StageControlResponse::ClaimAccepted(accepted) => {
+            Response::CoordinatorClaimAccepted(skippy_stage_proto::CoordinatorClaimAccepted {
+                accepted: accepted.accepted,
+                claim: Some(stage_coordinator_claim_to_proto(accepted.claim)),
+                error: accepted.error,
+            })
+        }
         crate::inference::skippy::StageControlResponse::Ready(ready) => {
             Response::StageReady(skippy_stage_proto::StageReady {
                 accepted: ready.accepted,
@@ -6414,6 +6535,20 @@ fn stage_control_response_from_proto(
         .response
         .ok_or_else(|| anyhow::anyhow!("missing stage control response"))?
     {
+        Response::CoordinatorClaimAccepted(accepted) => {
+            let claim = accepted
+                .claim
+                .ok_or_else(|| anyhow::anyhow!("coordinator claim accepted missing claim"))?;
+            Ok(
+                crate::inference::skippy::StageControlResponse::ClaimAccepted(
+                    crate::inference::skippy::StageCoordinatorClaimAck {
+                        accepted: accepted.accepted,
+                        claim: stage_coordinator_claim_from_proto(claim)?,
+                        error: accepted.error,
+                    },
+                ),
+            )
+        }
         Response::StageReady(ready) => {
             let status = ready
                 .status
@@ -6619,6 +6754,9 @@ fn stage_preparation_status_to_proto(
         bind_addr: status.bind_addr,
         error: status.error,
         shutdown_generation: status.shutdown_generation,
+        coordinator_term: status.coordinator_term,
+        coordinator_id: status.coordinator_id.map(|id| id.to_string()),
+        lease_until_unix_ms: status.lease_until_unix_ms,
     }
 }
 
@@ -6642,6 +6780,9 @@ fn stage_preparation_status_from_proto(
         bind_addr: status.bind_addr,
         error: status.error,
         shutdown_generation: status.shutdown_generation,
+        coordinator_term: status.coordinator_term,
+        coordinator_id: status.coordinator_id.and_then(|id| id.parse().ok()),
+        lease_until_unix_ms: status.lease_until_unix_ms,
     }
 }
 
@@ -6677,6 +6818,9 @@ fn stage_status_to_proto(
         materialized_pinned: Some(status.materialized_pinned),
         projector_path: status.projector_path,
         flash_attn_type: stage_flash_attn_type_to_proto(status.flash_attn_type) as i32,
+        coordinator_term: status.coordinator_term,
+        coordinator_id: status.coordinator_id.map(|id| id.to_string()),
+        lease_until_unix_ms: status.lease_until_unix_ms,
     }
 }
 
@@ -6719,6 +6863,13 @@ fn stage_status_from_proto(
         flash_attn_type: stage_flash_attn_type_from_proto(status.flash_attn_type),
         error: status.error,
         shutdown_generation: status.shutdown_generation,
+        coordinator_term: status.coordinator_term,
+        coordinator_id: status
+            .coordinator_id
+            .map(|id| id.parse())
+            .transpose()
+            .context("invalid stage status coordinator_id")?,
+        lease_until_unix_ms: status.lease_until_unix_ms,
     })
 }
 
