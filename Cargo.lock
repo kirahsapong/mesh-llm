@@ -3647,6 +3647,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "mesh-llm-gpu-bench"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cc",
+ "libc",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "mesh-llm-host-runtime"
 version = "0.65.1"
 dependencies = [
@@ -3780,12 +3792,14 @@ dependencies = [
  "dirs",
  "hex",
  "libc",
+ "mesh-llm-gpu-bench",
  "reqwest 0.12.28",
  "semver",
  "serde",
  "serde_json",
  "serial_test",
  "sha2 0.10.9",
+ "skippy-runtime",
  "tracing",
  "zip",
 ]
@@ -6840,6 +6854,7 @@ dependencies = [
  "sha2 0.10.9",
  "skippy-ffi",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]
