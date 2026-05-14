@@ -115,9 +115,9 @@ fn load_owner_keypair_from_path(path: &Path) -> Result<OwnerKeypair> {
         .with_context(|| format!("Failed to load owner keystore {}", path.display()))
 }
 
-fn sign_node_certificate(
+fn sign_node_certificate_for_id(
     owner: &OwnerKeypair,
-    node_secret_key: &SecretKey,
+    node_endpoint_id: &[u8; 32],
     expires_in_hours: u64,
     node_label: Option<String>,
     hostname_hint: Option<String>,
@@ -125,17 +125,32 @@ fn sign_node_certificate(
     if expires_in_hours == 0 {
         bail!("--expires-in-hours must be greater than 0");
     }
-
-    let endpoint_id = EndpointId::from(node_secret_key.public());
     let expires_at_unix_ms =
         now_unix_ms().saturating_add(expires_in_hours.saturating_mul(60 * 60 * 1000));
     Ok(sign_node_ownership(
         owner,
-        endpoint_id.as_bytes(),
+        node_endpoint_id,
         expires_at_unix_ms,
         node_label,
         hostname_hint,
     )?)
+}
+
+fn sign_node_certificate(
+    owner: &OwnerKeypair,
+    node_secret_key: &SecretKey,
+    expires_in_hours: u64,
+    node_label: Option<String>,
+    hostname_hint: Option<String>,
+) -> Result<SignedNodeOwnership> {
+    let endpoint_id = EndpointId::from(node_secret_key.public());
+    sign_node_certificate_for_id(
+        owner,
+        endpoint_id.as_bytes(),
+        expires_in_hours,
+        node_label,
+        hostname_hint,
+    )
 }
 
 fn parse_node_id_hex(node_id: &str) -> Result<[u8; 32]> {
@@ -389,23 +404,39 @@ pub(crate) fn run_status(
 pub(crate) fn run_sign_node(
     owner_key: Option<PathBuf>,
     node_key: Option<PathBuf>,
+    node_id: Option<String>,
     out: Option<PathBuf>,
     node_label: Option<String>,
     hostname_hint: Option<String>,
     expires_in_hours: u64,
 ) -> Result<()> {
     let owner_key_path = resolve_owner_key_path(owner_key)?;
-    let node_key_path = resolve_node_key_path(node_key)?;
     let output_path = resolve_node_ownership_path(out)?;
     let owner = load_owner_keypair_from_path(&owner_key_path)?;
-    let node_secret_key = load_node_key_from_path(&node_key_path)?;
-    let ownership = sign_node_certificate(
-        &owner,
-        &node_secret_key,
-        expires_in_hours,
-        node_label,
-        hostname_hint,
-    )?;
+
+    let ownership = match node_id {
+        Some(node_id_hex) => {
+            let node_id_bytes = parse_node_id_hex(&node_id_hex)?;
+            sign_node_certificate_for_id(
+                &owner,
+                &node_id_bytes,
+                expires_in_hours,
+                node_label,
+                hostname_hint,
+            )?
+        }
+        None => {
+            let node_key_path = resolve_node_key_path(node_key)?;
+            let node_secret_key = load_node_key_from_path(&node_key_path)?;
+            sign_node_certificate(
+                &owner,
+                &node_secret_key,
+                expires_in_hours,
+                node_label,
+                hostname_hint,
+            )?
+        }
+    };
     save_node_ownership(&output_path, &ownership)?;
 
     eprintln!(
@@ -416,6 +447,27 @@ pub(crate) fn run_sign_node(
     eprintln!("Node ID:         {}", ownership.claim.node_endpoint_id);
     eprintln!("Cert ID:         {}", ownership.claim.cert_id);
     eprintln!("Expires at:      {}", ownership.claim.expires_at_unix_ms);
+
+    Ok(())
+}
+
+pub(crate) fn run_sign_challenge(
+    node_key: Option<PathBuf>,
+    challenge_hex: String,
+) -> Result<()> {
+    let node_key_path = resolve_node_key_path(node_key)?;
+    let node_secret_key = load_node_key_from_path(&node_key_path)?;
+    let challenge_bytes = hex::decode(challenge_hex.trim())
+        .with_context(|| format!("Invalid challenge hex: {challenge_hex}"))?;
+    if challenge_bytes.is_empty() {
+        bail!("--challenge must be non-empty hex bytes");
+    }
+    let signature = node_secret_key.sign(&challenge_bytes);
+    let node_id = EndpointId::from(node_secret_key.public());
+
+    // Signature to stdout (machine-readable), node id to stderr (diagnostic).
+    println!("{}", hex::encode(signature.to_bytes()));
+    eprintln!("Node ID:    {}", hex::encode(node_id.as_bytes()));
 
     Ok(())
 }
@@ -431,6 +483,7 @@ pub(crate) fn run_renew_node(
     run_sign_node(
         owner_key,
         node_key,
+        None,
         out,
         node_label,
         hostname_hint,
