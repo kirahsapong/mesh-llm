@@ -157,6 +157,7 @@ pub(crate) async fn dispatch(cli: &Cli) -> Result<bool> {
             AuthCommand::SignNode {
                 owner_key,
                 node_key,
+                node_id,
                 out,
                 hostname_hint,
                 node_label,
@@ -164,11 +165,16 @@ pub(crate) async fn dispatch(cli: &Cli) -> Result<bool> {
             } => auth::run_sign_node(
                 owner_key.clone(),
                 node_key.clone(),
+                node_id.clone(),
                 out.clone(),
                 node_label.clone(),
                 hostname_hint.clone(),
                 *expires_in_hours,
             ),
+            AuthCommand::SignChallenge {
+                node_key,
+                challenge,
+            } => auth::run_sign_challenge(node_key.clone(), challenge.clone()),
             AuthCommand::RenewNode {
                 owner_key,
                 node_key,

@@ -76,8 +76,16 @@ pub(crate) enum AuthCommand {
         #[arg(long)]
         owner_key: Option<PathBuf>,
         /// Path to the node identity file (default: ~/.mesh-llm/key).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "node_id")]
         node_key: Option<PathBuf>,
+        /// Sign a certificate for a raw 32-byte public node endpoint ID (hex),
+        /// bypassing the local node secret-key file. Use this on a CA host
+        /// that signs certs for nodes whose secret key it does not hold.
+        /// Proof-of-possession must be verified out-of-band (e.g. via
+        /// challenge-response with `auth sign-challenge`).
+        /// Mutually exclusive with `--node-key`.
+        #[arg(long, conflicts_with = "node_key")]
+        node_id: Option<String>,
         /// Output path for the signed node certificate.
         #[arg(long)]
         out: Option<PathBuf>,
@@ -90,6 +98,18 @@ pub(crate) enum AuthCommand {
         /// Certificate lifetime in hours.
         #[arg(long, default_value = "168")]
         expires_in_hours: u64,
+    },
+    /// Sign an arbitrary challenge with the local node identity key.
+    /// Used by clients to prove possession of the node secret to a remote CA
+    /// via challenge-response without ever transmitting the secret key.
+    /// Prints the Ed25519 signature as hex to stdout and the node ID to stderr.
+    SignChallenge {
+        /// Path to the node identity file (default: ~/.mesh-llm/key).
+        #[arg(long)]
+        node_key: Option<PathBuf>,
+        /// Hex-encoded challenge bytes to sign.
+        #[arg(long)]
+        challenge: String,
     },
     /// Renew the local node ownership certificate in place.
     RenewNode {
