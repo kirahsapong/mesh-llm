@@ -19,11 +19,11 @@ use self::local::{
     add_runtime_local_target, add_serving_assignment, advertise_model_ready, local_process_payload,
     model_fits_runtime_capacity, remove_runtime_local_target, remove_serving_assignment,
     resolved_model_name, runtime_model_planning_bytes, runtime_model_required_bytes,
-    set_advertised_model_context, start_runtime_local_model, start_runtime_split_model,
-    startup_runtime_plan, stop_split_generation_cleanup, withdraw_advertised_model,
-    LocalRuntimeModelHandle, LocalRuntimeModelStartSpec, ManagedModelController, RuntimeEvent,
-    SplitCoordinatorAck, SplitCoordinatorEvent, SplitRuntimeReason, SplitRuntimeStart,
-    StartupRuntimePlan,
+    set_advertised_model_context, set_runtime_verified_served_model_capabilities,
+    start_runtime_local_model, start_runtime_split_model, startup_runtime_plan,
+    stop_split_generation_cleanup, withdraw_advertised_model, LocalRuntimeModelHandle,
+    LocalRuntimeModelStartSpec, ManagedModelController, RuntimeEvent, SplitCoordinatorAck,
+    SplitCoordinatorEvent, SplitRuntimeReason, SplitRuntimeStart, StartupRuntimePlan,
 };
 use self::proxy::{api_proxy, bootstrap_proxy};
 use crate::api;
@@ -811,6 +811,7 @@ async fn register_runtime_instance(
     model_name: &str,
     instance_id: &str,
     context_length: Option<u32>,
+    capabilities: models::ModelCapabilities,
 ) {
     let (was_empty, context_changed, next_context) = {
         let mut guard = registry.lock().await;
@@ -827,6 +828,13 @@ async fn register_runtime_instance(
     }
     if was_empty {
         add_serving_assignment(node, primary_model_name, model_name).await;
+        set_runtime_verified_served_model_capabilities(
+            node,
+            primary_model_name,
+            model_name,
+            capabilities,
+        )
+        .await;
         advertise_model_ready(node, primary_model_name, model_name).await;
     }
 }
@@ -1414,6 +1422,7 @@ async fn startup_local_model_loop(params: StartupLocalModelTask) {
         &loaded_name,
         &instance_id,
         Some(handle.context_length),
+        handle.capabilities,
     )
     .await;
     let payload = local_process_payload(
@@ -1621,6 +1630,7 @@ async fn startup_local_model_loop(params: StartupLocalModelTask) {
                                     &loaded_name,
                                     &instance_id,
                                     Some(next_handle.context_length),
+                                    next_handle.capabilities,
                                 )
                                 .await;
                                 let payload = local_process_payload(
@@ -1786,6 +1796,7 @@ async fn startup_local_model_loop(params: StartupLocalModelTask) {
                     &next.loaded_name,
                     &instance_id,
                     Some(next.handle.context_length),
+                    next.handle.capabilities,
                 )
                 .await;
                 let payload = local_process_payload(
@@ -5596,6 +5607,7 @@ async fn run_auto(
                                 &loaded_name,
                                 &instance_id,
                                 Some(handle.context_length),
+                                handle.capabilities,
                             )
                             .await;
                             node.set_available_models(models::scan_local_models()).await;
@@ -6741,6 +6753,57 @@ mod tests {
         assert_eq!(target.instance_id, "runtime-2");
         assert_eq!(target.model_name, "Qwen");
         assert_eq!(target.owner, RuntimeUnloadOwner::Managed);
+    }
+
+    #[tokio::test]
+    async fn register_runtime_instance_preserves_existing_known_descriptor_capabilities() {
+        let node = mesh::Node::new_for_tests(mesh::NodeRole::Worker)
+            .await
+            .expect("test node should initialize");
+        let registry = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let vision_model = "Qwen3VL-2B-Instruct-Q4_K_M";
+        let text_model = "Qwen3-8B-Q4_K_M";
+        let vision_capabilities = models::ModelCapabilities {
+            multimodal: true,
+            vision: models::CapabilityLevel::Supported,
+            ..Default::default()
+        };
+
+        register_runtime_instance(
+            &registry,
+            &node,
+            vision_model,
+            vision_model,
+            "runtime-vision",
+            Some(8192),
+            vision_capabilities,
+        )
+        .await;
+        register_runtime_instance(
+            &registry,
+            &node,
+            vision_model,
+            text_model,
+            "runtime-text",
+            Some(8192),
+            models::ModelCapabilities::default(),
+        )
+        .await;
+
+        let descriptors = node.served_model_descriptors().await;
+        let vision = descriptors
+            .iter()
+            .find(|descriptor| descriptor.identity.model_name == vision_model)
+            .expect("vision descriptor should remain registered");
+        assert!(vision.capabilities_known);
+        assert_eq!(vision.capabilities, vision_capabilities);
+
+        let text = descriptors
+            .iter()
+            .find(|descriptor| descriptor.identity.model_name == text_model)
+            .expect("text descriptor should be registered");
+        assert!(text.capabilities_known);
+        assert_eq!(text.capabilities, models::ModelCapabilities::default());
     }
 
     #[tokio::test]

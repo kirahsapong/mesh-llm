@@ -163,6 +163,7 @@ pub(crate) async fn api_proxy(
                         request.ensure_body_json();
                         if let Some(body_json) = request.body_json.as_ref() {
                             let cl = router::classify(body_json);
+                            let media = router::media_requirements(body_json);
                             let mut available_models = callable.clone();
                             if let Some(plugin_manager) = plugin_manager.as_ref() {
                                 if let Ok(external_models) = plugin_manager.inference_models().await
@@ -182,10 +183,26 @@ pub(crate) async fn api_proxy(
                                     .iter()
                                     .map(|name| {
                                         let caps =
-                                            crate::models::installed_model_capabilities(name);
+                                            proxy::capabilities_for_model(name, &descriptors);
                                         (name.as_str(), 0.0, caps)
                                     })
                                     .collect();
+                            let Some(available) =
+                                router::filter_media_compatible_candidates(&available, &media)
+                            else {
+                                let _ = proxy::send_error(
+                                    tcp_stream,
+                                    422,
+                                    "no served model can satisfy the requested media inputs",
+                                )
+                                .await;
+                                proxy::release_request_objects(
+                                    &node,
+                                    &request.request_object_request_ids,
+                                )
+                                .await;
+                                return;
+                            };
                             let picked = router::pick_model_classified(&cl, &available);
                             if let Some(name) = picked {
                                 tracing::info!(

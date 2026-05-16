@@ -2237,9 +2237,20 @@ fn should_learn_affinity(status_code: u16) -> bool {
 fn cached_auto_model_satisfies_media_requirements(
     model: &str,
     media: &router::MediaRequirements,
+    descriptors: &[mesh::ServedModelDescriptor],
 ) -> bool {
-    let caps = crate::models::installed_model_capabilities(model);
+    let caps = capabilities_for_model(model, descriptors);
     router::model_satisfies_media_requirements(&caps, media)
+}
+
+pub(crate) fn capabilities_for_model(
+    model: &str,
+    descriptors: &[mesh::ServedModelDescriptor],
+) -> crate::models::ModelCapabilities {
+    descriptor_for_model(descriptors, model)
+        .filter(|descriptor| descriptor.capabilities_known)
+        .map(|descriptor| descriptor.capabilities)
+        .unwrap_or_else(|| crate::models::installed_model_capabilities(model))
 }
 
 // ── Model-aware tunnel routing ──
@@ -2314,7 +2325,11 @@ pub async fn handle_mesh_request(
             let cached = if let Some(key) = auto_session_key {
                 if let Some(model) = affinity.lookup_auto_model(key) {
                     if !node.hosts_for_model(&model).await.is_empty() {
-                        if cached_auto_model_satisfies_media_requirements(&model, &media) {
+                        if cached_auto_model_satisfies_media_requirements(
+                            &model,
+                            &media,
+                            &descriptors,
+                        ) {
                             tracing::debug!(
                                 "auto: reusing cached model {model} for session {key:016x}"
                             );
@@ -2351,19 +2366,21 @@ pub async fn handle_mesh_request(
                 let with_caps: Vec<(&str, f64, crate::models::ModelCapabilities)> = served
                     .iter()
                     .map(|name| {
-                        let caps = crate::models::installed_model_capabilities(name);
+                        let caps = capabilities_for_model(name, &descriptors);
                         (name.as_str(), 0.0, caps)
                     })
                     .collect();
-                let available: Vec<(&str, f64, crate::models::ModelCapabilities)> = with_caps
-                    .iter()
-                    .filter(|(_, _, caps)| router::model_satisfies_media_requirements(caps, &media))
-                    .cloned()
-                    .collect();
-                let available = if available.is_empty() {
-                    with_caps
-                } else {
-                    available
+                let Some(available) =
+                    router::filter_media_compatible_candidates(&with_caps, &media)
+                else {
+                    let _ = send_error(
+                        tcp_stream,
+                        422,
+                        "no served model can satisfy the requested media inputs",
+                    )
+                    .await;
+                    release_request_objects(&node, &request.request_object_request_ids).await;
+                    return;
                 };
                 let picked = router::pick_model_classified(&cl, &available);
                 if let Some(name) = picked {
@@ -3188,7 +3205,7 @@ fn models_list_json(
             if !seen.insert(public_id.clone()) {
                 return None;
             }
-            let capabilities = crate::models::installed_model_capabilities(m);
+            let capabilities = capabilities_for_model(m, descriptors);
             let has_multimodal = capabilities.supports_multimodal_runtime();
             let has_vision = capabilities.supports_vision_runtime();
             let has_audio = capabilities.supports_audio_runtime();
@@ -3578,6 +3595,17 @@ mod tests {
         }
     }
 
+    fn local_gguf_descriptor_with_capabilities(
+        model_name: &str,
+        capabilities: crate::models::ModelCapabilities,
+    ) -> mesh::ServedModelDescriptor {
+        mesh::ServedModelDescriptor {
+            capabilities_known: true,
+            capabilities,
+            ..local_gguf_descriptor(model_name)
+        }
+    }
+
     async fn read_request_from_parts_with_limits(
         parts: Vec<Vec<u8>>,
         limits: HttpReadLimits,
@@ -3647,6 +3675,56 @@ mod tests {
 
         assert_eq!(body["data"][0]["id"], "smollm2-a");
         assert_eq!(body["data"][0]["display_name"], "smollm2-a");
+    }
+
+    #[test]
+    fn models_list_uses_descriptor_capabilities_not_filename_heuristics() {
+        let models = vec!["Qwen3VL-2B-Instruct-Q4_K_M".to_string()];
+        let descriptors = vec![local_gguf_descriptor_with_capabilities(
+            &models[0],
+            crate::models::ModelCapabilities::default(),
+        )];
+
+        let body = models_list_json(&models, &descriptors);
+
+        assert_eq!(body["data"][0]["capabilities"], serde_json::json!(["text"]));
+        assert_eq!(body["data"][0]["vision_status"], "none");
+        assert_eq!(body["data"][0]["multimodal_status"], "none");
+    }
+
+    #[test]
+    fn models_list_uses_static_fallback_for_unknown_descriptor_capabilities() {
+        let models = vec!["Qwen3VL-2B-Instruct-Q4_K_M".to_string()];
+        let descriptors = vec![local_gguf_descriptor(&models[0])];
+
+        let body = models_list_json(&models, &descriptors);
+        let capabilities = body["data"][0]["capabilities"].as_array().unwrap();
+
+        assert!(capabilities.iter().any(|cap| cap == "multimodal"));
+        assert!(capabilities.iter().any(|cap| cap == "vision"));
+        assert_eq!(body["data"][0]["vision_status"], "supported");
+        assert_eq!(body["data"][0]["multimodal_status"], "supported");
+    }
+
+    #[test]
+    fn models_list_reports_runtime_verified_projector_capabilities() {
+        let models = vec!["Qwen3VL-2B-Instruct-Q4_K_M".to_string()];
+        let descriptors = vec![local_gguf_descriptor_with_capabilities(
+            &models[0],
+            crate::models::ModelCapabilities {
+                multimodal: true,
+                vision: crate::models::CapabilityLevel::Supported,
+                ..Default::default()
+            },
+        )];
+
+        let body = models_list_json(&models, &descriptors);
+        let capabilities = body["data"][0]["capabilities"].as_array().unwrap();
+
+        assert!(capabilities.iter().any(|cap| cap == "multimodal"));
+        assert!(capabilities.iter().any(|cap| cap == "vision"));
+        assert_eq!(body["data"][0]["vision_status"], "supported");
+        assert_eq!(body["data"][0]["multimodal_status"], "supported");
     }
 
     #[test]
@@ -3772,11 +3850,60 @@ mod tests {
 
         assert!(!cached_auto_model_satisfies_media_requirements(
             "Qwen3-8B-Q4_K_M",
-            &media
+            &media,
+            &[]
         ));
         assert!(cached_auto_model_satisfies_media_requirements(
             "Qwen3.5-0.8B-Vision-Q4_K_M",
-            &media
+            &media,
+            &[]
+        ));
+    }
+
+    #[test]
+    fn cached_auto_model_rejects_descriptor_text_only_even_when_name_looks_vision() {
+        let body = serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe this image"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}
+                ]
+            }]
+        });
+        let media = router::media_requirements(&body);
+        let model = "Qwen3VL-2B-Instruct-Q4_K_M";
+        let descriptors = vec![local_gguf_descriptor_with_capabilities(
+            model,
+            crate::models::ModelCapabilities::default(),
+        )];
+
+        assert!(!cached_auto_model_satisfies_media_requirements(
+            model,
+            &media,
+            &descriptors
+        ));
+    }
+
+    #[test]
+    fn cached_auto_model_uses_static_fallback_for_unknown_descriptor_capabilities() {
+        let body = serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe this image"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}
+                ]
+            }]
+        });
+        let media = router::media_requirements(&body);
+        let model = "Qwen3VL-2B-Instruct-Q4_K_M";
+        let descriptors = vec![local_gguf_descriptor(model)];
+
+        assert!(cached_auto_model_satisfies_media_requirements(
+            model,
+            &media,
+            &descriptors
         ));
     }
 
